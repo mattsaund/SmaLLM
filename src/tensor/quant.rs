@@ -48,6 +48,59 @@ impl Default for Group {
 /// Decodes one block of a quantized type into a [`Group`].
 pub type Decoder = fn(block: &[u8], out: &mut Group);
 
+/// A whole weight row decoded to the common shape:
+///
+/// ```text
+/// weight[i] = scale[i / 4] * q[i] + offset[i / 16]
+/// ```
+///
+/// The batched multiply decodes a row once and reuses it for every vector
+/// of the batch. Scales are stored once per 4 weights, each sub-block's
+/// scale four times over, because that is the layout the SIMD kernels
+/// multiply against directly.
+#[derive(Default)]
+pub struct DecodedRow {
+    /// The integer weights.
+    pub q: Vec<i8>,
+    /// One scale per run of 4 weights.
+    pub scale: Vec<f32>,
+    /// One offset per sub-block of 16 weights.
+    pub offset: Vec<f32>,
+    /// True when some offset is not zero. Other rows skip the offset term.
+    pub has_offset: bool,
+}
+
+/// Decodes one row of a quantized tensor into `row`.
+///
+/// `bytes` must hold a whole number of blocks of type `ty`. A float type has
+/// no blocks and leaves the row empty.
+pub fn decode_row(ty: TensorType, bytes: &[u8], row: &mut DecodedRow) {
+    let (group, block_bytes) = (ty.block_len(), ty.block_bytes());
+    let blocks = match decoder(ty) {
+        Some(_) => bytes.len() / block_bytes,
+        None => 0,
+    };
+    let n = blocks * group;
+    row.q.resize(n, 0);
+    row.scale.resize(n / 4, 0.0);
+    row.offset.resize(n / 16, 0.0);
+    row.has_offset = false;
+    let Some(decode) = decoder(ty) else { return };
+
+    let mut decoded = Group::new();
+    let subs = group / 16;
+    for (index, block) in bytes.chunks_exact(block_bytes).enumerate() {
+        decode(block, &mut decoded);
+        row.q[index * group..(index + 1) * group].copy_from_slice(&decoded.q[..group]);
+        for sub in 0..subs {
+            let at = index * subs + sub;
+            row.scale[at * 4..at * 4 + 4].fill(decoded.scale[sub]);
+            row.offset[at] = decoded.offset[sub];
+            row.has_offset |= decoded.offset[sub] != 0.0;
+        }
+    }
+}
+
 /// The decoder for a quantized type, or `None` for float types.
 pub fn decoder(ty: TensorType) -> Option<Decoder> {
     Some(match ty {

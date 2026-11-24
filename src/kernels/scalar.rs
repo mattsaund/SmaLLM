@@ -29,6 +29,7 @@ pub static KERNELS: Kernels = Kernels {
     row_f16,
     row_bf16,
     row_quant,
+    dot_decoded,
 };
 
 /// Kernels that never round activations.
@@ -51,6 +52,7 @@ pub static EXACT: Kernels = Kernels {
     row_f16,
     row_bf16,
     row_quant: exact::row_quant,
+    dot_decoded,
 };
 
 /// Number of independent accumulators in float reductions.
@@ -514,6 +516,40 @@ unsafe fn dot_blocks(
                 integer += decoded.q[sub * 16 + l] as i32 * q[sub * 16 + l] as i32;
             }
             partial += decoded.scale[sub] * integer as f32 + decoded.offset[sub] * sums[sub] as f32;
+        }
+        total += partial * act_scale;
+    }
+    total
+}
+
+/// See [`DotDecoded`](super::DotDecoded). This is the definition the other
+/// backends are tested against.
+pub(super) unsafe fn dot_decoded(
+    q: *const i8,
+    scale: *const f32,
+    n: usize,
+    act: ActRef,
+    group: usize,
+) -> f32 {
+    // SAFETY: the caller guarantees `n` weights, `n / 4` scales, and
+    // activations quantized for `n` elements in groups of `group`.
+    let (q, scale, a, act_scale) = unsafe {
+        (
+            slice::from_raw_parts(q, n),
+            slice::from_raw_parts(scale, n / 4),
+            slice::from_raw_parts(act.q, n),
+            slice::from_raw_parts(act.scale, n / group),
+        )
+    };
+    let mut total = 0.0f32;
+    for (g, act_scale) in act_scale.iter().enumerate() {
+        let mut partial = 0.0f32;
+        for run in g * group / 4..(g + 1) * group / 4 {
+            let mut integer = 0i32;
+            for l in run * 4..run * 4 + 4 {
+                integer += q[l] as i32 * a[l] as i32;
+            }
+            partial += scale[run] * integer as f32;
         }
         total += partial * act_scale;
     }

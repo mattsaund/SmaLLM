@@ -21,18 +21,22 @@ use std::arch::aarch64::*;
 use std::arch::asm;
 
 use super::scalar;
-use super::{ActRef, DotQuant, Kernels};
+use super::{ActRef, DotDecoded, DotQuant, Kernels};
 use crate::tensor::TensorType;
 
 /// Kernels for every AArch64 CPU.
-pub static KERNELS: Kernels = kernels("neon", row_quant_widening);
+pub static KERNELS: Kernels = kernels("neon", row_quant_widening, dot_decoded);
 
 /// Kernels for CPUs with the dot product extension.
-pub static KERNELS_DOTPROD: Kernels = kernels("neon+dotprod", row_quant_sdot);
+pub static KERNELS_DOTPROD: Kernels = kernels("neon+dotprod", row_quant_sdot, dot_decoded_sdot);
 
-/// Builds a kernel table. Only the quantized row kernels differ between the
-/// two tables.
-const fn kernels(name: &'static str, row_quant: fn(TensorType) -> DotQuant) -> Kernels {
+/// Builds a kernel table. Only the kernels that multiply bytes differ
+/// between the two tables.
+const fn kernels(
+    name: &'static str,
+    row_quant: fn(TensorType) -> DotQuant,
+    dot_decoded: DotDecoded,
+) -> Kernels {
     Kernels {
         name,
         dot,
@@ -49,6 +53,7 @@ const fn kernels(name: &'static str, row_quant: fn(TensorType) -> DotQuant) -> K
         row_f16,
         row_bf16,
         row_quant,
+        dot_decoded,
     }
 }
 
@@ -294,6 +299,55 @@ unsafe fn sdot(mut sum: int32x4_t, weights: int8x16_t, acts: int8x16_t) -> int32
         );
     }
     sum
+}
+
+/// See [`DotDecoded`]. One step handles 16 weights: their products land in
+/// four 32-bit lanes, which all share one stored scale. Two accumulators
+/// take turns so that consecutive steps do not wait on each other.
+#[inline(always)]
+unsafe fn decoded_row<D: ByteDot>(
+    q: *const i8,
+    scale: *const f32,
+    n: usize,
+    act: ActRef,
+    group: usize,
+) -> f32 {
+    let runs = n / 16;
+    // Runs per activation group, as a shift: 1 for groups of 32, 4 for 256.
+    let shift = (group / 16).trailing_zeros();
+    // SAFETY: the caller guarantees `n` weights and activations, `n / 4`
+    // scales and `n / group` activation scales. Every index below stays
+    // under `runs * 16 = n`.
+    unsafe {
+        let mut acc = [vdupq_n_f32(0.0), vdupq_n_f32(0.0)];
+        for run in 0..runs {
+            let weights = vld1q_s8(q.add(run * 16));
+            let acts = vld1q_s8(act.q.add(run * 16));
+            let products = D::add_products(vdupq_n_s32(0), weights, acts);
+            let scales = vmulq_n_f32(vld1q_f32(scale.add(run * 4)), *act.scale.add(run >> shift));
+            acc[run & 1] = vfmaq_f32(acc[run & 1], vcvtq_f32_s32(products), scales);
+        }
+        vaddvq_f32(vaddq_f32(acc[0], acc[1]))
+    }
+}
+
+/// [`decoded_row`] for every CPU.
+unsafe fn dot_decoded(q: *const i8, scale: *const f32, n: usize, act: ActRef, group: usize) -> f32 {
+    // SAFETY: forwarded contract.
+    unsafe { decoded_row::<Widening>(q, scale, n, act, group) }
+}
+
+/// [`decoded_row`] for CPUs with the dot product extension.
+#[target_feature(enable = "dotprod")]
+unsafe fn dot_decoded_sdot(
+    q: *const i8,
+    scale: *const f32,
+    n: usize,
+    act: ActRef,
+    group: usize,
+) -> f32 {
+    // SAFETY: forwarded contract.
+    unsafe { decoded_row::<Sdot>(q, scale, n, act, group) }
 }
 
 /// Reads an unaligned little-endian u32 at `p`.

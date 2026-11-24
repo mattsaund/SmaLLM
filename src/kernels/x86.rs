@@ -37,6 +37,7 @@ pub static KERNELS: Kernels = Kernels {
     row_f16,
     row_bf16,
     row_quant,
+    dot_decoded,
 };
 
 /// True when the running CPU has every feature these kernels use.
@@ -74,6 +75,51 @@ unsafe fn hsum(v: __m256) -> f32 {
     let pair = _mm_add_ps(quad, _mm_movehl_ps(quad, quad));
     let single = _mm_add_ss(pair, _mm_shuffle_ps::<1>(pair, pair));
     _mm_cvtss_f32(single)
+}
+
+/// See [`DotDecoded`](super::DotDecoded).
+///
+/// One step handles 32 weights. `maddubs` needs an unsigned operand, so it
+/// multiplies the magnitudes of the weights with activations that carry the
+/// weights' signs. `madd` then adds the products in fours, which lines each
+/// 32-bit lane up with one stored scale. Four accumulators take turns so
+/// that consecutive steps do not wait on each other.
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn dot_decoded(q: *const i8, scale: *const f32, n: usize, act: ActRef, group: usize) -> f32 {
+    let blocks = n / 32;
+    // Blocks per activation group, as a shift: 0 for groups of 32, 3 for 256.
+    let shift = (group / 32).trailing_zeros();
+    let ones = _mm256_set1_epi16(1);
+    let mut acc = [_mm256_setzero_ps(); 4];
+    // SAFETY: the caller guarantees `n` weights and activations, `n / 4`
+    // scales and `n / group` activation scales. Every index below stays
+    // under `blocks * 32 = n`.
+    let step = |block: usize, acc: __m256| unsafe {
+        let weights = _mm256_loadu_si256(q.add(block * 32) as *const __m256i);
+        let acts = _mm256_loadu_si256(act.q.add(block * 32) as *const __m256i);
+        let pairs = _mm256_maddubs_epi16(_mm256_abs_epi8(weights), _mm256_sign_epi8(acts, weights));
+        let fours = _mm256_cvtepi32_ps(_mm256_madd_epi16(pairs, ones));
+        let scales = _mm256_mul_ps(
+            _mm256_loadu_ps(scale.add(block * 8)),
+            broadcast(act.scale.add(block >> shift)),
+        );
+        _mm256_fmadd_ps(fours, scales, acc)
+    };
+    let mut block = 0;
+    while block + 4 <= blocks {
+        for (lane, acc) in acc.iter_mut().enumerate() {
+            *acc = step(block + lane, *acc);
+        }
+        block += 4;
+    }
+    while block < blocks {
+        acc[0] = step(block, acc[0]);
+        block += 1;
+    }
+    hsum(_mm256_add_ps(
+        _mm256_add_ps(acc[0], acc[1]),
+        _mm256_add_ps(acc[2], acc[3]),
+    ))
 }
 
 /// Dot product of two float vectors. Neither pointer needs to be aligned.

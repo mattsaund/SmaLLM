@@ -50,6 +50,20 @@ pub type DotQuant = unsafe fn(row: *const u8, n: usize, act: ActRef) -> f32;
 /// Dot product of a float weight row, stored as bytes, and float activations.
 pub type DotFloat = unsafe fn(row: *const u8, x: *const f32, n: usize) -> f32;
 
+/// Dot product of a decoded weight row and a quantized activation vector,
+/// without the offset term:
+///
+/// ```text
+/// sum over i of scale[i / 4] * q[i] * act.q[i] * act.scale[i / group]
+/// ```
+///
+/// `q` holds `n` integer weights and `scale` one float per 4 of them, as in
+/// a [`DecodedRow`](crate::tensor::quant::DecodedRow). `group` is the group
+/// size the activations were quantized with, 32 or 256, and `n` a multiple
+/// of it.
+pub type DotDecoded =
+    unsafe fn(q: *const i8, scale: *const f32, n: usize, act: ActRef, group: usize) -> f32;
+
 /// How to reduce one row of a weight matrix.
 #[derive(Clone, Copy)]
 pub enum RowDot {
@@ -76,6 +90,7 @@ pub struct Kernels {
     row_f16: DotFloat,
     row_bf16: DotFloat,
     row_quant: fn(TensorType) -> DotQuant,
+    dot_decoded: DotDecoded,
 }
 
 /// The shape shared by the two attention kernels: `n_queries` vectors on one
@@ -261,6 +276,11 @@ impl Kernels {
                 wsum.as_mut_ptr(),
             )
         }
+    }
+
+    /// The kernel for rows that were decoded ahead of the multiply.
+    pub fn decoded_dot(&self) -> DotDecoded {
+        self.dot_decoded
     }
 
     /// The row kernel for a tensor type.
