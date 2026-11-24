@@ -3,7 +3,7 @@
 Each version is a `v` tag, with ready-made binaries and libraries on its
 [release page](https://github.com/mattsaund/SmaLLM/releases).
 
-## Unreleased
+## 0.3.0 - 2026-11-24
 
 - **Prompt threads.** Prompts are read on every physical core, efficiency
   cores included, while generation stays on the performance cores.
