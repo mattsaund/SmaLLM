@@ -110,6 +110,24 @@ y      = sum over taps i of kernel[i] * (b * s)[position - taps + 1 + i]
 mix    = (c * y) * Wout
 ```
 
+Mamba blocks (Mamba, Falcon Mamba, Mamba 2, and most blocks of Granite 4.0
+H) carry a state of fixed size from one position to the next, and most
+Mamba models have no feed-forward network:
+
+```
+x z    = h * Wx, h * Wz
+x      = silu(conv(x) + bias)            over the last few positions
+dt     = softplus(time step)             per head and token
+s      = s * exp(dt * A) + dt * x * B    a row of the state per channel
+mix    = [norm] ((s . C + D * x) * silu(z)) * Wout
+```
+
+The scan runs the tokens in order, but its heads are independent, so the
+threads split it by heads, and each takes its heads through the whole
+batch while their state stays in its cache. The projections around it read
+the batch at once, like every other multiply. `model/forward/mamba.rs` has
+the details.
+
 `model/config.rs` turns the architecture name and its metadata into a few
 model-wide switches (how positions are rotated, the activation, embedding
 and logit scaling) and one `LayerSpec` per block. A layer's spec says how it
@@ -258,6 +276,13 @@ a cache, a few kilobytes. Rolling it back needs inputs that are gone, so
 every layer's state each 256 positions. A short rollback costs nothing. A
 longer one restores the last saved state before the cut and reads the
 tokens after it again.
+
+A Mamba block costs nothing per position either. Its state takes from a
+few hundred kilobytes to a few megabytes, the same at any length, and it
+cannot be taken apart again. So `model/recurrent.rs` saves a copy at the end of each prompt and
+keeps the last three. A chat's next prompt repeats the conversation, so the
+session goes back to the copy after the last prompt and reads the reply
+again as one batch.
 
 When the window is full, the session drops the oldest tokens after a kept
 start: the first token, or the conversation's opening. The tokens after the

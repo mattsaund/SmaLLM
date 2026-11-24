@@ -158,6 +158,13 @@ pub(crate) struct TinyModel {
     /// YaRN position scaling, with a short original context so that its
     /// ramp falls inside the small heads.
     pub yarn: bool,
+    /// Floats of state per channel of the Mamba blocks. Zero for models
+    /// without them, which [`build`](Self::build) writes in another way.
+    pub ssm_state: usize,
+    /// Groups of Mamba 2 heads that share B and C.
+    pub ssm_groups: usize,
+    /// Normalizes Mamba 1's time step, B and C (Falcon Mamba).
+    pub ssm_norms: bool,
     pub seed: u64,
 }
 
@@ -204,6 +211,9 @@ impl TinyModel {
             granite_scales: matches!(arch, "granite" | "granitemoe"),
             longrope: arch == "phi3",
             yarn: arch == "qwen3",
+            ssm_state: 0,
+            ssm_groups: 1,
+            ssm_norms: false,
             seed: 1,
         };
         if matches!(
@@ -255,6 +265,22 @@ impl TinyModel {
                 model.values_from_keys = true;
                 model.output_scale = true;
                 model.wide_late_ff = true;
+            }
+            // Mamba models have no attention and no feed-forward network.
+            // Their state rows do not fill the lanes of the scan's sums.
+            "mamba" | "mamba2" => {
+                model.n_head = 0;
+                model.n_head_kv = 0;
+                model.n_ff = 0;
+                model.ssm_state = if arch == "mamba" { 12 } else { 20 };
+                model.ssm_groups = 2;
+            }
+            // Two Mamba 2 blocks to every attention block.
+            "granitehybrid" => {
+                model.n_layer = 4;
+                model.ssm_state = 20;
+                model.ssm_groups = 2;
+                model.granite_scales = true;
             }
             _ => {}
         }
@@ -313,6 +339,9 @@ impl TinyModel {
 
     /// Serializes the model as the bytes of a GGUF file.
     pub fn build(&self) -> Vec<u8> {
+        if self.ssm_state > 0 {
+            return self.build_ssm();
+        }
         let mut rng = Rng(self.seed);
         let arch = self.arch;
         let d = self.n_embd;
@@ -756,6 +785,207 @@ impl TinyModel {
                     vector(&mut builder, &name("attn_k.bias"), kv_dim, -0.2, 0.2);
                     vector(&mut builder, &name("attn_v.bias"), kv_dim, -0.2, 0.2);
                 }
+            }
+        }
+        builder.build()
+    }
+}
+
+/// Synthetic models with Mamba blocks: Mamba and Falcon Mamba, Mamba 2,
+/// and Granite 4.0 H, which mixes Mamba 2 blocks with attention blocks that
+/// do not rotate, and gives every block a feed-forward network.
+impl TinyModel {
+    /// Channels of each Mamba 2 head.
+    const SSM_HEAD_DIM: usize = 16;
+
+    /// True when layer `index` is a Mamba block. Granite 4.0 H has two of
+    /// them to every attention block.
+    pub fn is_mamba(&self, index: usize) -> bool {
+        self.ssm_state > 0 && (self.arch != "granitehybrid" || index % 3 != 1)
+    }
+
+    /// Serializes a model with Mamba blocks as the bytes of a GGUF file,
+    /// with the tensor names and shapes of llama.cpp's converter.
+    fn build_ssm(&self) -> Vec<u8> {
+        let (arch, d) = (self.arch, self.n_embd);
+        let (mamba2, hybrid) = (arch != "mamba", arch == "granitehybrid");
+        let (inner, state, groups) = (2 * d, self.ssm_state, self.ssm_groups);
+        let heads = if mamba2 {
+            inner / Self::SSM_HEAD_DIM
+        } else {
+            inner
+        };
+        // Mamba 1's time step rank, as Hugging Face sets it by default.
+        let rank = if mamba2 { heads } else { d.div_ceil(16) };
+        let channels = if mamba2 {
+            inner + 2 * groups * state
+        } else {
+            inner
+        };
+        let taps = 4;
+        let layers = 0..self.n_layer;
+
+        let mut builder = Builder::new();
+        let key = |suffix: &str| format!("{arch}.{suffix}");
+        builder
+            .string("general.architecture", arch)
+            .string("general.name", "tiny test model")
+            .u32(&key("context_length"), 512)
+            .u32(&key("embedding_length"), d as u32)
+            .u32(&key("block_count"), self.n_layer as u32)
+            .u32(&key("attention.head_count"), self.n_head as u32)
+            .u32(&key("feed_forward_length"), self.n_ff as u32)
+            .f32(&key("attention.layer_norm_rms_epsilon"), 1e-5)
+            .u32(&key("ssm.conv_kernel"), taps as u32)
+            .u32(&key("ssm.inner_size"), inner as u32)
+            .u32(&key("ssm.state_size"), state as u32)
+            .u32(&key("ssm.time_step_rank"), rank as u32);
+        if mamba2 {
+            builder.u32(&key("ssm.group_count"), groups as u32);
+        } else {
+            builder.bool(&key("ssm.dt_b_c_rms"), self.ssm_norms);
+        }
+        if hybrid {
+            // Attention layers have key/value heads, Mamba layers none.
+            let kv_heads: Vec<i32> = layers
+                .clone()
+                .map(|i| {
+                    if self.is_mamba(i) {
+                        0
+                    } else {
+                        self.n_head_kv as i32
+                    }
+                })
+                .collect();
+            builder
+                .i32s(&key("attention.head_count_kv"), &kv_heads)
+                .f32(&key("rope.freq_base"), 10000.0)
+                .bool(&key("rope.scaling.finetuned"), false)
+                .f32(&key("embedding_scale"), 2.0)
+                .f32(&key("residual_scale"), 0.5)
+                .f32(&key("logit_scale"), 3.0)
+                .f32(&key("attention.scale"), 0.3);
+        }
+
+        // A minimal vocabulary: three special tokens, then one per id.
+        let texts: Vec<String> = (0..self.n_vocab)
+            .map(|id| match id {
+                0 => "<unk>".to_string(),
+                1 => "<s>".to_string(),
+                2 => "</s>".to_string(),
+                _ => format!("w{id}"),
+            })
+            .collect();
+        let refs: Vec<&[u8]> = texts.iter().map(|text| text.as_bytes()).collect();
+        let types: Vec<i32> = (0..self.n_vocab)
+            .map(|id| if id < 3 { 3 } else { 1 })
+            .collect();
+        builder
+            .string("tokenizer.ggml.model", "llama")
+            .strings("tokenizer.ggml.tokens", &refs)
+            .f32s("tokenizer.ggml.scores", &vec![0.0; self.n_vocab])
+            .i32s("tokenizer.ggml.token_type", &types);
+
+        let mut rng = Rng(self.seed);
+        let mut matrix = |builder: &mut Builder, name: &str, rows: usize, cols: usize| {
+            // Mamba 1's time step projection is too narrow for blocks, so
+            // files keep it in half floats, as llama.cpp's quantizer does.
+            let ty = if cols % self.ty.block_len() == 0 {
+                self.ty
+            } else {
+                TensorType::F16
+            };
+            let magnitude = 1.5 / (cols as f32).sqrt();
+            let data = random_weights(&mut rng, ty, rows * cols, magnitude);
+            builder.tensor(name, &[cols as u64, rows as u64], type_id(ty), data);
+        };
+        matrix(&mut builder, "token_embd.weight", self.n_vocab, d);
+        // Mamba models tie the output to the embeddings.
+        if arch != "mamba" {
+            matrix(&mut builder, "output.weight", self.n_vocab, d);
+        }
+        let head_dim = if hybrid { self.head_dim() } else { 0 };
+        for layer in layers.clone() {
+            let name = |part: &str| format!("blk.{layer}.{part}");
+            if self.is_mamba(layer) {
+                let in_rows = if mamba2 {
+                    inner + channels + heads
+                } else {
+                    2 * inner
+                };
+                matrix(&mut builder, &name("ssm_in.weight"), in_rows, d);
+                if !mamba2 {
+                    matrix(&mut builder, &name("ssm_x.weight"), rank + 2 * state, inner);
+                    matrix(&mut builder, &name("ssm_dt.weight"), inner, rank);
+                }
+                matrix(&mut builder, &name("ssm_out.weight"), d, inner);
+            } else {
+                let (q_dim, kv_dim) = (self.n_head * head_dim, self.n_head_kv * head_dim);
+                matrix(&mut builder, &name("attn_q.weight"), q_dim, d);
+                matrix(&mut builder, &name("attn_k.weight"), kv_dim, d);
+                matrix(&mut builder, &name("attn_v.weight"), kv_dim, d);
+                matrix(&mut builder, &name("attn_output.weight"), d, q_dim);
+            }
+            if hybrid {
+                matrix(&mut builder, &name("ffn_gate.weight"), self.n_ff, d);
+                matrix(&mut builder, &name("ffn_up.weight"), self.n_ff, d);
+                matrix(&mut builder, &name("ffn_down.weight"), d, self.n_ff);
+            }
+        }
+
+        // Vectors are stored as f32. The decay rates are negative, and with
+        // the time step's bias they keep a few positions in the state.
+        let mut rng = Rng(self.seed ^ 0x55a);
+        let mut vector =
+            |builder: &mut Builder, name: &str, dims: &[usize], low: f32, high: f32| {
+                let len = dims.iter().product();
+                let dims: Vec<u64> = dims.iter().map(|&dim| dim as u64).collect();
+                builder.tensor_f32(name, &dims, &rng.floats(len, low, high));
+            };
+        vector(&mut builder, "output_norm.weight", &[d], 0.5, 1.5);
+        for layer in layers {
+            let name = |part: &str| format!("blk.{layer}.{part}");
+            vector(&mut builder, &name("attn_norm.weight"), &[d], 0.5, 1.5);
+            if hybrid {
+                vector(&mut builder, &name("ffn_norm.weight"), &[d], 0.5, 1.5);
+            }
+            if !self.is_mamba(layer) {
+                continue;
+            }
+            let per_head = if mamba2 { 1 } else { state };
+            let mut rates = Rng(self.seed ^ (0xa0 + layer as u64));
+            let a: Vec<f32> = rates
+                .floats(per_head * heads, -2.0, 0.5)
+                .iter()
+                .map(|log| -log.exp())
+                .collect();
+            builder.tensor_f32(&name("ssm_a"), &[per_head as u64, heads as u64], &a);
+            vector(
+                &mut builder,
+                &name("ssm_conv1d.weight"),
+                &[taps, channels],
+                -1.0,
+                1.0,
+            );
+            vector(
+                &mut builder,
+                &name("ssm_conv1d.bias"),
+                &[channels],
+                -0.2,
+                0.2,
+            );
+            vector(&mut builder, &name("ssm_dt.bias"), &[heads], -2.0, 0.0);
+            if mamba2 {
+                vector(&mut builder, &name("ssm_d"), &[1, heads], 0.5, 1.5);
+                vector(
+                    &mut builder,
+                    &name("ssm_norm.weight"),
+                    &[inner / groups, groups],
+                    0.5,
+                    1.5,
+                );
+            } else {
+                vector(&mut builder, &name("ssm_d"), &[inner], 0.5, 1.5);
             }
         }
         builder.build()

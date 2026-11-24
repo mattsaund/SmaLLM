@@ -34,6 +34,12 @@
 //! Gemma 4 also adds a small input of its own to every block, looked up per
 //! token. The differences between architectures are all in [`Config`] and
 //! in which optional tensors a layer has.
+//!
+//! A Mamba block mixes positions through a recurrent state instead, and
+//! most Mamba models have no feed-forward network. `forward/mamba.rs` has
+//! its math.
+
+mod mamba;
 
 use std::cell::UnsafeCell;
 use std::ops::Range;
@@ -56,6 +62,7 @@ use super::weights::{
     AttentionWeights, ConvWeights, Dense, Experts, FeedForward, Linear, Matrix, MixerWeights,
     PerLayerInputs, PerLayerWeights,
 };
+use mamba::MambaScratch;
 
 /// Context length used when the caller does not choose one.
 const DEFAULT_CONTEXT: usize = 4096;
@@ -70,7 +77,8 @@ const INLINE_ATTENTION_WORK: usize = 64 * 1024;
 ///
 /// Convolution blocks are timed with the attention stages: their input
 /// projection as `Project`, the convolution as `Attention` and their output
-/// projection as `AttentionOut`.
+/// projection as `AttentionOut`. Mamba blocks are timed the same way, with
+/// their scan as `Attention`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
     /// Token embedding lookup and rotary tables.
@@ -485,6 +493,7 @@ struct Scratch {
     h: Vec<f32>,
     attention: AttentionScratch,
     conv: ConvScratch,
+    mamba: MambaScratch,
     /// The feed-forward gate and up projections.
     gate: Vec<f32>,
     up: Vec<f32>,
@@ -583,6 +592,14 @@ impl Session {
         } else {
             ConvScratch::default()
         };
+        let mamba = c
+            .layers
+            .iter()
+            .find_map(|layer| match layer.mixer {
+                Mixer::Mamba(ssm) => Some(MambaScratch::new(&ssm, batch)),
+                _ => None,
+            })
+            .unwrap_or_default();
         let per = c.per_layer_embd;
         let per_layer = if per > 0 {
             PerLayerScratch {
@@ -642,6 +659,7 @@ impl Session {
                 ),
             },
             conv: conv_scratch,
+            mamba,
             gate: vec![0.0; batch * n_ff],
             up: vec![0.0; batch * n_ff],
             experts,
@@ -879,6 +897,7 @@ impl Session {
             h,
             attention,
             conv: conv_scratch,
+            mamba,
             gate,
             up,
             experts,
@@ -956,6 +975,7 @@ impl Session {
             match &layer.mixer {
                 MixerWeights::Attention(weights) => pass.attention(&run, weights, h, attention),
                 MixerWeights::ShortConv(weights) => pass.short_conv(&run, weights, h, conv_scratch),
+                MixerWeights::Mamba(weights) => pass.mamba(&run, weights, h, mamba),
             }
             let n_active = run.active.len();
             if n_active == 0 {
@@ -972,6 +992,11 @@ impl Session {
                 eps,
                 config.residual_scale,
             );
+            // Mamba blocks are their mixer alone.
+            if let FeedForward::None = layer.ffn {
+                pass.lap(Phase::Norm);
+                continue;
+            }
 
             // Feed-forward: a gated network, or a mixture of them.
             for (out, row) in h_active.chunks_exact_mut(d).zip(x_active.chunks_exact(d)) {
@@ -983,6 +1008,7 @@ impl Session {
                 FeedForward::Experts(weights) => {
                     pass.experts(weights, spec, h_active, (gate, up), experts)
                 }
+                FeedForward::None => unreachable!("Mamba blocks skip the feed-forward network"),
             }
             add_residual(
                 kernels,

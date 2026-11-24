@@ -253,6 +253,21 @@ fn phi_4_mini_q4_k_m() {
 }
 
 #[test]
+fn mamba_370m_q8_0() {
+    check("mamba-370m-hf.Q8_0");
+}
+
+#[test]
+fn mamba2_130m_q8_0() {
+    check("mamba2-130m-hf-q8_0");
+}
+
+#[test]
+fn granite_4_0_h_350m_q4_k_m() {
+    check("granite-4.0-h-350m-Q4_K_M");
+}
+
+#[test]
 fn every_golden_file_has_a_test() {
     let tested = [
         "gemma-2-2b-it-Q4_K_M",
@@ -270,6 +285,9 @@ fn every_golden_file_has_a_test() {
         "gemma-3-270m-it-Q4_K_M",
         "Llama-3.2-1B-Instruct-Q4_K_M",
         "tinyllama-1.1b-chat-v1.0.Q4_K_M",
+        "mamba-370m-hf.Q8_0",
+        "mamba2-130m-hf-q8_0",
+        "granite-4.0-h-350m-Q4_K_M",
     ];
     for entry in std::fs::read_dir(golden_dir()).unwrap() {
         let path = entry.unwrap().path();

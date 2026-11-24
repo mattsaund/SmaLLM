@@ -90,6 +90,26 @@ pub fn main(raw: impl Iterator<Item = String>) -> Result<(), String> {
             format!("{n_attention} attention, {n_conv} short convolution"),
         );
     }
+    let mamba = config.layers.iter().filter_map(|layer| match layer.mixer {
+        Mixer::Mamba(ssm) => Some(ssm),
+        _ => None,
+    });
+    if let Some(ssm) = mamba.clone().next() {
+        let kind = if ssm.mamba2 { "Mamba 2" } else { "Mamba" };
+        row(
+            "blocks",
+            format!("{n_attention} attention, {} {kind}", mamba.count()),
+        );
+        row(
+            "state",
+            format!(
+                "{} channels in {} heads, {} floats of state each",
+                ssm.inner,
+                ssm.heads(),
+                ssm.state
+            ),
+        );
+    }
     let windowed: Vec<usize> = attention
         .iter()
         .filter(|layer| layer.window > 0)

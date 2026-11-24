@@ -52,4 +52,7 @@ LFM2-8B-A1B-Q4_K_M.gguf                    chatml.txt  32
 granite-3.1-1b-a400m-instruct-Q4_K_M.gguf  granite.txt 32
 gemma-2-2b-it-Q4_K_M.gguf                  gemma.txt   32
 microsoft_Phi-4-mini-instruct-Q4_K_M.gguf  phi4-mini.txt 32
+mamba-370m-hf.Q8_0.gguf                    plain.txt   48
+mamba2-130m-hf-q8_0.gguf                   plain.txt   48
+granite-4.0-h-350m-Q4_K_M.gguf             granite.txt 32
 TABLE

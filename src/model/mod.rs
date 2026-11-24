@@ -9,6 +9,7 @@
 //! | `encoder.rs` | Encoder models, for embeddings and reranking.            |
 //! | `matmul.rs`  | The parallel matrix multiply.                            |
 //! | `forward.rs` | The forward pass and the [`Session`] type.               |
+//! | `forward/mamba.rs` | Mamba blocks: a convolution and a selective scan. |
 
 mod config;
 mod conv;
@@ -29,13 +30,13 @@ use crate::gguf::Gguf;
 use crate::tokenizer::Tokenizer;
 
 pub use config::{
-    ARCHITECTURES, Activation, Config, Gating, LayerSpec, Mixer, Rope, Routing, Yarn,
+    ARCHITECTURES, Activation, Config, Gating, LayerSpec, Mixer, Rope, Routing, Ssm, Yarn,
 };
 pub use encoder::{ENCODERS, Embedder, Pooling, normalize};
 pub use forward::{Phase, Profile, Session, SessionConfig};
 pub use weights::{
     AttentionWeights, ConvWeights, Dense, ExpertMatrix, Experts, FeedForward, Layer, Linear,
-    Matrix, MixerWeights, PerLayerInputs, PerLayerWeights, Weights,
+    LowRank, MambaWeights, Matrix, MixerWeights, PerLayerInputs, PerLayerWeights, Weights,
 };
 
 /// A model file, opened and ready to run.

@@ -425,6 +425,146 @@ mod oracle {
             .collect()
     }
 
+    /// A Mamba block over every position, from scratch. It reads the small
+    /// tensors as the file stores them, applies whole projection matrices
+    /// and splits their outputs where llama.cpp does, and carries the
+    /// state in f64 with the formulas of the Mamba papers.
+    fn mamba(model: &Model, index: usize, w: &MambaWeights, inputs: &[Vec<f64>]) -> Vec<Vec<f64>> {
+        let c = model.config();
+        let Mixer::Mamba(ssm) = c.layers[index].mixer else {
+            panic!("layer {index} is not a Mamba block");
+        };
+        let stored = |part: &str| tensor(model, &format!("blk.{index}.{part}"));
+        let whole = |matrix: &Matrix| Linear {
+            matrix: *matrix,
+            first_row: 0,
+            rows: matrix.rows,
+            bias: None,
+        };
+        let silu = |x: f64| x / (1.0 + (-x).exp());
+        let softplus = |x: f64| (1.0 + x.exp()).ln();
+        let (inner, n, taps, groups) = (ssm.inner, ssm.state, ssm.conv_kernel, ssm.groups);
+        let heads = if ssm.mamba2 { ssm.dt_rank } else { inner };
+        let head_dim = inner / heads;
+        let channels = if ssm.mamba2 {
+            inner + 2 * groups * n
+        } else {
+            inner
+        };
+        // The kernel is stored channel by channel.
+        let (kernel, conv_bias) = (stored("ssm_conv1d.weight"), stored("ssm_conv1d.bias"));
+        let (a, d, dt_bias) = (stored("ssm_a"), stored("ssm_d"), stored("ssm_dt.bias"));
+
+        // Mamba 1's input projection holds x, then z. Mamba 2's holds z,
+        // then x with B and C, then the time steps.
+        let mut signal = Vec::new();
+        let mut gates = Vec::new();
+        let mut steps = Vec::new();
+        for h in inputs {
+            let all = apply(model, &whole(&w.x.matrix), h);
+            if ssm.mamba2 {
+                gates.push(all[..inner].to_vec());
+                signal.push(all[inner..inner + channels].to_vec());
+                let raw = &all[inner + channels..];
+                steps.push(raw.iter().zip(&dt_bias).map(|(s, b)| s + b).collect());
+            } else {
+                signal.push(all[..inner].to_vec());
+                gates.push(all[inner..].to_vec());
+                steps.push(Vec::new());
+            }
+        }
+        // The causal convolution sees zeros before the first position.
+        let convolved: Vec<Vec<f64>> = (0..inputs.len())
+            .map(|position| {
+                (0..channels)
+                    .map(|channel| {
+                        let sum: f64 = (0..taps)
+                            .filter_map(|tap| {
+                                let earlier = (position + tap).checked_sub(taps - 1)?;
+                                Some(kernel[channel * taps + tap] * signal[earlier][channel])
+                            })
+                            .sum();
+                        silu(sum + conv_bias[channel])
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let gain: Vec<f32> = match ssm.mamba2 {
+            true => stored("ssm_norm.weight")
+                .iter()
+                .map(|v| *v as f32)
+                .collect(),
+            false => Vec::new(),
+        };
+        let mut state = vec![0.0f64; inner * n];
+        let mut outputs = Vec::new();
+        for (position, x) in convolved.iter().enumerate() {
+            let mut y = vec![0.0f64; inner];
+            match &w.low_rank {
+                // Mamba 1: every channel is a head, and every element of
+                // its state decays at its own rate.
+                Some(low_rank) => {
+                    let rank = ssm.dt_rank;
+                    let all = apply(model, &whole(&low_rank.dt.matrix), x);
+                    let mut low = all[..rank].to_vec();
+                    let mut b = all[rank..rank + n].to_vec();
+                    let mut cc = all[rank + n..rank + 2 * n].to_vec();
+                    if ssm.dt_b_c_norm {
+                        low = rms_norm(&low, None, c.norm_eps);
+                        b = rms_norm(&b, None, c.norm_eps);
+                        cc = rms_norm(&cc, None, c.norm_eps);
+                    }
+                    let dt = apply(model, &w.dt, &low);
+                    for channel in 0..inner {
+                        let delta = softplus(dt[channel]);
+                        for s in 0..n {
+                            let at = channel * n + s;
+                            let decay = (delta * a[at]).exp();
+                            state[at] = state[at] * decay + delta * b[s] * x[channel];
+                            y[channel] += state[at] * cc[s];
+                        }
+                        y[channel] += d[channel] * x[channel];
+                    }
+                }
+                // Mamba 2: a head decays as one, and reads the B and C of
+                // its group, which follow the signal.
+                None => {
+                    for head in 0..heads {
+                        let delta = softplus(steps[position][head]);
+                        let decay = (delta * a[head]).exp();
+                        let group = head / (heads / groups);
+                        let b = &x[inner + group * n..][..n];
+                        let cc = &x[inner + (groups + group) * n..][..n];
+                        for channel in head * head_dim..(head + 1) * head_dim {
+                            for s in 0..n {
+                                let at = channel * n + s;
+                                state[at] = state[at] * decay + delta * b[s] * x[channel];
+                                y[channel] += state[at] * cc[s];
+                            }
+                            y[channel] += d[head] * x[channel];
+                        }
+                    }
+                }
+            }
+            let mut gated: Vec<f64> = y
+                .iter()
+                .zip(&gates[position])
+                .map(|(y, z)| y * silu(*z))
+                .collect();
+            if ssm.mamba2 {
+                let width = inner / groups;
+                gated = gated
+                    .chunks(width)
+                    .zip(gain.chunks(width))
+                    .flat_map(|(part, gain)| rms_norm(part, Some(gain), c.norm_eps))
+                    .collect();
+            }
+            outputs.push(apply(model, &w.out, &gated));
+        }
+        outputs
+    }
+
     /// The logits after `tokens`, computed from scratch.
     pub fn logits(model: &Model, tokens: &[u32]) -> Vec<f64> {
         let (c, w) = (model.config(), model.weights());
@@ -478,6 +618,7 @@ mod oracle {
             let updates = match &layer.mixer {
                 MixerWeights::Attention(a) => attention(model, index, a, &inputs, &mut caches),
                 MixerWeights::ShortConv(cw) => short_conv(model, index, cw, &inputs),
+                MixerWeights::Mamba(mw) => mamba(model, index, mw, &inputs),
             };
             for (position, mut update) in updates.into_iter().enumerate() {
                 if let Some(weight) = &layer.attn_post_norm {
@@ -488,10 +629,15 @@ mod oracle {
                     .for_each(|v| *v *= c.residual_scale as f64);
                 add(&mut x[position], &update);
 
+                // Mamba blocks are their mixer alone.
+                if let FeedForward::None = layer.ffn {
+                    continue;
+                }
                 let h = rms_norm(&x[position], Some(&layer.ffn_norm), eps);
                 let mut update = match &layer.ffn {
                     FeedForward::Dense(dense) => feed_forward(model, dense, &h),
                     FeedForward::Experts(experts) => mixture(model, experts, &h),
+                    FeedForward::None => unreachable!("skipped above"),
                 };
                 if let Some(weight) = &layer.ffn_post_norm {
                     update = rms_norm(&update, Some(weight), eps);
@@ -832,6 +978,124 @@ fn convolution_state_survives_rolling_back() {
         assert_eq!(session.cache_bytes(), full_size);
         session.clear();
         assert!(session.cache_bytes() < full_size / 4);
+    }
+}
+
+/// The models with Mamba blocks, in weights of type `ty`: Mamba, Falcon
+/// Mamba, Mamba 2 and Granite 4.0 H.
+fn mamba_models(ty: TensorType) -> Vec<TinyModel> {
+    let mut falcon = TinyModel::new("mamba", ty);
+    falcon.ssm_norms = true;
+    vec![
+        TinyModel::new("mamba", ty),
+        falcon,
+        TinyModel::new("mamba2", ty),
+        TinyModel::new("granitehybrid", ty),
+    ]
+}
+
+#[test]
+fn mamba_models_match_the_oracle() {
+    for spec in mamba_models(TensorType::F32) {
+        let model = load(&spec);
+        // The long prompt fills batches that take the tile route.
+        for tokens in [&PROMPT[..], &LONG_PROMPT[..]] {
+            let expected = oracle::logits(&model, tokens);
+            for (threads, batch) in [(1, 1), (1, 4), (3, 32)] {
+                let got = logits(&model, tokens, threads, batch);
+                let error = relative_error(&got, &expected);
+                assert!(
+                    error < 2e-4,
+                    "{} norms {} {} tokens, threads {threads} batch {batch}: error {error}",
+                    spec.arch,
+                    spec.ssm_norms,
+                    tokens.len()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn quantized_mamba_models_stay_close_to_the_oracle() {
+    for ty in [TensorType::Q8_0, TensorType::Q4_0, TensorType::Q4K] {
+        for spec in mamba_models(ty) {
+            let model = load(&spec);
+            let expected = oracle::logits(&model, &PROMPT);
+            let error = relative_error(&logits(&model, &PROMPT, 2, 4), &expected);
+            assert!(error < 0.08, "{} {}: error {error}", spec.arch, ty.name());
+        }
+    }
+}
+
+#[test]
+fn mamba_models_batch_and_thread_exactly() {
+    // The scan runs every token in order whatever the batch, and threads
+    // split it by heads, so neither changes a bit of the result below the
+    // batches that take the tile route.
+    for ty in [TensorType::F32, TensorType::Q8_0] {
+        for spec in mamba_models(ty) {
+            let model = load(&spec);
+            let expected = logits(&model, &PROMPT, 1, 1);
+            for (threads, batch) in [(1, 2), (1, 7), (4, 3), (3, 5), (8, 1)] {
+                assert_eq!(
+                    logits(&model, &PROMPT, threads, batch),
+                    expected,
+                    "{} {} threads {threads} batch {batch}",
+                    spec.arch,
+                    ty.name()
+                );
+            }
+            let wide = logits(&model, &LONG_PROMPT, 3, 32);
+            let narrow: Vec<f64> = logits(&model, &LONG_PROMPT, 1, 1)
+                .iter()
+                .map(|v| *v as f64)
+                .collect();
+            let error = relative_error(&wide, &narrow);
+            assert!(error < 1e-3, "{} {}: error {error}", spec.arch, ty.name());
+        }
+    }
+}
+
+#[test]
+fn recurrent_state_survives_rolling_back() {
+    // A chat: a prompt, a reply generated one token at a time, then cuts
+    // back into the reply, to the end of the prompt, and before it. The
+    // session restores the state saved at the end of a prompt, or starts
+    // over, and reads the tokens after it again.
+    let prompt: Vec<u32> = (0..50u32).map(|i| 3 + (i * 7) % 37).collect();
+    let reply = [30, 31, 32, 33];
+    let next = [34, 35];
+    for spec in mamba_models(TensorType::F32) {
+        let model = load(&spec);
+        let mut session = session(&model, 2, 5, None);
+        session.eval(&prompt).unwrap();
+        for token in reply {
+            session.eval(&[token]).unwrap();
+        }
+        let mut context = prompt.clone();
+        context.extend(reply);
+        for len in [53, 50, 49, 20, 0] {
+            session.truncate(len);
+            assert_eq!(session.tokens(), &context[..len]);
+            session.eval(&next).unwrap();
+            let mut expected = context[..len].to_vec();
+            expected.extend(next);
+            assert_eq!(
+                session.logits(),
+                logits(&model, &expected, 2, 5),
+                "{} cut to {len}",
+                spec.arch
+            );
+            // Back to the whole conversation for the next cut.
+            session.truncate(len);
+            session.eval(&context[len..]).unwrap();
+            assert_eq!(session.logits(), logits(&model, &context, 2, 5));
+        }
+        // The state and the copies saved at prompt ends, which are a few.
+        let state = session.cache_bytes();
+        session.clear();
+        assert!(session.cache_bytes() < state);
     }
 }
 

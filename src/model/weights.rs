@@ -13,7 +13,7 @@ use crate::gguf::{Gguf, TensorInfo};
 use crate::tensor::TensorType;
 use crate::tensor::quant::dequantize_row;
 
-use super::config::{Config, Mixer};
+use super::config::{Config, Mixer, Ssm};
 
 /// A weight matrix stored in the model file, one row after another.
 #[derive(Clone, Copy, Debug)]
@@ -76,10 +76,53 @@ pub struct ConvWeights {
     pub out_proj: Linear,
 }
 
+/// The weights of a Mamba block.
+///
+/// One input projection yields the output gate `z` and the signal `x` that
+/// the convolution reads, and in Mamba 2 also each head's time step. They
+/// are bound as maps over that one matrix. In Mamba 2 the signal also
+/// carries B and C of every group, after the channels.
+pub struct MambaWeights {
+    pub z: Linear,
+    pub x: Linear,
+    /// The convolution kernel, tap by tap: `conv[tap * channels + channel]`.
+    /// The last tap applies to the current position.
+    pub conv: Vec<f32>,
+    /// Added to the convolution's output. Zeros when the file has none.
+    pub conv_bias: Vec<f32>,
+    /// Mamba 1 projects the convolved signal to the time step in low-rank
+    /// form, and to B and C. Mamba 2 has none of these.
+    pub low_rank: Option<LowRank>,
+    /// The time step before its softplus, with its bias. Mamba 1 projects
+    /// it up from the low-rank form, one per channel. Mamba 2 takes it from
+    /// the block's input, one per head: rows of the input projection.
+    pub dt: Linear,
+    /// How fast the state decays, as negative rates: one per channel and
+    /// element of the state in Mamba 1, element by element, `a[element *
+    /// inner + channel]`, and one per head in Mamba 2.
+    pub a: Vec<f32>,
+    /// Weight of the skip from the signal to the output: one per channel in
+    /// Mamba 1, one per head in Mamba 2.
+    pub d: Vec<f32>,
+    /// Mamba 2: the gain of the RMS norm that each group's share of the
+    /// output gets before the output projection.
+    pub norm: Option<Vec<f32>>,
+    pub out: Linear,
+}
+
+/// Mamba 1's projection of the convolved signal, as three maps over one
+/// matrix: the time step in low-rank form, B and C.
+pub struct LowRank {
+    pub dt: Linear,
+    pub b: Linear,
+    pub c: Linear,
+}
+
 /// What a block mixes positions with.
 pub enum MixerWeights {
     Attention(AttentionWeights),
     ShortConv(ConvWeights),
+    Mamba(Box<MambaWeights>),
 }
 
 /// A layer's part of the per-layer token embeddings (Gemma 4).
@@ -142,6 +185,8 @@ pub struct Experts {
 pub enum FeedForward {
     Dense(Box<Dense>),
     Experts(Box<Experts>),
+    /// No feed-forward network: the block is its mixer alone (Mamba).
+    None,
 }
 
 /// The weights of one block.
@@ -339,9 +384,15 @@ impl Weights {
                         out_proj: layer_whole("shortconv.out_proj", d, d)?,
                     })
                 }
+                Mixer::Mamba(ssm) => MixerWeights::Mamba(Box::new(mamba(file, index, d, &ssm)?)),
             };
 
+            // Mamba and Mamba 2 blocks are their mixer alone. Granite 4.0 H
+            // gives its Mamba blocks a feed-forward network.
+            let bare = matches!(spec.mixer, Mixer::Mamba(_))
+                && file.tensor(&name("ffn_norm.weight")).is_none();
             let ffn = match &config.routing {
+                _ if bare => FeedForward::None,
                 Some(routing) if file.tensor(&name("ffn_gate_inp.weight")).is_some() => {
                     let experts = experts(file, index, d, routing.count)?;
                     spec.n_ff_expert = experts.gate.rows;
@@ -381,7 +432,11 @@ impl Weights {
                 attn_norm: vector(file, &name("attn_norm.weight"), d)?,
                 mixer,
                 attn_post_norm: optional_vector(file, &name("post_attention_norm.weight"), d)?,
-                ffn_norm: vector(file, &name("ffn_norm.weight"), d)?,
+                ffn_norm: if bare {
+                    Vec::new()
+                } else {
+                    vector(file, &name("ffn_norm.weight"), d)?
+                },
                 ffn,
                 ffn_post_norm: optional_vector(file, &name("post_ffw_norm.weight"), d)?,
                 per_layer: per_layer_weights,
@@ -501,6 +556,78 @@ fn experts(file: &Gguf, index: usize, d: usize, count: usize) -> Result<Experts>
             offset: 0,
         },
         shared,
+    })
+}
+
+/// Binds the Mamba block of layer `index`. The input projection is split
+/// the way llama.cpp reads it: the signal, then the gate, in Mamba 1. The
+/// gate, then the signal with B and C, then the time steps, in Mamba 2.
+fn mamba(file: &Gguf, index: usize, d: usize, ssm: &Ssm) -> Result<MambaWeights> {
+    let name = |part: &str| format!("blk.{index}.{part}");
+    let (inner, state, heads, taps) = (ssm.inner, ssm.state, ssm.heads(), ssm.conv_kernel);
+    let channels = ssm.conv_channels();
+    let rows_of = |matrix: Matrix, first_row: usize, rows: usize| Linear {
+        matrix,
+        first_row,
+        rows,
+        bias: None,
+    };
+
+    // Stored channel by channel. The convolution reads it tap by tap.
+    let stored = vector(file, &name("ssm_conv1d.weight"), taps * channels)?;
+    let mut conv = vec![0.0; taps * channels];
+    for channel in 0..channels {
+        for tap in 0..taps {
+            conv[tap * channels + channel] = stored[channel * taps + tap];
+        }
+    }
+    let conv_bias = optional_vector(file, &name("ssm_conv1d.bias"), channels)?
+        .unwrap_or_else(|| vec![0.0; channels]);
+    let out = whole(file, &name("ssm_out"), d, inner)?;
+
+    if ssm.mamba2 {
+        let in_proj = matrix(file, &name("ssm_in.weight"), inner + channels + heads, d)?;
+        let mut dt = rows_of(in_proj, inner + channels, heads);
+        dt.bias = Some(vector(file, &name("ssm_dt.bias"), heads)?);
+        return Ok(MambaWeights {
+            z: rows_of(in_proj, 0, inner),
+            x: rows_of(in_proj, inner, channels),
+            conv,
+            conv_bias,
+            low_rank: None,
+            dt,
+            a: vector(file, &name("ssm_a"), heads)?,
+            d: vector(file, &name("ssm_d"), heads)?,
+            norm: Some(vector(file, &name("ssm_norm.weight"), inner)?),
+            out,
+        });
+    }
+    let in_proj = matrix(file, &name("ssm_in.weight"), 2 * inner, d)?;
+    let rank = ssm.dt_rank;
+    let x_proj = matrix(file, &name("ssm_x.weight"), rank + 2 * state, inner)?;
+    // Stored channel by channel. The scan reads them element by element.
+    let stored = vector(file, &name("ssm_a"), inner * state)?;
+    let mut a = vec![0.0; inner * state];
+    for channel in 0..inner {
+        for element in 0..state {
+            a[element * inner + channel] = stored[channel * state + element];
+        }
+    }
+    Ok(MambaWeights {
+        z: rows_of(in_proj, inner, inner),
+        x: rows_of(in_proj, 0, inner),
+        conv,
+        conv_bias,
+        low_rank: Some(LowRank {
+            dt: rows_of(x_proj, 0, rank),
+            b: rows_of(x_proj, rank, state),
+            c: rows_of(x_proj, rank + state, state),
+        }),
+        dt: whole(file, &name("ssm_dt"), inner, rank)?,
+        a,
+        d: vector(file, &name("ssm_d"), inner)?,
+        norm: None,
+        out,
     })
 }
 
