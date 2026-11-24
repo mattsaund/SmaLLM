@@ -6,7 +6,7 @@ use crate::tensor::f16::{bf16_to_f32, f16_to_f32, f32_to_f16};
 use crate::tensor::quant::{Tile, dequantize_row};
 use crate::testing::{Rng, random_weights, set_scales};
 
-const QUANT_TYPES: [TensorType; 11] = [
+const QUANT_TYPES: [TensorType; 22] = [
     TensorType::Q4_0,
     TensorType::Q4_1,
     TensorType::Q5_0,
@@ -18,6 +18,17 @@ const QUANT_TYPES: [TensorType; 11] = [
     TensorType::Q4K,
     TensorType::Q5K,
     TensorType::Q6K,
+    TensorType::Iq4Xs,
+    TensorType::Iq3S,
+    TensorType::Iq3Xxs,
+    TensorType::Iq2S,
+    TensorType::Iq2Xs,
+    TensorType::Iq2Xxs,
+    TensorType::Iq1M,
+    TensorType::Iq1S,
+    TensorType::Tq2_0,
+    TensorType::Tq1_0,
+    TensorType::Mxfp4,
 ];
 
 /// An activation vector quantized by one backend.

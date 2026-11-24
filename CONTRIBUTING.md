@@ -70,6 +70,7 @@ SmaLLM/
 │   ├── tensor/              weight formats
 │   │   ├── mod.rs           the list of element types and their sizes
 │   │   ├── quant.rs         the bit layout of every quantized block
+│   │   ├── iq_tables.rs     the IQ formats' grids, from tools/gen_iq_tables.py
 │   │   └── f16.rs           half-float conversion
 │   ├── kernels/             the hot loops
 │   │   ├── mod.rs           the kernel table and backend selection
@@ -127,15 +128,21 @@ SmaLLM/
 ├── tests/                   integration tests
 │   ├── golden.rs            agreement with llama.cpp on real models
 │   ├── golden/              reference results, prompts and texts
-│   ├── golden/vocab/        tokenizer results for vocabularies llama.cpp has none for
+│   │   ├── vocab/           tokenizer results for vocabularies llama.cpp has none for
+│   │   └── quant/           blocks and the floats ggml expands them to
 │   ├── compare.rs           logits and embeddings against llama.cpp's, by hand
+│   ├── quant.rs             weight formats expanded exactly as ggml does
 │   ├── tokenizers.rs        llama.cpp's tokenizer test texts
 │   └── writing.rs           the writing rules below, enforced
 ├── tools/
 │   ├── gen_unicode.py       writes the Unicode tables
 │   ├── gen_pretok.py        writes the BPE families from llama.cpp's source
 │   ├── gen_unicode_maps.py  writes the WordPiece lowercase and accent tables
+│   ├── gen_iq_tables.py     writes the IQ grids from ggml's source
 │   └── reference/           makes the golden files from llama.cpp
+│       ├── ref.c            the llama.cpp side of the golden tests
+│       ├── golden.sh        runs ref over the models
+│       └── quant.c          the vectors in tests/golden/quant
 ├── docs/ARCHITECTURE.md     how the engine works and why
 ├── install.sh, install.ps1  the one-line installers
 ├── .cargo/config.toml       static C runtime for Windows builds
@@ -150,7 +157,7 @@ engine and explains the design choices.
 | To | Edit |
 |---|---|
 | support a new architecture | `ARCHITECTURES` and the `match` in `model/config.rs`, which sets the model-wide switches and each layer's `LayerSpec`. New tensors go in `model/weights.rs`, new math in `model/forward.rs` and the oracle in `model/tests.rs`. Check it with `tests/compare.rs` and add a golden file from a real model |
-| support a new weight format | `TensorType` in `tensor/mod.rs`, a decoder in `tensor/quant.rs`, and a row in `kernels/scalar.rs`. The scalar row is enough to be correct |
+| support a new weight format | `TensorType` in `tensor/mod.rs`, a decoder in `tensor/quant.rs`, and a row in `kernels/scalar.rs`. The scalar row is enough to be correct. Add the format to `tools/reference/quant.c` and `tests/quant.rs` to check it against ggml |
 | speed up a weight format | a kernel in `kernels/x86.rs` or `kernels/arm.rs`. `kernels/tests.rs` checks it against the scalar one without further work |
 | add a chat format | `Template` in `chat.rs`: detection, rendering and a test |
 | add a word splitting rule | run `tools/gen_pretok.py` on a newer llama.cpp. A rule that is common and slow can get a scanner in `tokenizer/pretok.rs` |

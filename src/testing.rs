@@ -38,18 +38,74 @@ fn half_offsets(ty: TensorType) -> &'static [usize] {
         TensorType::Q2K => &[80, 82],
         TensorType::Q3K => &[108],
         TensorType::Q6K => &[208],
+        TensorType::Iq4Xs
+        | TensorType::Iq3S
+        | TensorType::Iq3Xxs
+        | TensorType::Iq2S
+        | TensorType::Iq2Xs
+        | TensorType::Iq2Xxs
+        | TensorType::Iq1S => &[0],
+        TensorType::Tq2_0 => &[64],
+        TensorType::Tq1_0 => &[52],
         _ => &[],
     }
+}
+
+/// How far the weights of `ty` reach for a scale of one, compared with the
+/// 127 of Q8_0: the largest integer weight times the largest sub-block
+/// scale the format can encode, over 127.
+///
+/// Random scales of the IQ, TQ and MXFP4 formats are divided by it, so
+/// that their random weights come out about as large as Q8_0's. The older
+/// formats count as 1, as they did when their tests were tuned.
+fn reach(ty: TensorType) -> f32 {
+    let largest = match ty {
+        // IQ4_NL levels up to 127, times 6-bit scales from -32.
+        TensorType::Iq4Xs => 127.0 * 32.0,
+        // Grid values up to 15, times 1 + 2 * 15.
+        TensorType::Iq3S => 15.0 * 31.0,
+        // Grid values up to 62, times (0.5 + 15) / 2.
+        TensorType::Iq3Xxs => 62.0 * 7.75,
+        // Grid values up to 43, times (0.5 + 15) / 4.
+        TensorType::Iq2S | TensorType::Iq2Xs | TensorType::Iq2Xxs => 43.0 * 3.875,
+        // A grid value of 1 plus a delta of 1/8, times 2 * 7 + 1.
+        TensorType::Iq1M | TensorType::Iq1S => 1.125 * 15.0,
+        TensorType::Tq2_0 | TensorType::Tq1_0 => 1.0,
+        // The largest FP4 level, doubled. The scale is set directly.
+        TensorType::Mxfp4 => 12.0,
+        _ => 127.0,
+    };
+    largest / 127.0
 }
 
 /// Overwrites the scale fields of every block with finite values of at most
 /// `magnitude`. Random bytes are valid weights in every format, but not
 /// valid scales.
 pub(crate) fn set_scales(rng: &mut Rng, ty: TensorType, row: &mut [u8], magnitude: f32) {
+    let magnitude = magnitude / reach(ty);
     for block in row.chunks_exact_mut(ty.block_bytes()) {
         for &at in half_offsets(ty) {
             let scale = rng.range(-magnitude, magnitude);
             block[at..at + 2].copy_from_slice(&f32_to_f16(scale).to_le_bytes());
+        }
+        match ty {
+            // IQ1_M keeps its half scale in the top nibbles of its four
+            // scale words, the first word's nibble lowest.
+            TensorType::Iq1M => {
+                let bits = f32_to_f16(rng.range(-magnitude, magnitude));
+                for k in 0..4 {
+                    let nibble = ((bits >> (4 * k)) & 0x0f) as u8;
+                    block[49 + 2 * k] = (block[49 + 2 * k] & 0x0f) | (nibble << 4);
+                }
+            }
+            // An MXFP4 scale is a power of two, stored as its exponent.
+            // Exponent `e` stands for 2 to the `e - 128`, so the float
+            // exponent of `scale`, plus one, picks the power just below it.
+            TensorType::Mxfp4 => {
+                let scale = rng.range(0.0, magnitude);
+                block[0] = ((scale.to_bits() >> 23) & 0xff) as u8 + 1;
+            }
+            _ => {}
         }
     }
 }
