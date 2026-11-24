@@ -89,6 +89,7 @@ pub fn main(raw: impl Iterator<Item = String>) -> Result<(), String> {
         sampler: sampler_config(&args)?,
         stop: args.all("stop"),
         show_special: args.has("show-special"),
+        reasoning: false,
         overflow,
         keep,
     };
@@ -209,11 +210,31 @@ fn answer(
     if dropped > 0 {
         eprintln!("smallm: the context is full, so the {dropped} oldest messages were left out");
     }
+    // The reasoning of a thinking model is shown faint in a terminal and
+    // left out of a file or pipe. It is not part of the reply that the
+    // conversation keeps.
+    let mut options = options.clone();
+    options.reasoning = true;
+    let show_reasoning = term::stdout_is_terminal();
     let mut reply = String::new();
+    let mut thinking = false;
     term::begin_generation();
-    let result = generate::run_tokens(session, &tokens, options, |piece| {
-        reply.push_str(piece);
-        print_piece(piece)
+    let result = generate::run_tokens_with(session, &tokens, &options, |piece| {
+        if piece.reasoning {
+            if !show_reasoning {
+                return !term::interrupted();
+            }
+            thinking = true;
+            return print_piece(&term::faint(piece.text));
+        }
+        // A blank line between the reasoning and the answer.
+        let gap = if std::mem::take(&mut thinking) {
+            "\n\n"
+        } else {
+            ""
+        };
+        reply.push_str(piece.text);
+        print_piece(gap) && print_piece(piece.text)
     });
     term::end_generation();
     let stats = result.map_err(|error| error.to_string())?;

@@ -450,8 +450,13 @@ impl Server {
                     &envelope.chunk(Some("assistant"), Some(""), None).to_text(),
                 )?;
             }
-            let result = generate::run_tokens(&mut session, &tokens, &job.options, |piece| {
-                http::send_event(out, &envelope.chunk(None, Some(piece), None).to_text()).is_ok()
+            let result = generate::run_tokens_with(&mut session, &tokens, &job.options, |piece| {
+                let chunk = if piece.reasoning {
+                    envelope.reasoning_chunk(piece.text)
+                } else {
+                    envelope.chunk(None, Some(piece.text), None)
+                };
+                http::send_event(out, &chunk.to_text()).is_ok()
             });
             match result {
                 Ok(stats) => {
@@ -469,15 +474,20 @@ impl Server {
                 Err(error) => http::send_event(out, &error_json(&error.to_string()).to_text()),
             }
         } else {
-            let mut text = String::new();
-            let result = generate::run_tokens(&mut session, &tokens, &job.options, |piece| {
-                text.push_str(piece);
+            let (mut text, mut reasoning) = (String::new(), String::new());
+            let result = generate::run_tokens_with(&mut session, &tokens, &job.options, |piece| {
+                let into = if piece.reasoning {
+                    &mut reasoning
+                } else {
+                    &mut text
+                };
+                into.push_str(piece.text);
                 true
             });
             match result {
                 Ok(stats) => {
                     log_request(&id, &stats);
-                    send_json(out, 200, &envelope.complete(&text, &stats))
+                    send_json(out, 200, &envelope.complete(&text, &reasoning, &stats))
                 }
                 Err(error) => send_error(out, 500, &error.to_string()),
             }
@@ -581,6 +591,9 @@ impl Job {
             sampler,
             stop,
             show_special: false,
+            // A chat answer keeps the model's reasoning apart, as
+            // `reasoning_content`. A plain completion is raw text.
+            reasoning: kind == Kind::Chat,
             overflow: Overflow::default(),
             keep: None,
         };
@@ -649,14 +662,19 @@ impl Envelope<'_> {
     }
 
     /// A whole, unstreamed response.
-    fn complete(&self, text: &str, stats: &Stats) -> Json {
+    fn complete(&self, text: &str, reasoning: &str, stats: &Stats) -> Json {
         let finish = ("finish_reason", Json::string(finish_reason(stats.finish)));
         let (object, choice) = match self.kind {
             Kind::Chat => {
-                let message = Json::object([
-                    ("role", Json::string("assistant")),
-                    ("content", Json::string(text)),
-                ]);
+                let mut message = vec![
+                    ("role".to_string(), Json::string("assistant")),
+                    ("content".to_string(), Json::string(text)),
+                ];
+                // The field llama.cpp and DeepSeek's API use.
+                if !reasoning.is_empty() {
+                    message.push(("reasoning_content".to_string(), Json::string(reasoning)));
+                }
+                let message = Json::Object(message);
                 (
                     "chat.completion",
                     Json::object([("index", Json::Number(0.0)), ("message", message), finish]),
@@ -705,6 +723,19 @@ impl Envelope<'_> {
             }
         };
         let mut members = self.base(object);
+        members.push(("choices".to_string(), Json::Array(vec![choice])));
+        Json::Object(members)
+    }
+
+    /// One event of a streamed chat answer that carries reasoning.
+    fn reasoning_chunk(&self, text: &str) -> Json {
+        let delta = Json::object([("reasoning_content", Json::string(text))]);
+        let choice = Json::object([
+            ("index", Json::Number(0.0)),
+            ("delta", delta),
+            ("finish_reason", Json::Null),
+        ]);
+        let mut members = self.base("chat.completion.chunk");
         members.push(("choices".to_string(), Json::Array(vec![choice])));
         Json::Object(members)
     }
@@ -898,12 +929,36 @@ mod tests {
             model: "m",
             kind: Kind::Chat,
         };
-        let full = chat.complete("hi", &stats());
+        let full = chat.complete("hi", "", &stats());
         assert_eq!(
             full.get("object").unwrap().as_str(),
             Some("chat.completion")
         );
         let choice = &full.get("choices").unwrap().as_array().unwrap()[0];
+        // Reasoning appears only when there was some.
+        assert!(
+            choice
+                .get("message")
+                .unwrap()
+                .get("reasoning_content")
+                .is_none()
+        );
+        let thought = chat.complete("hi", "plan", &stats());
+        let message = thought.get("choices").unwrap().as_array().unwrap()[0]
+            .get("message")
+            .unwrap();
+        assert_eq!(
+            message.get("reasoning_content").unwrap().as_str(),
+            Some("plan")
+        );
+        let delta = chat.reasoning_chunk("step");
+        let delta = delta.get("choices").unwrap().as_array().unwrap()[0]
+            .get("delta")
+            .unwrap();
+        assert_eq!(
+            delta.get("reasoning_content").unwrap().as_str(),
+            Some("step")
+        );
         assert_eq!(
             choice
                 .get("message")
@@ -951,7 +1006,7 @@ mod tests {
             model: "m",
             kind: Kind::Text,
         };
-        let full = text.complete("out", &stats());
+        let full = text.complete("out", "", &stats());
         assert_eq!(
             full.get("choices").unwrap().as_array().unwrap()[0]
                 .get("text")

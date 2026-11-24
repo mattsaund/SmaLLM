@@ -36,7 +36,8 @@ pub use encoder::{ENCODERS, Embedder, Pooling, normalize};
 pub use forward::{Phase, Profile, Session, SessionConfig};
 pub use weights::{
     Absorb, AttentionWeights, ConvWeights, Dense, ExpertMatrix, Experts, FeedForward, HeadMatrix,
-    Layer, Linear, Matrix, MixerWeights, MlaWeights, PerLayerInputs, PerLayerWeights, Weights,
+    Layer, Linear, Matrix, MixerWeights, MlaWeights, PerLayerInputs, PerLayerWeights, Plain,
+    Weights,
 };
 
 /// A model file, opened and ready to run.

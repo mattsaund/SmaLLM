@@ -38,18 +38,74 @@ fn half_offsets(ty: TensorType) -> &'static [usize] {
         TensorType::Q2K => &[80, 82],
         TensorType::Q3K => &[108],
         TensorType::Q6K => &[208],
+        TensorType::Iq4Xs
+        | TensorType::Iq3S
+        | TensorType::Iq3Xxs
+        | TensorType::Iq2S
+        | TensorType::Iq2Xs
+        | TensorType::Iq2Xxs
+        | TensorType::Iq1S => &[0],
+        TensorType::Tq2_0 => &[64],
+        TensorType::Tq1_0 => &[52],
         _ => &[],
     }
+}
+
+/// How far the weights of `ty` reach for a scale of one, compared with the
+/// 127 of Q8_0: the largest integer weight times the largest sub-block
+/// scale the format can encode, over 127.
+///
+/// Random scales of the IQ, TQ and MXFP4 formats are divided by it, so
+/// that their random weights come out about as large as Q8_0's. The older
+/// formats count as 1, as they did when their tests were tuned.
+fn reach(ty: TensorType) -> f32 {
+    let largest = match ty {
+        // IQ4_NL levels up to 127, times 6-bit scales from -32.
+        TensorType::Iq4Xs => 127.0 * 32.0,
+        // Grid values up to 15, times 1 + 2 * 15.
+        TensorType::Iq3S => 15.0 * 31.0,
+        // Grid values up to 62, times (0.5 + 15) / 2.
+        TensorType::Iq3Xxs => 62.0 * 7.75,
+        // Grid values up to 43, times (0.5 + 15) / 4.
+        TensorType::Iq2S | TensorType::Iq2Xs | TensorType::Iq2Xxs => 43.0 * 3.875,
+        // A grid value of 1 plus a delta of 1/8, times 2 * 7 + 1.
+        TensorType::Iq1M | TensorType::Iq1S => 1.125 * 15.0,
+        TensorType::Tq2_0 | TensorType::Tq1_0 => 1.0,
+        // The largest FP4 level, doubled. The scale is set directly.
+        TensorType::Mxfp4 => 12.0,
+        _ => 127.0,
+    };
+    largest / 127.0
 }
 
 /// Overwrites the scale fields of every block with finite values of at most
 /// `magnitude`. Random bytes are valid weights in every format, but not
 /// valid scales.
 pub(crate) fn set_scales(rng: &mut Rng, ty: TensorType, row: &mut [u8], magnitude: f32) {
+    let magnitude = magnitude / reach(ty);
     for block in row.chunks_exact_mut(ty.block_bytes()) {
         for &at in half_offsets(ty) {
             let scale = rng.range(-magnitude, magnitude);
             block[at..at + 2].copy_from_slice(&f32_to_f16(scale).to_le_bytes());
+        }
+        match ty {
+            // IQ1_M keeps its half scale in the top nibbles of its four
+            // scale words, the first word's nibble lowest.
+            TensorType::Iq1M => {
+                let bits = f32_to_f16(rng.range(-magnitude, magnitude));
+                for k in 0..4 {
+                    let nibble = ((bits >> (4 * k)) & 0x0f) as u8;
+                    block[49 + 2 * k] = (block[49 + 2 * k] & 0x0f) | (nibble << 4);
+                }
+            }
+            // An MXFP4 scale is a power of two, stored as its exponent.
+            // Exponent `e` stands for 2 to the `e - 128`, so the float
+            // exponent of `scale`, plus one, picks the power just below it.
+            TensorType::Mxfp4 => {
+                let scale = rng.range(0.0, magnitude);
+                block[0] = ((scale.to_bits() >> 23) & 0xff) as u8 + 1;
+            }
+            _ => {}
         }
     }
 }
@@ -196,6 +252,12 @@ pub(crate) struct TinyModel {
     /// Stores the latent's up-projection as two tensors, the key half
     /// transposed, as newer files do. Older files store one.
     pub split_kv_b: bool,
+    /// gpt-oss: attention sinks, an output bias, biases on the router and
+    /// on every expert, and the feed-forward norm under another name.
+    pub gpt_oss: bool,
+    /// Phi-2: LayerNorm with biases, attention and an ungated network side
+    /// by side, biases on every projection and on the output.
+    pub phi2: bool,
     pub seed: u64,
 }
 
@@ -218,7 +280,7 @@ impl TinyModel {
                 "qwen3" | "qwen3moe" | "gemma3" | "gemma4" | "lfm2" | "lfm2moe" | "lfm3" | "olmoe"
             ),
             post_norm: matches!(arch, "gemma2" | "gemma3" | "gemma4" | "lfm3"),
-            bias: matches!(arch, "qwen2" | "qwen2moe"),
+            bias: matches!(arch, "qwen2" | "qwen2moe" | "gpt-oss" | "phi2"),
             fused: false,
             window: 0,
             rope_factors: false,
@@ -242,7 +304,7 @@ impl TinyModel {
             wide_qk_norm: arch == "olmoe",
             granite_scales: matches!(arch, "granite" | "granitemoe"),
             longrope: arch == "phi3",
-            yarn: matches!(arch, "qwen3" | "deepseek2"),
+            yarn: matches!(arch, "qwen3" | "gpt-oss" | "deepseek2"),
             expert_groups: 0,
             groups_used: 0,
             expert_scale: 1.0,
@@ -252,11 +314,13 @@ impl TinyModel {
             nope_dims: 0,
             value_dims: 0,
             split_kv_b: false,
+            gpt_oss: arch == "gpt-oss",
+            phi2: arch == "phi2",
             seed: 1,
         };
         if matches!(
             arch,
-            "qwen2moe" | "qwen3moe" | "olmoe" | "granitemoe" | "lfm2moe"
+            "qwen2moe" | "qwen3moe" | "olmoe" | "granitemoe" | "lfm2moe" | "gpt-oss"
         ) {
             model.experts = 4;
             model.experts_used = 2;
@@ -305,8 +369,10 @@ impl TinyModel {
             // Phi-3 stores query, key and value together, and the gate
             // with `up`.
             "phi3" => model.fused = true,
-            // Every other layer of Gemma 2 is windowed.
-            "gemma2" => {
+            // Phi-2 rotates part of each head.
+            "phi2" => model.rope_dims = model.head_dim() / 2,
+            // Every other layer of Gemma 2 and gpt-oss is windowed.
+            "gemma2" | "gpt-oss" => {
                 model.n_layer = 4;
                 model.window = 3;
             }
@@ -401,6 +467,7 @@ impl TinyModel {
             .u32(&format!("{arch}.block_count"), self.n_layer as u32)
             .u32(&format!("{arch}.attention.head_count"), self.n_head as u32)
             .f32(&format!("{arch}.attention.layer_norm_rms_epsilon"), 1e-5)
+            .f32(&format!("{arch}.attention.layer_norm_epsilon"), 1e-5)
             .f32(&format!("{arch}.rope.freq_base"), 10000.0);
         let layers = 0..self.n_layer;
         if self.wide_late_ff {
@@ -801,6 +868,15 @@ impl TinyModel {
                         weight_scale,
                     );
                 }
+            } else if self.phi2 {
+                matrix(&mut builder, &name("ffn_up.weight"), n_ff, d, weight_scale);
+                matrix(
+                    &mut builder,
+                    &name("ffn_down.weight"),
+                    d,
+                    n_ff,
+                    weight_scale,
+                );
             } else if self.fused {
                 matrix(
                     &mut builder,
@@ -852,6 +928,10 @@ impl TinyModel {
             "output_norm.weight"
         };
         vector(&mut builder, output_norm, d, 0.5, 1.5);
+        if self.phi2 {
+            vector(&mut builder, "output_norm.bias", d, -0.2, 0.2);
+            vector(&mut builder, "output.bias", self.n_vocab, -0.2, 0.2);
+        }
         if self.rope_factors {
             // Divisors for the full-attention layers' rotation.
             let full = (0..self.n_layer)
@@ -887,7 +967,52 @@ impl TinyModel {
             let head_dim = self.layer_head_dim(layer);
             let (q_dim, kv_dim) = (self.n_head * head_dim, self.n_head_kv * head_dim);
             vector(&mut builder, &name("attn_norm.weight"), d, 0.5, 1.5);
-            vector(&mut builder, &name("ffn_norm.weight"), d, 0.5, 1.5);
+            if self.phi2 {
+                // One LayerNorm, before attention and the network both.
+                let n_ff = self.layer_n_ff(layer);
+                vector(&mut builder, &name("attn_norm.bias"), d, -0.2, 0.2);
+                vector(&mut builder, &name("attn_output.bias"), d, -0.2, 0.2);
+                vector(&mut builder, &name("ffn_up.bias"), n_ff, -0.2, 0.2);
+                vector(&mut builder, &name("ffn_down.bias"), d, -0.2, 0.2);
+            } else {
+                // gpt-oss calls its feed-forward norm the post-attention
+                // norm.
+                let ffn_norm = if self.gpt_oss {
+                    "post_attention_norm.weight"
+                } else {
+                    "ffn_norm.weight"
+                };
+                vector(&mut builder, &name(ffn_norm), d, 0.5, 1.5);
+            }
+            if self.gpt_oss {
+                let n_ff = self.layer_n_ff(layer);
+                vector(
+                    &mut builder,
+                    &name("attn_sinks.weight"),
+                    self.n_head,
+                    -1.0,
+                    2.0,
+                );
+                vector(&mut builder, &name("attn_output.bias"), d, -0.2, 0.2);
+                vector(
+                    &mut builder,
+                    &name("ffn_gate_inp.bias"),
+                    self.experts,
+                    -0.5,
+                    0.5,
+                );
+                // One bias row per expert.
+                let count = self.experts as u64;
+                let mut bias_rng = Rng(self.seed ^ (0xb0 + layer as u64));
+                for (part, width) in [
+                    ("ffn_gate_exps.bias", n_ff),
+                    ("ffn_up_exps.bias", n_ff),
+                    ("ffn_down_exps.bias", d),
+                ] {
+                    let values = bias_rng.floats(width * self.experts, -0.3, 0.3);
+                    builder.tensor_f32(&name(part), &[width as u64, count], &values);
+                }
+            }
             if self.is_conv(layer) {
                 let taps = self.conv_kernel as u64;
                 let mut taps_rng = Rng(self.seed ^ (0xc0 + layer as u64));

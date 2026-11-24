@@ -253,6 +253,16 @@ fn phi_4_mini_q4_k_m() {
 }
 
 #[test]
+fn phi_2_q4_k_m() {
+    check("phi-2.Q4_K_M");
+}
+
+#[test]
+fn gpt_oss_20b_mxfp4() {
+    check("gpt-oss-20b-MXFP4");
+}
+
+#[test]
 fn deepseek_coder_v2_lite_q4_k_m() {
     check("DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M");
 }
@@ -273,6 +283,8 @@ fn every_golden_file_has_a_test() {
         "DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M",
         "Moonlight-16B-A3B-Instruct-Q4_K_M",
         "deepseek-moe-16b-chat.Q4_K_M",
+        "gpt-oss-20b-MXFP4",
+        "phi-2.Q4_K_M",
         "gemma-2-2b-it-Q4_K_M",
         "microsoft_Phi-4-mini-instruct-Q4_K_M",
         "LFM2-8B-A1B-Q4_K_M",

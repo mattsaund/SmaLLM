@@ -52,6 +52,21 @@ pub fn stderr_is_terminal() -> bool {
     std::io::stderr().is_terminal()
 }
 
+/// True when standard output is a terminal, not a file or a pipe.
+pub fn stdout_is_terminal() -> bool {
+    std::io::stdout().is_terminal()
+}
+
+/// Faint text for standard output, when it is a terminal that shows
+/// styles. A model's reasoning is printed this way.
+pub fn faint(text: &str) -> String {
+    if stdout_is_terminal() && ansi() {
+        format!("\x1b[2m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
 /// True when stderr is a terminal that understands ANSI escape codes: colors,
 /// and clearing a line to redraw a progress bar.
 ///

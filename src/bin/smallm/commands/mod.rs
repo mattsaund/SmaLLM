@@ -140,8 +140,14 @@ pub fn load_model(name: &str) -> Result<Loaded, String> {
     let model = Model::load(&path).map_err(|error| format!("{}: {error}", path.display()))?;
     let (pre, known) = model.tokenizer().pre_tokenizer();
     if !known {
+        // Older files name none, and then llama.cpp's default is used too.
+        let which = if pre.is_empty() {
+            "the file names no pre-tokenizer, so the default one is used".to_string()
+        } else {
+            format!("unknown pre-tokenizer '{pre}'")
+        };
         eprintln!(
-            "smallm: warning: unknown pre-tokenizer '{pre}'. Text may be split differently from the model's training."
+            "smallm: warning: {which}. Text may be split differently from the model's training."
         );
     }
     Ok(Loaded {
