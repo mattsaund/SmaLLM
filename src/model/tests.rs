@@ -31,6 +31,12 @@ const QUANT_TYPES: [TensorType; 11] = [
 
 const PROMPT: [u32; 9] = [1, 5, 9, 12, 7, 30, 8, 8, 21];
 
+/// A prompt long enough to fill a batch that decodes weight rows up front.
+const LONG_PROMPT: [u32; 40] = [
+    1, 5, 9, 12, 7, 30, 8, 8, 21, 3, 17, 4, 26, 11, 2, 19, 6, 23, 14, 29, 10, 1, 13, 27, 5, 18, 22,
+    9, 31, 16, 7, 25, 20, 2, 28, 15, 12, 24, 6, 3,
+];
+
 fn load(spec: &TinyModel) -> Arc<Model> {
     Arc::new(Model::from_bytes(spec.build()).expect("the synthetic model loads"))
 }
@@ -358,12 +364,35 @@ fn batching_and_threads_do_not_change_the_result() {
     for ty in [TensorType::F32, TensorType::Q8_0, TensorType::Q4K] {
         let model = load(&TinyModel::new("llama", ty));
         let expected = logits(&model, &PROMPT, 1, 1);
-        for (threads, batch) in [(1, 2), (1, 32), (4, 1), (4, 3), (8, 32)] {
+        // Batches this small take the same route as single tokens, so the
+        // result is the same to the last bit.
+        for (threads, batch) in [(1, 2), (1, 7), (4, 1), (4, 3), (8, 7)] {
             assert_eq!(
                 logits(&model, &PROMPT, threads, batch),
                 expected,
                 "threads {threads} batch {batch}"
             );
+        }
+        // Larger batches decode each weight row ahead of the multiply. That
+        // adds the same numbers in another order, so only rounding differs.
+        // The thread count still changes nothing.
+        let wide = logits(&model, &LONG_PROMPT, 1, 32);
+        let narrow: Vec<f64> = logits(&model, &LONG_PROMPT, 1, 1)
+            .iter()
+            .map(|v| *v as f64)
+            .collect();
+        assert!(
+            relative_error(&wide, &narrow) < 1e-4,
+            "{}",
+            relative_error(&wide, &narrow)
+        );
+        for (threads, batch) in [(4, 32), (8, 32), (3, 16)] {
+            let again = logits(&model, &LONG_PROMPT, threads, batch);
+            if batch == 32 {
+                assert_eq!(again, wide, "threads {threads} batch {batch}");
+            } else {
+                assert!(relative_error(&again, &narrow) < 1e-4);
+            }
         }
         // Feeding the prompt in pieces is the same as feeding it at once.
         let mut session = session(&model, 2, 4, None);

@@ -21,21 +21,22 @@ use std::arch::aarch64::*;
 use std::arch::asm;
 
 use super::scalar;
-use super::{ActRef, DotDecoded, DotQuant, Kernels};
+use super::{ActRef, DotQuant, Kernels, TileDot};
 use crate::tensor::TensorType;
+use crate::tensor::quant::Tile;
 
 /// Kernels for every AArch64 CPU.
-pub static KERNELS: Kernels = kernels("neon", row_quant_widening, dot_decoded);
+pub static KERNELS: Kernels = kernels("neon", row_quant_widening, tile_dot);
 
 /// Kernels for CPUs with the dot product extension.
-pub static KERNELS_DOTPROD: Kernels = kernels("neon+dotprod", row_quant_sdot, dot_decoded_sdot);
+pub static KERNELS_DOTPROD: Kernels = kernels("neon+dotprod", row_quant_sdot, tile_dot_sdot);
 
 /// Builds a kernel table. Only the kernels that multiply bytes differ
 /// between the two tables.
 const fn kernels(
     name: &'static str,
     row_quant: fn(TensorType) -> DotQuant,
-    dot_decoded: DotDecoded,
+    tile_dot: TileDot,
 ) -> Kernels {
     Kernels {
         name,
@@ -53,7 +54,9 @@ const fn kernels(
         row_f16,
         row_bf16,
         row_quant,
-        dot_decoded,
+        tile_rows: 4,
+        tile_dot,
+        tile_fill: scalar::tile_fill,
     }
 }
 
@@ -249,7 +252,12 @@ unsafe fn row_bf16(row: *const u8, x: *const f32, n: usize) -> f32 {
 
 /// Adds the 16 products of two byte registers into four 32-bit lanes.
 trait ByteDot {
+    /// Adds all 16 products to `sum`. Which lane a product lands in is not
+    /// defined, only the total over the four lanes.
     unsafe fn add_products(sum: int32x4_t, weights: int8x16_t, acts: int8x16_t) -> int32x4_t;
+
+    /// Adds the products of bytes `4 * l..4 * l + 4` to lane `l` of `sum`.
+    unsafe fn add_lanes(sum: int32x4_t, weights: int8x16_t, acts: int8x16_t) -> int32x4_t;
 }
 
 /// Widening multiplies to 16 bits, then pairwise adds to 32 bits.
@@ -268,6 +276,18 @@ impl ByteDot for Widening {
             vpadalq_s16(vpadalq_s16(sum, low), high)
         }
     }
+
+    #[inline(always)]
+    unsafe fn add_lanes(sum: int32x4_t, weights: int8x16_t, acts: int8x16_t) -> int32x4_t {
+        // SAFETY: NEON is part of the AArch64 baseline.
+        unsafe {
+            let low = vpaddlq_s16(vmull_s8(vget_low_s8(weights), vget_low_s8(acts)));
+            let high = vpaddlq_s16(vmull_high_s8(weights, acts));
+            // Each half holds two pair sums per lane. Adding neighbors
+            // leaves one sum per lane, in order.
+            vaddq_s32(sum, vpaddq_s32(low, high))
+        }
+    }
 }
 
 impl ByteDot for Sdot {
@@ -275,6 +295,12 @@ impl ByteDot for Sdot {
     unsafe fn add_products(sum: int32x4_t, weights: int8x16_t, acts: int8x16_t) -> int32x4_t {
         // SAFETY: only instantiated inside functions that enable `dotprod`,
         // which are only selected when the CPU reports the extension.
+        unsafe { sdot(sum, weights, acts) }
+    }
+
+    #[inline(always)]
+    unsafe fn add_lanes(sum: int32x4_t, weights: int8x16_t, acts: int8x16_t) -> int32x4_t {
+        // SAFETY: as above. The instruction already works lane by lane.
         unsafe { sdot(sum, weights, acts) }
     }
 }
@@ -301,53 +327,104 @@ unsafe fn sdot(mut sum: int32x4_t, weights: int8x16_t, acts: int8x16_t) -> int32
     sum
 }
 
-/// See [`DotDecoded`]. One step handles 16 weights: their products land in
-/// four 32-bit lanes, which all share one stored scale. Two accumulators
-/// take turns so that consecutive steps do not wait on each other.
+/// See [`TileDot`], for tiles of 4 rows.
+///
+/// A step loads 4 columns of all 4 rows, 16 bytes, and multiplies them with
+/// the same 4 activation bytes repeated in every lane, which leaves one
+/// partial sum per row. Four steps make a sub-block of 16 columns. Its sums
+/// are converted to floats once and scaled with one scale per row.
 #[inline(always)]
-unsafe fn decoded_row<D: ByteDot>(
-    q: *const i8,
-    scale: *const f32,
-    n: usize,
+unsafe fn tile_rows<D: ByteDot>(
+    tile: &Tile,
     act: ActRef,
+    scaled_sums: *const f32,
     group: usize,
-) -> f32 {
-    let runs = n / 16;
-    // Runs per activation group, as a shift: 1 for groups of 32, 4 for 256.
-    let shift = (group / 16).trailing_zeros();
-    // SAFETY: the caller guarantees `n` weights and activations, `n / 4`
-    // scales and `n / group` activation scales. Every index below stays
-    // under `runs * 16 = n`.
+    out: *mut f32,
+) {
+    debug_assert_eq!(tile.height, 4);
+    let subs = tile.cols / 16;
+    let (q, scale, offset) = (tile.q.as_ptr(), tile.scale.as_ptr(), tile.offset.as_ptr());
+    // SAFETY: the tile holds `cols * 4` weights and `subs * 4` scales and
+    // offsets. The caller guarantees activations for `cols` elements in
+    // groups of `group`, their scaled sums when the tile has offsets, and
+    // room for 4 outputs. Every index below stays inside those sizes.
     unsafe {
-        let mut acc = [vdupq_n_f32(0.0), vdupq_n_f32(0.0)];
-        for run in 0..runs {
-            let weights = vld1q_s8(q.add(run * 16));
-            let acts = vld1q_s8(act.q.add(run * 16));
-            let products = D::add_products(vdupq_n_s32(0), weights, acts);
-            let scales = vmulq_n_f32(vld1q_f32(scale.add(run * 4)), *act.scale.add(run >> shift));
-            acc[run & 1] = vfmaq_f32(acc[run & 1], vcvtq_f32_s32(products), scales);
+        let mut total = vdupq_n_f32(0.0);
+        let mut sub = 0;
+        for g in 0..tile.cols / group {
+            // Two sub-blocks at a time, each with its own accumulator, so
+            // that neither waits for the addition of the other. A group of
+            // activations always holds an even number of sub-blocks.
+            let mut even = vdupq_n_f32(0.0);
+            let mut odd = vdupq_n_f32(0.0);
+            for _ in 0..group / 32 {
+                even = sub_block::<D>(even, q, scale, act, sub);
+                odd = sub_block::<D>(odd, q, scale, act, sub + 1);
+                sub += 2;
+            }
+            total = vfmaq_n_f32(total, vaddq_f32(even, odd), *act.scale.add(g));
         }
-        vaddvq_f32(vaddq_f32(acc[0], acc[1]))
+        if tile.has_offset {
+            // Four accumulators, for the same reason. `subs` is a multiple
+            // of two, and the loop takes the sub-blocks in pairs.
+            let mut terms = [vdupq_n_f32(0.0); 4];
+            let mut sub = 0;
+            while sub < subs {
+                for lane in 0..2 {
+                    let offsets = vld1q_f32(offset.add((sub + lane) * 4));
+                    let at = (sub & 2) + lane;
+                    terms[at] = vfmaq_n_f32(terms[at], offsets, *scaled_sums.add(sub + lane));
+                }
+                sub += 2;
+            }
+            let terms = vaddq_f32(vaddq_f32(terms[0], terms[1]), vaddq_f32(terms[2], terms[3]));
+            total = vaddq_f32(total, terms);
+        }
+        vst1q_f32(out, total);
     }
 }
 
-/// [`decoded_row`] for every CPU.
-unsafe fn dot_decoded(q: *const i8, scale: *const f32, n: usize, act: ActRef, group: usize) -> f32 {
-    // SAFETY: forwarded contract.
-    unsafe { decoded_row::<Widening>(q, scale, n, act, group) }
-}
-
-/// [`decoded_row`] for CPUs with the dot product extension.
-#[target_feature(enable = "dotprod")]
-unsafe fn dot_decoded_sdot(
+/// One sub-block of a tile: the sums of 16 columns for each of the 4 rows,
+/// scaled and added to `acc`.
+#[inline(always)]
+unsafe fn sub_block<D: ByteDot>(
+    acc: float32x4_t,
     q: *const i8,
     scale: *const f32,
-    n: usize,
     act: ActRef,
-    group: usize,
-) -> f32 {
+    sub: usize,
+) -> float32x4_t {
+    // SAFETY: the caller guarantees the tile and the activations cover
+    // sub-block `sub`.
+    unsafe {
+        let mut sums = vdupq_n_s32(0);
+        for step in sub * 4..sub * 4 + 4 {
+            let weights = vld1q_s8(q.add(step * 16));
+            let four = (act.q.add(step * 4) as *const u32).read_unaligned();
+            let acts = vreinterpretq_s8_u32(vdupq_n_u32(four));
+            sums = D::add_lanes(sums, weights, acts);
+        }
+        vfmaq_f32(acc, vcvtq_f32_s32(sums), vld1q_f32(scale.add(sub * 4)))
+    }
+}
+
+/// [`tile_rows`] for every CPU.
+unsafe fn tile_dot(tile: &Tile, act: ActRef, scaled_sums: *const f32, group: usize, out: *mut f32) {
     // SAFETY: forwarded contract.
-    unsafe { decoded_row::<Sdot>(q, scale, n, act, group) }
+    unsafe { tile_rows::<Widening>(tile, act, scaled_sums, group, out) }
+}
+
+/// [`tile_rows`] for CPUs with the dot product extension.
+#[target_feature(enable = "dotprod")]
+unsafe fn tile_dot_sdot(
+    tile: &Tile,
+    act: ActRef,
+    scaled_sums: *const f32,
+    group: usize,
+    out: *mut f32,
+) {
+    // SAFETY: forwarded contract.
+    unsafe { tile_rows::<Sdot>(tile, act, scaled_sums, group, out) }
 }
 
 /// Reads an unaligned little-endian u32 at `p`.

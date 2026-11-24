@@ -25,6 +25,7 @@ mod x86;
 use std::sync::OnceLock;
 
 use crate::tensor::TensorType;
+use crate::tensor::quant::Tile;
 
 /// One activation vector, quantized for integer dot products.
 ///
@@ -50,19 +51,26 @@ pub type DotQuant = unsafe fn(row: *const u8, n: usize, act: ActRef) -> f32;
 /// Dot product of a float weight row, stored as bytes, and float activations.
 pub type DotFloat = unsafe fn(row: *const u8, x: *const f32, n: usize) -> f32;
 
-/// Dot product of a decoded weight row and a quantized activation vector,
-/// without the offset term:
+/// Reduces every row of a [`Tile`] against one quantized activation vector:
 ///
 /// ```text
-/// sum over i of scale[i / 4] * q[i] * act.q[i] * act.scale[i / group]
+/// out[r] = sum over i of (scale[i / 16][r] * q[i][r] * act.q[i] * act.scale[i / group])
+///        + sum over s of (offset[s][r] * scaled_sums[s])
 /// ```
 ///
-/// `q` holds `n` integer weights and `scale` one float per 4 of them, as in
-/// a [`DecodedRow`](crate::tensor::quant::DecodedRow). `group` is the group
-/// size the activations were quantized with, 32 or 256, and `n` a multiple
-/// of it.
-pub type DotDecoded =
-    unsafe fn(q: *const i8, scale: *const f32, n: usize, act: ActRef, group: usize) -> f32;
+/// `scaled_sums` holds `act.scale * sum(act.q)` for each run of 16 elements
+/// and is only read when the tile has offsets. `group` is the group size
+/// the activations were quantized with, 32 or 256. `out` receives one float
+/// per row of the tile.
+pub type TileDot =
+    unsafe fn(tile: &Tile, act: ActRef, scaled_sums: *const f32, group: usize, out: *mut f32);
+
+/// Fills a tile with the rows in `data`, exactly as [`Tile::fill`] does.
+///
+/// A backend may decode the formats it cares about with its own
+/// instructions. The result must not differ from the portable fill.
+pub type TileFill =
+    unsafe fn(tile: &mut Tile, ty: TensorType, height: usize, data: &[u8], row_bytes: usize);
 
 /// How to reduce one row of a weight matrix.
 #[derive(Clone, Copy)]
@@ -90,7 +98,11 @@ pub struct Kernels {
     row_f16: DotFloat,
     row_bf16: DotFloat,
     row_quant: fn(TensorType) -> DotQuant,
-    dot_decoded: DotDecoded,
+    /// Rows this backend multiplies at once in the batched route. Zero when
+    /// it has no kernel worth using for that.
+    tile_rows: usize,
+    tile_dot: TileDot,
+    tile_fill: TileFill,
 }
 
 /// The shape shared by the two attention kernels: `n_queries` vectors on one
@@ -278,9 +290,27 @@ impl Kernels {
         }
     }
 
-    /// The kernel for rows that were decoded ahead of the multiply.
-    pub fn decoded_dot(&self) -> DotDecoded {
-        self.dot_decoded
+    /// How many rows a tile for this backend holds. Zero when the backend
+    /// should not be given tiles.
+    pub fn tile_rows(&self) -> usize {
+        self.tile_rows
+    }
+
+    /// The kernel for tiles of decoded rows.
+    pub fn tile_dot(&self) -> TileDot {
+        self.tile_dot
+    }
+
+    /// Fills `tile` with the rows stored in `data`, `row_bytes` apart, for
+    /// this backend's tile kernel. `data` holds at most
+    /// [`tile_rows`](Self::tile_rows) whole rows of type `ty`.
+    pub fn fill_tile(&self, tile: &mut Tile, ty: TensorType, data: &[u8], row_bytes: usize) {
+        assert!(self.tile_rows > 0 && ty.row_bytes(1).is_none());
+        assert!(data.len() % row_bytes == 0 && data.len() / row_bytes <= self.tile_rows);
+        assert!(row_bytes % ty.block_bytes() == 0);
+        // SAFETY: the asserts above are the contract of the fill: whole
+        // rows of whole blocks, and no more of them than a tile holds.
+        unsafe { (self.tile_fill)(tile, ty, self.tile_rows, data, row_bytes) }
     }
 
     /// The row kernel for a tensor type.

@@ -48,26 +48,19 @@ impl Default for Group {
 /// Decodes one block of a quantized type into a [`Group`].
 pub type Decoder = fn(block: &[u8], out: &mut Group);
 
-/// A whole weight row decoded to the common shape:
+/// One weight row decoded to the common shape:
 ///
 /// ```text
-/// weight[i] = scale[i / 4] * q[i] + offset[i / 16]
+/// weight[i] = scale[i / 16] * q[i] + offset[i / 16]
 /// ```
-///
-/// The batched multiply decodes a row once and reuses it for every vector
-/// of the batch. Scales are stored once per 4 weights, each sub-block's
-/// scale four times over, because that is the layout the SIMD kernels
-/// multiply against directly.
 #[derive(Default)]
 pub struct DecodedRow {
     /// The integer weights.
     pub q: Vec<i8>,
-    /// One scale per run of 4 weights.
+    /// One scale per sub-block of 16 weights.
     pub scale: Vec<f32>,
     /// One offset per sub-block of 16 weights.
     pub offset: Vec<f32>,
-    /// True when some offset is not zero. Other rows skip the offset term.
-    pub has_offset: bool,
 }
 
 /// Decodes one row of a quantized tensor into `row`.
@@ -75,28 +68,226 @@ pub struct DecodedRow {
 /// `bytes` must hold a whole number of blocks of type `ty`. A float type has
 /// no blocks and leaves the row empty.
 pub fn decode_row(ty: TensorType, bytes: &[u8], row: &mut DecodedRow) {
-    let (group, block_bytes) = (ty.block_len(), ty.block_bytes());
-    let blocks = match decoder(ty) {
-        Some(_) => bytes.len() / block_bytes,
+    let n = match decoder(ty) {
+        Some(_) => bytes.len() / ty.block_bytes() * ty.block_len(),
         None => 0,
     };
-    let n = blocks * group;
     row.q.resize(n, 0);
-    row.scale.resize(n / 4, 0.0);
+    row.scale.resize(n / 16, 0.0);
     row.offset.resize(n / 16, 0.0);
-    row.has_offset = false;
-    let Some(decode) = decoder(ty) else { return };
+    // One loop per format, so that each has its decoder built in.
+    match ty {
+        TensorType::F32 | TensorType::F16 | TensorType::BF16 => {}
+        TensorType::Q4_0 => decode_blocks(ty, bytes, row, decode_q4_0),
+        TensorType::Q4_1 => decode_blocks(ty, bytes, row, decode_q4_1),
+        TensorType::Q5_0 => decode_blocks(ty, bytes, row, decode_q5_0),
+        TensorType::Q5_1 => decode_blocks(ty, bytes, row, decode_q5_1),
+        TensorType::Q8_0 => decode_blocks(ty, bytes, row, decode_q8_0),
+        TensorType::Iq4Nl => decode_blocks(ty, bytes, row, decode_iq4_nl),
+        TensorType::Q2K => decode_blocks(ty, bytes, row, decode_q2_k),
+        TensorType::Q3K => decode_blocks(ty, bytes, row, decode_q3_k),
+        TensorType::Q4K => decode_blocks(ty, bytes, row, decode_q4_k),
+        TensorType::Q5K => decode_blocks(ty, bytes, row, decode_q5_k),
+        TensorType::Q6K => decode_blocks(ty, bytes, row, decode_q6_k),
+    }
+}
 
-    let mut decoded = Group::new();
+/// Decodes the blocks of a row one after another with `decode`.
+#[inline(always)]
+fn decode_blocks(
+    ty: TensorType,
+    bytes: &[u8],
+    row: &mut DecodedRow,
+    decode: impl Fn(&[u8], &mut Group),
+) {
+    let group = ty.block_len();
     let subs = group / 16;
-    for (index, block) in bytes.chunks_exact(block_bytes).enumerate() {
+    let mut decoded = Group::new();
+    let blocks = bytes.chunks_exact(ty.block_bytes());
+    let q = row.q.chunks_exact_mut(group);
+    let scale = row.scale.chunks_exact_mut(subs);
+    let offset = row.offset.chunks_exact_mut(subs);
+    for (((block, q), scale), offset) in blocks.zip(q).zip(scale).zip(offset) {
         decode(block, &mut decoded);
-        row.q[index * group..(index + 1) * group].copy_from_slice(&decoded.q[..group]);
-        for sub in 0..subs {
-            let at = index * subs + sub;
-            row.scale[at * 4..at * 4 + 4].fill(decoded.scale[sub]);
-            row.offset[at] = decoded.offset[sub];
-            row.has_offset |= decoded.offset[sub] != 0.0;
+        q.copy_from_slice(&decoded.q[..group]);
+        scale.copy_from_slice(&decoded.scale[..subs]);
+        offset.copy_from_slice(&decoded.offset[..subs]);
+    }
+}
+
+/// How the integer weights of a format become non-negative: what to add to
+/// each of them, and the largest value that gives. `None` for the formats
+/// that use the whole signed byte.
+///
+/// A row shifted this way stands for the same weights once `bias * scale`
+/// is taken off its offsets. Kernels that multiply an unsigned byte by a
+/// signed one read such rows without any sign handling.
+pub fn unsigned_range(ty: TensorType) -> Option<(i8, u8)> {
+    match ty {
+        TensorType::Q2K => Some((0, 3)),
+        TensorType::Q3K => Some((4, 7)),
+        TensorType::Q4_0 => Some((8, 15)),
+        TensorType::Q4_1 | TensorType::Q4K => Some((0, 15)),
+        TensorType::Q5_0 => Some((16, 31)),
+        TensorType::Q5_1 | TensorType::Q5K => Some((0, 31)),
+        TensorType::Q6K => Some((32, 63)),
+        TensorType::Q8_0 | TensorType::Iq4Nl => None,
+        TensorType::F32 | TensorType::F16 | TensorType::BF16 => None,
+    }
+}
+
+/// A buffer whose first element sits at the start of a cache line.
+///
+/// SIMD registers are loaded from a tile at steps of their own size. From
+/// an aligned start none of those loads straddles two cache lines, which
+/// costs a load twice over where it happens.
+#[derive(Default)]
+pub struct Aligned<T> {
+    /// The allocation, a cache line longer than what is in use.
+    data: Vec<T>,
+    /// Index of the first element in use.
+    start: usize,
+    /// Number of elements in use.
+    len: usize,
+}
+
+impl<T: Copy + Default> Aligned<T> {
+    /// Bytes in a cache line on every CPU this engine has kernels for.
+    const LINE: usize = 64;
+
+    /// Sets the number of elements. What they hold afterwards is not
+    /// defined: the caller writes all of them.
+    pub fn resize(&mut self, len: usize) {
+        let spare = Self::LINE / size_of::<T>();
+        if self.data.len() < len + spare {
+            self.data.resize(len + spare, T::default());
+        }
+        // The allocation is aligned for `T`, so the distance to the next
+        // line is a whole number of elements, and fewer than `spare`.
+        let address = self.data.as_ptr() as usize;
+        self.start = (address.next_multiple_of(Self::LINE) - address) / size_of::<T>();
+        self.len = len;
+    }
+}
+
+impl<T> std::ops::Deref for Aligned<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        &self.data[self.start..self.start + self.len]
+    }
+}
+
+impl<T> std::ops::DerefMut for Aligned<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        &mut self.data[self.start..self.start + self.len]
+    }
+}
+
+impl<T: Copy + Default> From<&[T]> for Aligned<T> {
+    fn from(values: &[T]) -> Aligned<T> {
+        let mut aligned = Aligned::default();
+        aligned.resize(values.len());
+        aligned.copy_from_slice(values);
+        aligned
+    }
+}
+
+/// Several weight rows, decoded and interleaved for the batched multiply.
+///
+/// Columns are taken four at a time. For each run of four columns the tile
+/// holds those four weights of its first row, then of its second, and so
+/// on. A SIMD register loaded from that spot has one 32-bit lane per row,
+/// so a single multiply serves every row of the tile, and each lane's sum
+/// is one row's result. Nothing has to be added across lanes at the end.
+///
+/// Scales and offsets are laid out the same way: for each sub-block of 16
+/// columns, one value per row.
+#[derive(Default)]
+pub struct Tile {
+    /// Rows in the tile. Rows past the ones filled are zero.
+    pub height: usize,
+    /// Columns in every row.
+    pub cols: usize,
+    /// `cols * height` integer weights.
+    pub q: Aligned<i8>,
+    /// `cols / 16 * height` scales.
+    pub scale: Aligned<f32>,
+    /// `cols / 16 * height` offsets.
+    pub offset: Aligned<f32>,
+    /// True when some offset is not zero. Other tiles skip the offset term.
+    pub has_offset: bool,
+    /// True when weights use the whole signed byte. Otherwise every weight
+    /// lies between zero and `max`.
+    pub signed: bool,
+    /// The largest weight an unsigned tile can hold.
+    pub max: u8,
+    /// The row being decoded.
+    pub(crate) row: DecodedRow,
+    /// A row of zero bytes, which stands in for the rows a tile lacks.
+    pub(crate) blank: Vec<u8>,
+}
+
+impl Tile {
+    /// Sizes the tile for `height` rows of type `ty`, `row_bytes` long, and
+    /// sets what follows from the type. The caller writes the contents.
+    pub fn prepare(&mut self, ty: TensorType, height: usize, row_bytes: usize) {
+        let cols = row_bytes / ty.block_bytes() * ty.block_len();
+        let range = unsigned_range(ty);
+        self.height = height;
+        self.cols = cols;
+        self.signed = range.is_none();
+        self.max = range.map_or(0, |(_, max)| max);
+        self.has_offset = false;
+        self.q.resize(cols * height);
+        self.scale.resize(cols / 16 * height);
+        self.offset.resize(cols / 16 * height);
+    }
+
+    /// A row of `row_bytes` zero bytes. In every format it decodes to
+    /// weights of zero.
+    pub fn blank_row(&mut self, row_bytes: usize) -> &[u8] {
+        if self.blank.len() < row_bytes {
+            self.blank.resize(row_bytes, 0);
+        }
+        &self.blank[..row_bytes]
+    }
+
+    /// Fills the tile with the rows stored in `data`, `row_bytes` apart.
+    ///
+    /// `data` holds at most `height` rows of type `ty`. This is the portable
+    /// way to fill a tile, and the definition for the faster ones.
+    pub fn fill(&mut self, ty: TensorType, height: usize, data: &[u8], row_bytes: usize) {
+        let count = data.len() / row_bytes;
+        assert!(count <= height, "a tile holds at most {height} rows");
+        self.prepare(ty, height, row_bytes);
+        let bias = unsigned_range(ty).map_or(0, |(bias, _)| bias);
+        if count < height {
+            self.q.fill(0);
+            self.scale.fill(0.0);
+            self.offset.fill(0.0);
+        }
+        for (r, bytes) in data.chunks_exact(row_bytes).enumerate() {
+            decode_row(ty, bytes, &mut self.row);
+            if bias != 0 {
+                for q in self.row.q.iter_mut() {
+                    *q += bias;
+                }
+            }
+            // Four weights at a time move to this row's place in each run.
+            let runs = self.q.chunks_exact_mut(4 * height);
+            for (run, four) in runs.zip(self.row.q.chunks_exact(4)) {
+                run[r * 4..r * 4 + 4].copy_from_slice(four);
+            }
+            let scales = self.scale.chunks_exact_mut(height);
+            let offsets = self.offset.chunks_exact_mut(height);
+            let decoded = self.row.scale.iter().zip(&self.row.offset);
+            for ((scales, offsets), (scale, offset)) in scales.zip(offsets).zip(decoded) {
+                let offset = offset - bias as f32 * scale;
+                scales[r] = *scale;
+                offsets[r] = offset;
+                self.has_offset |= offset != 0.0;
+            }
         }
     }
 }

@@ -21,6 +21,7 @@ use super::scalar;
 use super::{ActRef, DotQuant, Kernels};
 use crate::tensor::TensorType;
 use crate::tensor::f16::f16_to_f32;
+use crate::tensor::quant::Tile;
 
 pub static KERNELS: Kernels = Kernels {
     name: "avx2",
@@ -37,7 +38,9 @@ pub static KERNELS: Kernels = Kernels {
     row_f16,
     row_bf16,
     row_quant,
-    dot_decoded,
+    tile_rows: 8,
+    tile_dot,
+    tile_fill,
 };
 
 /// True when the running CPU has every feature these kernels use.
@@ -77,49 +80,456 @@ unsafe fn hsum(v: __m256) -> f32 {
     _mm_cvtss_f32(single)
 }
 
-/// See [`DotDecoded`](super::DotDecoded).
+/// See [`TileDot`](super::TileDot), for tiles of 8 rows.
 ///
-/// One step handles 32 weights. `maddubs` needs an unsigned operand, so it
-/// multiplies the magnitudes of the weights with activations that carry the
-/// weights' signs. `madd` then adds the products in fours, which lines each
-/// 32-bit lane up with one stored scale. Four accumulators take turns so
-/// that consecutive steps do not wait on each other.
+/// A step loads 4 columns of all 8 rows, 32 bytes, and multiplies them with
+/// the same 4 activation bytes repeated in every lane. `maddubs` adds the
+/// products in pairs, which leaves two 16-bit sums per row. Four steps make
+/// a sub-block of 16 columns. Its sums are widened to one 32-bit sum per
+/// row, converted to floats once, and scaled with one scale per row.
+///
+/// How early the 16-bit sums must be widened depends on the tile:
+///
+/// - Weights up to 31: the pair sums of all four steps fit in 16 bits, so
+///   they are added there and widened once.
+/// - Weights up to 63: two steps fit.
+/// - Signed weights: `maddubs` needs an unsigned operand, so it multiplies
+///   the weights' magnitudes with activations that carry the weights'
+///   signs. One step fills 16 bits.
 #[target_feature(enable = "avx2,fma,f16c")]
-unsafe fn dot_decoded(q: *const i8, scale: *const f32, n: usize, act: ActRef, group: usize) -> f32 {
-    let blocks = n / 32;
-    // Blocks per activation group, as a shift: 0 for groups of 32, 3 for 256.
-    let shift = (group / 32).trailing_zeros();
+unsafe fn tile_dot(tile: &Tile, act: ActRef, scaled_sums: *const f32, group: usize, out: *mut f32) {
+    debug_assert_eq!(tile.height, 8);
+    debug_assert!(tile.signed || tile.max <= 63);
+    debug_assert!(group == 32 || group == 256);
+    let (q, scale, offset) = (tile.q.as_ptr(), tile.scale.as_ptr(), tile.offset.as_ptr());
     let ones = _mm256_set1_epi16(1);
-    let mut acc = [_mm256_setzero_ps(); 4];
-    // SAFETY: the caller guarantees `n` weights and activations, `n / 4`
-    // scales and `n / group` activation scales. Every index below stays
-    // under `blocks * 32 = n`.
-    let step = |block: usize, acc: __m256| unsafe {
-        let weights = _mm256_loadu_si256(q.add(block * 32) as *const __m256i);
-        let acts = _mm256_loadu_si256(act.q.add(block * 32) as *const __m256i);
-        let pairs = _mm256_maddubs_epi16(_mm256_abs_epi8(weights), _mm256_sign_epi8(acts, weights));
-        let fours = _mm256_cvtepi32_ps(_mm256_madd_epi16(pairs, ones));
-        let scales = _mm256_mul_ps(
-            _mm256_loadu_ps(scale.add(block * 8)),
-            broadcast(act.scale.add(block >> shift)),
-        );
-        _mm256_fmadd_ps(fours, scales, acc)
+    let zero = _mm256_setzero_ps();
+
+    // The weights and activations of step `$step`.
+    macro_rules! operands {
+        ($step:expr) => {{
+            let weights = _mm256_loadu_si256(q.add($step * 32) as *const __m256i);
+            let four = (act.q.add($step * 4) as *const i32).read_unaligned();
+            (weights, _mm256_set1_epi32(four))
+        }};
+    }
+    // The pair sums of step `$step`, for unsigned weights.
+    macro_rules! pairs {
+        ($step:expr) => {{
+            let (weights, acts) = operands!($step);
+            _mm256_maddubs_epi16(weights, acts)
+        }};
+    }
+    // The row sums of step `$step`, for signed weights.
+    macro_rules! signed_rows {
+        ($step:expr) => {{
+            let (weights, acts) = operands!($step);
+            let magnitudes = _mm256_abs_epi8(weights);
+            let pairs = _mm256_maddubs_epi16(magnitudes, _mm256_sign_epi8(acts, weights));
+            _mm256_madd_epi16(pairs, ones)
+        }};
+    }
+    // The scaled row sums of sub-block `$sub`, added to `$acc`. `$sums`
+    // yields the row sums of the sub-block whose first step is `$first`.
+    macro_rules! scaled {
+        ($acc:expr, $sub:expr, |$first:ident| $sums:expr) => {{
+            let $first = $sub * 4;
+            let sums = _mm256_cvtepi32_ps($sums);
+            _mm256_fmadd_ps(sums, _mm256_loadu_ps(scale.add($sub * 8)), $acc)
+        }};
+    }
+    // The offset term of sub-block `$sub`, added to `$acc`.
+    macro_rules! shifted {
+        ($acc:expr, $sub:expr) => {{
+            let offsets = _mm256_loadu_ps(offset.add($sub * 8));
+            _mm256_fmadd_ps(offsets, broadcast(scaled_sums.add($sub)), $acc)
+        }};
+    }
+    // Walks a tile whose activation groups hold `$pairs` pairs of
+    // sub-blocks. The two sub-blocks of a pair have accumulators of their
+    // own, so neither waits for the addition of the other. With
+    // `$offsets`, the offset term is gathered on the way, again in two
+    // accumulators.
+    macro_rules! walk {
+        ($pairs:expr, $offsets:expr, |$first:ident| $sums:expr) => {{
+            let mut total = zero;
+            let (mut shift_even, mut shift_odd) = (zero, zero);
+            let mut sub = 0;
+            for g in 0..tile.cols / ($pairs * 32) {
+                let (mut even, mut odd) = (zero, zero);
+                for _ in 0..$pairs {
+                    even = scaled!(even, sub, |$first| $sums);
+                    odd = scaled!(odd, sub + 1, |$first| $sums);
+                    if $offsets {
+                        shift_even = shifted!(shift_even, sub);
+                        shift_odd = shifted!(shift_odd, sub + 1);
+                    }
+                    sub += 2;
+                }
+                let partial = _mm256_add_ps(even, odd);
+                total = _mm256_fmadd_ps(partial, broadcast(act.scale.add(g)), total);
+            }
+            _mm256_add_ps(total, _mm256_add_ps(shift_even, shift_odd))
+        }};
+    }
+    // The walk for either group size, each with a loop of its own.
+    macro_rules! reduce {
+        ($offsets:expr, |$first:ident| $sums:expr) => {
+            if group == 32 {
+                walk!(1, $offsets, |$first| $sums)
+            } else {
+                walk!(8, $offsets, |$first| $sums)
+            }
+        };
+    }
+
+    // SAFETY: the tile holds `cols * 8` weights and `cols / 16 * 8` scales
+    // and offsets. The caller guarantees activations for `cols` elements in
+    // groups of `group`, their scaled sums when the tile has offsets, and
+    // room for 8 outputs. Every index below stays inside those sizes.
+    unsafe {
+        let total = if tile.signed {
+            // Signed tiles come from formats without offsets.
+            reduce!(tile.has_offset, |s| {
+                let low = _mm256_add_epi32(signed_rows!(s), signed_rows!(s + 1));
+                let high = _mm256_add_epi32(signed_rows!(s + 2), signed_rows!(s + 3));
+                _mm256_add_epi32(low, high)
+            })
+        } else if tile.max <= 31 {
+            reduce!(tile.has_offset, |s| {
+                let low = _mm256_add_epi16(pairs!(s), pairs!(s + 1));
+                let high = _mm256_add_epi16(pairs!(s + 2), pairs!(s + 3));
+                _mm256_madd_epi16(_mm256_add_epi16(low, high), ones)
+            })
+        } else {
+            reduce!(tile.has_offset, |s| {
+                let low = _mm256_add_epi16(pairs!(s), pairs!(s + 1));
+                let high = _mm256_add_epi16(pairs!(s + 2), pairs!(s + 3));
+                _mm256_add_epi32(_mm256_madd_epi16(low, ones), _mm256_madd_epi16(high, ones))
+            })
+        };
+        _mm256_storeu_ps(out, total);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Filling tiles
+// ---------------------------------------------------------------------------
+
+/// See [`TileFill`](super::TileFill).
+///
+/// The common formats are unpacked 32 weights at a time for all eight rows,
+/// and the eight registers are transposed straight into the tile. The other
+/// formats take the portable fill.
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn tile_fill(tile: &mut Tile, ty: TensorType, height: usize, data: &[u8], row_bytes: usize) {
+    let fill: unsafe fn(&mut Tile, [*const u8; 8]) -> bool = match ty {
+        TensorType::Q4_0 => fill_q4_0,
+        TensorType::Q5_0 => fill_q5_0,
+        TensorType::Q8_0 => fill_q8_0,
+        TensorType::Q4K => fill_q4_k,
+        TensorType::Q5K => fill_q5_k,
+        TensorType::Q6K => fill_q6_k,
+        _ => return tile.fill(ty, height, data, row_bytes),
     };
-    let mut block = 0;
-    while block + 4 <= blocks {
-        for (lane, acc) in acc.iter_mut().enumerate() {
-            *acc = step(block + lane, *acc);
+    if height != 8 {
+        return tile.fill(ty, height, data, row_bytes);
+    }
+    tile.prepare(ty, 8, row_bytes);
+    // Rows the tile lacks are read from a row of zeros, which decodes to
+    // weights of zero in each of these formats.
+    let blank = tile.blank_row(row_bytes).as_ptr();
+    let mut rows = [blank; 8];
+    for (row, bytes) in rows.iter_mut().zip(data.chunks_exact(row_bytes)) {
+        *row = bytes.as_ptr();
+    }
+    // SAFETY: every pointer in `rows` is valid for `row_bytes` bytes, which
+    // is a whole number of blocks, and `prepare` sized the tile for them.
+    tile.has_offset = unsafe { fill(tile, rows) };
+}
+
+/// Turns eight registers of eight 32-bit lanes into their transpose: lane
+/// `r` of result `k` is lane `k` of input `r`.
+#[target_feature(enable = "avx2,fma,f16c")]
+#[inline]
+unsafe fn transpose(rows: [__m256i; 8]) -> [__m256i; 8] {
+    let t0 = _mm256_unpacklo_epi32(rows[0], rows[1]);
+    let t1 = _mm256_unpackhi_epi32(rows[0], rows[1]);
+    let t2 = _mm256_unpacklo_epi32(rows[2], rows[3]);
+    let t3 = _mm256_unpackhi_epi32(rows[2], rows[3]);
+    let t4 = _mm256_unpacklo_epi32(rows[4], rows[5]);
+    let t5 = _mm256_unpackhi_epi32(rows[4], rows[5]);
+    let t6 = _mm256_unpacklo_epi32(rows[6], rows[7]);
+    let t7 = _mm256_unpackhi_epi32(rows[6], rows[7]);
+    let u0 = _mm256_unpacklo_epi64(t0, t2);
+    let u1 = _mm256_unpackhi_epi64(t0, t2);
+    let u2 = _mm256_unpacklo_epi64(t1, t3);
+    let u3 = _mm256_unpackhi_epi64(t1, t3);
+    let u4 = _mm256_unpacklo_epi64(t4, t6);
+    let u5 = _mm256_unpackhi_epi64(t4, t6);
+    let u6 = _mm256_unpacklo_epi64(t5, t7);
+    let u7 = _mm256_unpackhi_epi64(t5, t7);
+    [
+        _mm256_permute2x128_si256::<0x20>(u0, u4),
+        _mm256_permute2x128_si256::<0x20>(u1, u5),
+        _mm256_permute2x128_si256::<0x20>(u2, u6),
+        _mm256_permute2x128_si256::<0x20>(u3, u7),
+        _mm256_permute2x128_si256::<0x31>(u0, u4),
+        _mm256_permute2x128_si256::<0x31>(u1, u5),
+        _mm256_permute2x128_si256::<0x31>(u2, u6),
+        _mm256_permute2x128_si256::<0x31>(u3, u7),
+    ]
+}
+
+/// Writes 32 columns of a tile: `weights[r]` holds those columns of row `r`.
+#[target_feature(enable = "avx2,fma,f16c")]
+#[inline]
+unsafe fn store_columns(q: *mut i8, weights: [__m256i; 8]) {
+    for (step, lanes) in transpose(weights).into_iter().enumerate() {
+        // SAFETY: the caller guarantees room for 8 steps of 32 bytes at `q`.
+        unsafe { _mm256_storeu_si256(q.add(step * 32) as *mut __m256i, lanes) };
+    }
+}
+
+/// Writes one value per row for each of 8 sub-blocks: `values[r]` holds the
+/// eight values of row `r`. Each is written `repeat` times, for formats
+/// whose scales span more than one sub-block of 16 columns.
+#[target_feature(enable = "avx2,fma,f16c")]
+#[inline]
+unsafe fn store_affine(out: *mut f32, values: [__m256; 8], repeat: usize) {
+    let lanes = transpose(values.map(|row| _mm256_castps_si256(row)));
+    for (index, lanes) in lanes.into_iter().enumerate() {
+        for copy in 0..repeat {
+            // SAFETY: the caller guarantees room for `8 * repeat` runs of
+            // eight floats at `out`.
+            unsafe {
+                _mm256_storeu_ps(
+                    out.add((index * repeat + copy) * 8),
+                    _mm256_castsi256_ps(lanes),
+                )
+            };
         }
-        block += 4;
     }
-    while block < blocks {
-        acc[0] = step(block, acc[0]);
-        block += 1;
+}
+
+/// Lanes that hold something other than zero, as a mask to gather with OR.
+#[target_feature(enable = "avx2,fma,f16c")]
+#[inline]
+unsafe fn nonzero(values: __m256) -> __m256 {
+    _mm256_cmp_ps::<_CMP_NEQ_UQ>(values, _mm256_setzero_ps())
+}
+
+/// Defines the fill of a format with blocks of 32 weights. `$weights`
+/// unpacks the block at `$p` into 32 bytes, shifted by `$bias` where the
+/// format is signed. Returns whether any offset is not zero.
+macro_rules! block32_fill {
+    ($name:ident, $bytes:expr, $bias:expr, |$p:ident| $weights:expr) => {
+        #[target_feature(enable = "avx2,fma,f16c")]
+        unsafe fn $name(tile: &mut Tile, rows: [*const u8; 8]) -> bool {
+            let (q, scale, offset) = (
+                tile.q.as_mut_ptr(),
+                tile.scale.as_mut_ptr(),
+                tile.offset.as_mut_ptr(),
+            );
+            let zero = _mm256_setzero_ps();
+            let mut any = zero;
+            // SAFETY: the caller guarantees `tile.cols / 32` blocks behind
+            // every row pointer and a tile sized for them.
+            unsafe {
+                for block in 0..tile.cols / 32 {
+                    let mut weights = [_mm256_setzero_si256(); 8];
+                    let mut halves = [0i16; 8];
+                    for r in 0..8 {
+                        let $p = rows[r].add(block * $bytes);
+                        weights[r] = $weights;
+                        halves[r] = ($p as *const i16).read_unaligned();
+                    }
+                    store_columns(q.add(block * 256), weights);
+                    // One scale per row, shared by both sub-blocks.
+                    let scales =
+                        _mm256_cvtph_ps(_mm_loadu_si128(halves.as_ptr() as *const __m128i));
+                    let offsets = _mm256_sub_ps(zero, _mm256_mul_ps(_mm256_set1_ps($bias), scales));
+                    for sub in block * 2..block * 2 + 2 {
+                        _mm256_storeu_ps(scale.add(sub * 8), scales);
+                        _mm256_storeu_ps(offset.add(sub * 8), offsets);
+                    }
+                    any = _mm256_or_ps(any, nonzero(offsets));
+                }
+            }
+            _mm256_movemask_ps(any) != 0
+        }
+    };
+}
+
+block32_fill!(fill_q4_0, 18, 8.0, |p| nibbles(p.add(2)));
+block32_fill!(fill_q5_0, 22, 16.0, |p| _mm256_or_si256(
+    nibbles(p.add(6)),
+    fifth_bits(p.add(2))
+));
+block32_fill!(fill_q8_0, 34, 0.0, |p| _mm256_loadu_si256(
+    p.add(2) as *const __m256i
+));
+
+/// The scales and offsets of the Q4_K or Q5_K super-block at `p`, as
+/// floats: eight of each, one per sub-block of 32 weights.
+#[target_feature(enable = "avx2,fma,f16c")]
+#[inline]
+unsafe fn k4_affine(p: *const u8) -> (__m256, __m256) {
+    // SAFETY: the caller guarantees 16 readable bytes at `p`.
+    let (w0, w1, w2) = unsafe { (word(p.add(4)), word(p.add(8)), word(p.add(12))) };
+    // The same unpacking as `k4_scales`, one byte per value.
+    let scales_low = w0 & 0x3f3f_3f3f;
+    let minimums_low = w1 & 0x3f3f_3f3f;
+    let scales_high = (w2 & 0x0f0f_0f0f) | (((w0 >> 6) & 0x0303_0303) << 4);
+    let minimums_high = ((w2 >> 4) & 0x0f0f_0f0f) | (((w1 >> 6) & 0x0303_0303) << 4);
+    let floats = |low: u32, high: u32| {
+        let bytes = _mm_set_epi64x(0, (low as u64 | (high as u64) << 32) as i64);
+        _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(bytes))
+    };
+    // SAFETY: as above.
+    let (d, dmin) = unsafe { (half(p), half(p.add(2))) };
+    let scale = _mm256_mul_ps(d, floats(scales_low, scales_high));
+    let minimum = _mm256_mul_ps(dmin, floats(minimums_low, minimums_high));
+    (scale, _mm256_xor_ps(minimum, _mm256_set1_ps(-0.0)))
+}
+
+/// Defines the fill of Q4_K or Q5_K. `$weights` yields the low and the high
+/// 32 weights of pair `$pair` of the super-block at `$p`.
+macro_rules! k4_fill {
+    ($name:ident, $bytes:expr, |$p:ident, $pair:ident| $weights:expr) => {
+        #[target_feature(enable = "avx2,fma,f16c")]
+        unsafe fn $name(tile: &mut Tile, rows: [*const u8; 8]) -> bool {
+            let (q, scale, offset) = (
+                tile.q.as_mut_ptr(),
+                tile.scale.as_mut_ptr(),
+                tile.offset.as_mut_ptr(),
+            );
+            let mut any = _mm256_setzero_ps();
+            // SAFETY: the caller guarantees `tile.cols / 256` super-blocks
+            // behind every row pointer and a tile sized for them.
+            unsafe {
+                for block in 0..tile.cols / 256 {
+                    let mut scales = [_mm256_setzero_ps(); 8];
+                    let mut offsets = [_mm256_setzero_ps(); 8];
+                    for r in 0..8 {
+                        (scales[r], offsets[r]) = k4_affine(rows[r].add(block * $bytes));
+                        any = _mm256_or_ps(any, nonzero(offsets[r]));
+                    }
+                    // Each scale covers 32 weights, two sub-blocks of 16.
+                    store_affine(scale.add(block * 128), scales, 2);
+                    store_affine(offset.add(block * 128), offsets, 2);
+                    for $pair in 0..4 {
+                        let mut low = [_mm256_setzero_si256(); 8];
+                        let mut high = [_mm256_setzero_si256(); 8];
+                        for r in 0..8 {
+                            let $p = rows[r].add(block * $bytes);
+                            (low[r], high[r]) = $weights;
+                        }
+                        store_columns(q.add((block * 8 + $pair * 2) * 256), low);
+                        store_columns(q.add((block * 8 + $pair * 2 + 1) * 256), high);
+                    }
+                }
+            }
+            _mm256_movemask_ps(any) != 0
+        }
+    };
+}
+
+k4_fill!(fill_q4_k, 144, |p, pair| {
+    let bytes = _mm256_loadu_si256(p.add(16 + pair * 32) as *const __m256i);
+    let mask = _mm256_set1_epi8(0x0f);
+    (
+        _mm256_and_si256(bytes, mask),
+        _mm256_and_si256(_mm256_srli_epi16::<4>(bytes), mask),
+    )
+});
+
+k4_fill!(fill_q5_k, 176, |p, pair| {
+    let bytes = _mm256_loadu_si256(p.add(48 + pair * 32) as *const __m256i);
+    let fifth = _mm256_loadu_si256(p.add(16) as *const __m256i);
+    let mask = _mm256_set1_epi8(0x0f);
+    // Bits `2 * pair` and `2 * pair + 1` of each byte are the fifth bits of
+    // the low and the high weight.
+    let bit = |shift: usize| {
+        let wanted = _mm256_set1_epi8(1 << shift);
+        let is_set = _mm256_cmpeq_epi8(_mm256_and_si256(fifth, wanted), wanted);
+        _mm256_and_si256(is_set, _mm256_set1_epi8(0x10))
+    };
+    (
+        _mm256_or_si256(_mm256_and_si256(bytes, mask), bit(2 * pair)),
+        _mm256_or_si256(
+            _mm256_and_si256(_mm256_srli_epi16::<4>(bytes), mask),
+            bit(2 * pair + 1),
+        ),
+    )
+});
+
+/// The fill of Q6_K. Weights are 4 low bits and 2 high bits, stored with a
+/// bias of 32, which is how the tile wants them.
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn fill_q6_k(tile: &mut Tile, rows: [*const u8; 8]) -> bool {
+    const BYTES: usize = 210;
+    let (q, scale, offset) = (
+        tile.q.as_mut_ptr(),
+        tile.scale.as_mut_ptr(),
+        tile.offset.as_mut_ptr(),
+    );
+    let zero = _mm256_setzero_ps();
+    let low_mask = _mm256_set1_epi8(0x0f);
+    let two_bits = _mm256_set1_epi8(3);
+    let mut any = zero;
+    // SAFETY: the caller guarantees `tile.cols / 256` super-blocks behind
+    // every row pointer and a tile sized for them.
+    unsafe {
+        for block in 0..tile.cols / 256 {
+            // Sixteen signed 8-bit scales per row, times the block's scale.
+            for part in 0..2 {
+                let mut scales = [zero; 8];
+                let mut offsets = [zero; 8];
+                for r in 0..8 {
+                    let p = rows[r].add(block * BYTES);
+                    let raw = _mm_loadl_epi64(p.add(192 + part * 8) as *const __m128i);
+                    let integers = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(raw));
+                    scales[r] = _mm256_mul_ps(half(p.add(208)), integers);
+                    offsets[r] =
+                        _mm256_sub_ps(zero, _mm256_mul_ps(_mm256_set1_ps(32.0), scales[r]));
+                    any = _mm256_or_ps(any, nonzero(offsets[r]));
+                }
+                store_affine(scale.add((block * 16 + part * 8) * 8), scales, 1);
+                store_affine(offset.add((block * 16 + part * 8) * 8), offsets, 1);
+            }
+            // Each half of the block is 64 bytes of nibbles and 32 bytes of
+            // high bit pairs, and unpacks to four runs of 32 weights.
+            for part in 0..2 {
+                let mut runs = [[_mm256_setzero_si256(); 8]; 4];
+                for r in 0..8 {
+                    let p = rows[r].add(block * BYTES);
+                    let first = _mm256_loadu_si256(p.add(part * 64) as *const __m256i);
+                    let second = _mm256_loadu_si256(p.add(part * 64 + 32) as *const __m256i);
+                    let high = _mm256_loadu_si256(p.add(128 + part * 32) as *const __m256i);
+                    let top =
+                        |shift: __m256i| _mm256_slli_epi16::<4>(_mm256_and_si256(shift, two_bits));
+                    runs[0][r] = _mm256_or_si256(_mm256_and_si256(first, low_mask), top(high));
+                    runs[1][r] = _mm256_or_si256(
+                        _mm256_and_si256(second, low_mask),
+                        top(_mm256_srli_epi16::<2>(high)),
+                    );
+                    runs[2][r] = _mm256_or_si256(
+                        _mm256_and_si256(_mm256_srli_epi16::<4>(first), low_mask),
+                        top(_mm256_srli_epi16::<4>(high)),
+                    );
+                    runs[3][r] = _mm256_or_si256(
+                        _mm256_and_si256(_mm256_srli_epi16::<4>(second), low_mask),
+                        top(_mm256_srli_epi16::<6>(high)),
+                    );
+                }
+                for (run, weights) in runs.into_iter().enumerate() {
+                    store_columns(q.add((block * 8 + part * 4 + run) * 256), weights);
+                }
+            }
+        }
     }
-    hsum(_mm256_add_ps(
-        _mm256_add_ps(acc[0], acc[1]),
-        _mm256_add_ps(acc[2], acc[3]),
-    ))
+    _mm256_movemask_ps(any) != 0
 }
 
 /// Dot product of two float vectors. Neither pointer needs to be aligned.
@@ -378,6 +788,13 @@ unsafe fn softmax(x: *mut f32, n: usize) {
     unsafe { scalar::softmax_impl(x, n) }
 }
 
+/// See [`Kernels::quantize`]. The results equal the portable version's to
+/// the last bit.
+///
+/// A group is scanned once for its largest magnitude. Then 32 floats at a
+/// time are scaled, rounded and narrowed to bytes. Converting a float to an
+/// integer rounds to the nearest, ties to even, which is the rounding the
+/// portable version spells out.
 #[target_feature(enable = "avx2,fma,f16c")]
 unsafe fn quantize(
     x: *const f32,
@@ -388,8 +805,76 @@ unsafe fn quantize(
     sums: *mut i16,
     wsum: *mut f32,
 ) {
-    // SAFETY: forwarded contract.
-    unsafe { scalar::quantize_impl(x, n, group, q, scale, sums, wsum) }
+    let sign = _mm256_set1_ps(-0.0);
+    // Narrowing packs each half of a register on its own. This puts the
+    // bytes back in order.
+    let order = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+    let to_unsigned = _mm256_set1_epi8(-128);
+
+    // The eight floats at `$p`, scaled by `$inverse` and rounded. A value
+    // that is not a number becomes zero, as it does in the portable version.
+    macro_rules! rounded {
+        ($p:expr, $inverse:expr) => {{
+            let scaled = _mm256_mul_ps(_mm256_loadu_ps($p), $inverse);
+            let is_number = _mm256_cmp_ps::<_CMP_ORD_Q>(scaled, scaled);
+            _mm256_cvtps_epi32(_mm256_and_ps(scaled, is_number))
+        }};
+    }
+
+    // SAFETY: the caller guarantees the buffer sizes documented on
+    // `Kernels::quantize`, and `group` is a multiple of 32.
+    unsafe {
+        for g in 0..n / group {
+            let values = x.add(g * group);
+            let out = q.add(g * group);
+            let group_sums = sums.add(g * group / 16);
+
+            // `max` returns its second operand when the first is not a
+            // number, so such values never become the largest.
+            let mut largest = _mm256_setzero_ps();
+            for i in (0..group).step_by(8) {
+                let magnitudes = _mm256_andnot_ps(sign, _mm256_loadu_ps(values.add(i)));
+                largest = _mm256_max_ps(magnitudes, largest);
+            }
+            let quad = _mm_max_ps(
+                _mm256_castps256_ps128(largest),
+                _mm256_extractf128_ps::<1>(largest),
+            );
+            let pair = _mm_max_ps(quad, _mm_movehl_ps(quad, quad));
+            let max = _mm_cvtss_f32(_mm_max_ss(pair, _mm_shuffle_ps::<1>(pair, pair)));
+            if max == 0.0 {
+                std::ptr::write_bytes(out, 0, group);
+                std::ptr::write_bytes(group_sums, 0, group / 16);
+                *scale.add(g) = 0.0;
+                *wsum.add(g) = 0.0;
+                continue;
+            }
+
+            let inverse = _mm256_set1_ps(127.0 / max);
+            let mut total = 0i64;
+            for block in 0..group / 32 {
+                let p = values.add(block * 32);
+                let low = _mm256_packs_epi32(rounded!(p, inverse), rounded!(p.add(8), inverse));
+                let high =
+                    _mm256_packs_epi32(rounded!(p.add(16), inverse), rounded!(p.add(24), inverse));
+                let bytes = _mm256_permutevar8x32_epi32(_mm256_packs_epi16(low, high), order);
+                _mm256_storeu_si256(out.add(block * 32) as *mut __m256i, bytes);
+                // Sums of unsigned bytes come in one instruction, eight
+                // bytes at a time. Each byte is shifted up by 128 for it.
+                let eights =
+                    _mm256_sad_epu8(_mm256_xor_si256(bytes, to_unsigned), _mm256_setzero_si256());
+                let first = _mm256_extract_epi64::<0>(eights) + _mm256_extract_epi64::<1>(eights)
+                    - 16 * 128;
+                let second = _mm256_extract_epi64::<2>(eights) + _mm256_extract_epi64::<3>(eights)
+                    - 16 * 128;
+                *group_sums.add(block * 2) = first as i16;
+                *group_sums.add(block * 2 + 1) = second as i16;
+                total += first + second;
+            }
+            *scale.add(g) = max / 127.0;
+            *wsum.add(g) = *scale.add(g) * total as i32 as f32;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

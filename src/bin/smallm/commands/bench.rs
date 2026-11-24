@@ -133,23 +133,33 @@ pub fn main(raw: impl Iterator<Item = String>) -> Result<(), String> {
     Ok(())
 }
 
-/// Times each stage of the forward pass during one generation run.
+/// Times each stage of the forward pass, first while the prompt is read
+/// and then while tokens are generated.
 fn profile(session: &mut Session, prompt: &[u32], n_gen: usize) -> Result<(), String> {
     session.clear();
+    session.set_profiling(true);
     session.eval(prompt).map_err(|error| error.to_string())?;
+    if let Some(profile) = session.profile() {
+        print_profile("reading the prompt", &profile, prompt.len());
+    }
+
     session.set_profiling(true);
     for _ in 0..n_gen {
         let next = argmax(session.logits());
         session.eval(&[next]).map_err(|error| error.to_string())?;
     }
-    let Some(profile) = session.profile() else {
-        return Ok(());
-    };
+    if let Some(profile) = session.profile() {
+        print_profile("generation", &profile, n_gen);
+    }
     session.set_profiling(false);
+    Ok(())
+}
 
+/// Prints the time each stage took, per token.
+fn print_profile(what: &str, profile: &smallm::model::Profile, tokens: usize) {
     let total = profile.total().as_secs_f64();
-    let per_token = |time: std::time::Duration| time.as_secs_f64() * 1e6 / n_gen as f64;
-    println!("\ngeneration time per token, by stage:");
+    let per_token = |time: std::time::Duration| time.as_secs_f64() * 1e6 / tokens.max(1) as f64;
+    println!("\n{what}, time per token by stage:");
     for (phase, time) in Phase::ALL.iter().zip(profile.phases) {
         let share = 100.0 * time.as_secs_f64() / total.max(1e-12);
         println!(
@@ -163,7 +173,6 @@ fn profile(session: &mut Session, prompt: &[u32], n_gen: usize) -> Result<(), St
         "  of which quantizing activations: {:.1} us",
         per_token(profile.quantize)
     );
-    Ok(())
 }
 
 /// Reads the prompt into an empty context, then generates greedily.

@@ -630,10 +630,7 @@ impl Session {
             ];
             engine.multiply(acts, h_active, d, &mut targets);
             lap(profile, Phase::FeedForwardUp);
-            match config.activation {
-                Activation::Silu => kernels.silu_mul(gate, up),
-                Activation::Gelu => kernels.gelu_mul(gate, up),
-            }
+            apply_gate(kernels, pool, config.activation, gate, up);
             lap(profile, Phase::Activation);
             engine.multiply(
                 acts,
@@ -682,6 +679,32 @@ impl Session {
     }
 }
 
+/// Applies the gate of the feed-forward network: `gate = act(gate) * up`.
+/// Large batches are split between the threads.
+fn apply_gate(
+    kernels: &Kernels,
+    pool: &ThreadPool,
+    activation: Activation,
+    gate: &mut [f32],
+    up: &[f32],
+) {
+    /// Elements per parallel piece. Fewer are not worth waking a thread for.
+    const GRAIN: usize = 16 * 1024;
+    let apply = |gate: &mut [f32], up: &[f32]| match activation {
+        Activation::Silu => kernels.silu_mul(gate, up),
+        Activation::Gelu => kernels.gelu_mul(gate, up),
+    };
+    if gate.len() <= GRAIN || pool.threads() == 1 {
+        return apply(gate, up);
+    }
+    let output = SharedOutput(gate.as_mut_ptr());
+    pool.ranges(gate.len().min(up.len()), GRAIN, &|range| {
+        // SAFETY: the ranges are disjoint and lie inside `gate`.
+        let gate = unsafe { output.slice(range.start, range.len()) };
+        apply(gate, &up[range]);
+    });
+}
+
 /// Adds a block's output to the hidden state, normalizing it first when the
 /// model has a post-norm.
 fn add_residual(
@@ -713,13 +736,13 @@ struct Query<'a> {
     window: usize,
 }
 
-/// Where attention writes, shared between threads.
-struct AttendOutput(*mut f32);
+/// Where a parallel loop writes, shared between its threads.
+struct SharedOutput(*mut f32);
 
-// SAFETY: every (token, head) unit writes its own disjoint slice.
-unsafe impl Sync for AttendOutput {}
+// SAFETY: every unit of work writes a slice of its own.
+unsafe impl Sync for SharedOutput {}
 
-impl AttendOutput {
+impl SharedOutput {
     /// The `len` floats starting at `start`.
     ///
     /// # Safety
@@ -756,7 +779,7 @@ fn attend(
     let shared = config.n_head / n_kv;
     let group_dim = shared * head_dim;
     let units = query.q.len() / q_dim * n_kv;
-    let output = AttendOutput(out.as_mut_ptr());
+    let output = SharedOutput(out.as_mut_ptr());
 
     let unit = |index: usize, slot: usize| {
         let (token, kv_head) = (index / n_kv, index % n_kv);

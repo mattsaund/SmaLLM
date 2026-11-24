@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::tensor::f16::{bf16_to_f32, f16_to_f32, f32_to_f16};
-use crate::tensor::quant::dequantize_row;
+use crate::tensor::quant::{Tile, dequantize_row};
 use crate::testing::{Rng, random_weights, set_scales};
 
 const QUANT_TYPES: [TensorType; 11] = [
@@ -80,6 +80,67 @@ fn row_dot(kernels: &Kernels, ty: TensorType, row: &[u8], n: usize, acts: &Acts)
         RowDot::Quant(dot) => unsafe { dot(row.as_ptr(), n, acts.as_ref()) },
         RowDot::Float(_) => panic!("{} is not a quantized type", ty.name()),
     }
+}
+
+/// The scaled sums of an activation vector: what tile offsets multiply.
+fn scaled_sums(acts: &Acts) -> Vec<f32> {
+    acts.sums
+        .iter()
+        .enumerate()
+        .map(|(sub, sum)| acts.scale[sub * 16 / acts.group] * *sum as f32)
+        .collect()
+}
+
+/// The tile heights to test a backend with. The portable kernel is the
+/// definition for every height, so it is tested with both heights in use.
+fn tile_heights(kernels: &Kernels) -> Vec<usize> {
+    match kernels.tile_rows() {
+        0 => vec![4, 8],
+        height => vec![height],
+    }
+}
+
+/// Reduces the rows stored in `matrix` against `acts` with a backend's tile
+/// kernel, the way the batched multiply does. Returns one result per row.
+fn tile_dots(
+    kernels: &Kernels,
+    height: usize,
+    ty: TensorType,
+    matrix: &[u8],
+    n: usize,
+    acts: &Acts,
+) -> Vec<f32> {
+    let row_bytes = ty.row_bytes(n).unwrap();
+    let mut tile = Tile::default();
+    let mut results = Vec::new();
+    for rows in matrix.chunks(height * row_bytes) {
+        // The portable kernel is tested on tiles from the portable fill.
+        match kernels.tile_rows() {
+            0 => tile.fill(ty, height, rows, row_bytes),
+            _ => kernels.fill_tile(&mut tile, ty, rows, row_bytes),
+        }
+        assert_eq!((tile.cols, tile.height), (n, height));
+        let mut out = vec![f32::NAN; height];
+        // SAFETY: the tile and `acts` both describe `n` columns, the scaled
+        // sums cover them, and `out` has one slot per tile row.
+        unsafe {
+            (kernels.tile_dot())(
+                &tile,
+                acts.as_ref(),
+                scaled_sums(acts).as_ptr(),
+                acts.group,
+                out.as_mut_ptr(),
+            )
+        };
+        // Rows the tile was padded with come out as zero.
+        assert!(
+            out[rows.len() / row_bytes..]
+                .iter()
+                .all(|value| *value == 0.0)
+        );
+        results.extend_from_slice(&out[..rows.len() / row_bytes]);
+    }
+    results
 }
 
 /// The dot product by definition: expand both sides to floats and multiply.
@@ -256,6 +317,10 @@ fn quantized_activations_reconstruct_their_input() {
         // One group of zeros, and one dominated by a single large value.
         x[group..group * 2].fill(0.0);
         x[group * 2 + 5] = 400.0;
+        // Exact halves, which must round to the even neighbor.
+        x[group * 3] = 3.0;
+        x[group * 3 + 1] = 3.0 * 0.5 / 127.0;
+        x[group * 3 + 2] = -3.0 * 2.5 / 127.0;
         let reference = Acts::new(scalar(), &x, group);
 
         for g in 0..4 {
@@ -279,6 +344,23 @@ fn quantized_activations_reconstruct_their_input() {
 
         for kernels in available() {
             let acts = Acts::new(kernels, &x, group);
+            assert_eq!(acts.q, reference.q, "{}", kernels.name);
+            assert_eq!(acts.sums, reference.sums, "{}", kernels.name);
+            assert_eq!(acts.scale, reference.scale, "{}", kernels.name);
+            assert_eq!(acts.wsum, reference.wsum, "{}", kernels.name);
+        }
+
+        // Values that are not numbers, and infinities, quantize the same
+        // way on every backend.
+        let mut odd = rng.floats(group * 3, -3.0, 3.0);
+        odd[3] = f32::NAN;
+        odd[group + 7] = f32::INFINITY;
+        odd[group + 9] = -1.0;
+        odd[group * 2 + 1] = f32::NEG_INFINITY;
+        odd[group * 2 + 2] = f32::NAN;
+        let reference = Acts::new(scalar(), &odd, group);
+        for kernels in available() {
+            let acts = Acts::new(kernels, &odd, group);
             assert_eq!(acts.q, reference.q, "{}", kernels.name);
             assert_eq!(acts.sums, reference.sums, "{}", kernels.name);
             assert_eq!(acts.scale, reference.scale, "{}", kernels.name);
@@ -346,9 +428,161 @@ fn extreme_weights_and_activations_do_not_saturate() {
                     let acts = Acts::new(scalar(), &x, group_of(ty));
                     assert!(acts.q.iter().all(|q| q.unsigned_abs() == 127));
                     let (expected, magnitude) = reference_dot(ty, &row, &acts.reconstruct());
-                    let got = row_dot(kernels, ty, &row, n, &acts);
                     let what = format!("{} {} fill {fill:#04x} x {value}", kernels.name, ty.name());
-                    assert_close(got, expected, magnitude, &what);
+                    assert_close(
+                        row_dot(kernels, ty, &row, n, &acts),
+                        expected,
+                        magnitude,
+                        &what,
+                    );
+                    for height in tile_heights(kernels) {
+                        let got = tile_dots(kernels, height, ty, &row, n, &acts);
+                        assert_close(got[0], expected, magnitude, &format!("tile {what}"));
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn tiles_match_the_definition() {
+    let mut rng = Rng(21);
+    for kernels in available() {
+        for height in tile_heights(kernels) {
+            for ty in QUANT_TYPES {
+                // Full tiles, a tile with one row missing, and a lone row.
+                for (blocks, rows) in [(1, height), (2, height - 1), (3, 1), (5, 2 * height + 3)] {
+                    let n = blocks * ty.block_len();
+                    let matrix = random_weights(&mut rng, ty, rows * n, 3.2);
+                    let x = rng.floats(n, -3.0, 3.0);
+                    let acts = Acts::new(scalar(), &x, group_of(ty));
+                    let got = tile_dots(kernels, height, ty, &matrix, n, &acts);
+                    assert_eq!(got.len(), rows);
+                    let row_bytes = ty.row_bytes(n).unwrap();
+                    for (r, row) in matrix.chunks_exact(row_bytes).enumerate() {
+                        let (expected, magnitude) = reference_dot(ty, row, &acts.reconstruct());
+                        let what = format!(
+                            "tile {} {} n={n} row {r} of {rows}",
+                            kernels.name,
+                            ty.name()
+                        );
+                        assert_close(got[r], expected, magnitude, &what);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn every_backend_fills_tiles_like_the_portable_fill() {
+    let mut rng = Rng(23);
+    for kernels in available() {
+        let height = kernels.tile_rows();
+        if height == 0 {
+            continue;
+        }
+        let (mut expected, mut got) = (Tile::default(), Tile::default());
+        for ty in QUANT_TYPES {
+            // Every number of rows a tile can hold, on rows of two lengths,
+            // with random bytes and with the extreme ones.
+            for rows in 1..=height {
+                for blocks in [1, 3] {
+                    let n = blocks * ty.block_len();
+                    let row_bytes = ty.row_bytes(n).unwrap();
+                    let mut matrices = vec![random_weights(&mut rng, ty, rows * n, 3.2)];
+                    for fill in [0x00u8, 0x7f, 0x80, 0xff] {
+                        matrices.push(vec![fill; rows * row_bytes]);
+                    }
+                    for matrix in matrices {
+                        expected.fill(ty, height, &matrix, row_bytes);
+                        kernels.fill_tile(&mut got, ty, &matrix, row_bytes);
+                        let what = format!("{} {} {rows} rows of {n}", kernels.name, ty.name());
+                        assert_eq!(
+                            (got.height, got.cols, got.signed, got.max, got.has_offset),
+                            (
+                                expected.height,
+                                expected.cols,
+                                expected.signed,
+                                expected.max,
+                                expected.has_offset
+                            ),
+                            "{what}"
+                        );
+                        assert_eq!(&got.q[..], &expected.q[..], "{what}: weights");
+                        // Compared as bits, except that NaN equals NaN and
+                        // the two zeros equal each other.
+                        let same = |a: &[f32], b: &[f32]| {
+                            a.iter()
+                                .zip(b)
+                                .all(|(a, b)| a == b || (a.is_nan() && b.is_nan()))
+                        };
+                        assert!(same(&got.scale, &expected.scale), "{what}: scales");
+                        assert!(same(&got.offset, &expected.offset), "{what}: offsets");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn tile_kernels_handle_the_whole_byte_range() {
+    // No weight format produces -128, but a signed tile may hold any byte.
+    let mut rng = Rng(22);
+    for kernels in available() {
+        for height in tile_heights(kernels) {
+            for (n, group) in [(32, 32), (160, 32), (256, 256), (768, 256)] {
+                let q: Vec<i8> = (0..n * height)
+                    .map(|i| [-128i8, 127, -1, 0, 1, -127][(i * 7 + i / 5) % 6])
+                    .collect();
+                let tile = Tile {
+                    height,
+                    cols: n,
+                    q: q.as_slice().into(),
+                    scale: rng.floats(n / 16 * height, -0.5, 0.5).as_slice().into(),
+                    offset: rng.floats(n / 16 * height, -0.5, 0.5).as_slice().into(),
+                    has_offset: true,
+                    signed: true,
+                    ..Tile::default()
+                };
+                let x: Vec<f32> = (0..n)
+                    .map(|i| if i % 3 == 0 { -2.5 } else { 2.5 })
+                    .collect();
+                let acts = Acts::new(scalar(), &x, group);
+                let sums = scaled_sums(&acts);
+                let mut out = vec![0.0f32; height];
+                // SAFETY: the tile, `acts` and `sums` describe `n` columns,
+                // and `out` has one slot per row.
+                unsafe {
+                    (kernels.tile_dot())(
+                        &tile,
+                        acts.as_ref(),
+                        sums.as_ptr(),
+                        group,
+                        out.as_mut_ptr(),
+                    )
+                };
+                for (r, got) in out.iter().enumerate() {
+                    let mut expected = 0.0f64;
+                    let mut magnitude = 0.0f64;
+                    for col in 0..n {
+                        let weight = tile.q[(col / 4) * 4 * height + r * 4 + col % 4] as f64;
+                        let term = tile.scale[col / 16 * height + r] as f64
+                            * weight
+                            * acts.q[col] as f64
+                            * acts.scale[col / group] as f64;
+                        expected += term;
+                        magnitude += term.abs();
+                    }
+                    for (sub, sum) in sums.iter().enumerate() {
+                        let term = tile.offset[sub * height + r] as f64 * *sum as f64;
+                        expected += term;
+                        magnitude += term.abs();
+                    }
+                    let what = format!("{} n={n} group={group} row {r}", kernels.name);
+                    assert_close(*got, expected, magnitude, &what);
                 }
             }
         }
@@ -433,6 +667,45 @@ fn kernel_speed() {
             let picos = start.elapsed().as_secs_f64() * 1e12 / (rounds * rows * cols) as f64;
             std::hint::black_box(sink);
             line.push_str(&format!("  {} {picos:>6.1}", kernels.name));
+        }
+
+        // The tile route: filling a tile, then reducing it once. Both are
+        // counted per weight of the tile.
+        for kernels in available() {
+            let height = kernels.tile_rows();
+            if height == 0 {
+                continue;
+            }
+            let mut tile = Tile::default();
+            let rounds = 400;
+            let start = std::time::Instant::now();
+            for _ in 0..rounds {
+                for rows in matrix.chunks_exact(height * row_bytes) {
+                    kernels.fill_tile(&mut tile, ty, std::hint::black_box(rows), row_bytes);
+                }
+            }
+            let picos = start.elapsed().as_secs_f64() * 1e12 / (rounds * rows * cols) as f64;
+            line.push_str(&format!("  fill {picos:>6.1}"));
+            let sums = scaled_sums(&acts);
+            let mut out = [0.0f32; 8];
+            let rounds = 40000;
+            let start = std::time::Instant::now();
+            for _ in 0..rounds {
+                // SAFETY: the tile, `acts` and `sums` describe `cols`
+                // columns, and `out` has room for a tile's rows.
+                unsafe {
+                    (kernels.tile_dot())(
+                        &tile,
+                        acts.as_ref(),
+                        sums.as_ptr(),
+                        acts.group,
+                        out.as_mut_ptr(),
+                    )
+                };
+                std::hint::black_box(&mut out);
+            }
+            let picos = start.elapsed().as_secs_f64() * 1e12 / (rounds * height * cols) as f64;
+            line.push_str(&format!("  tile-{} {picos:>5.1}", kernels.name));
         }
         println!("{line}");
     }

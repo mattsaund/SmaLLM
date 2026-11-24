@@ -12,7 +12,7 @@ use std::slice;
 use super::{ActRef, DotQuant, Kernels};
 use crate::tensor::TensorType;
 use crate::tensor::f16::{bf16_to_f32, f16_to_f32};
-use crate::tensor::quant::{self, Group};
+use crate::tensor::quant::{self, Group, Tile};
 
 pub static KERNELS: Kernels = Kernels {
     name: "scalar",
@@ -29,7 +29,10 @@ pub static KERNELS: Kernels = Kernels {
     row_f16,
     row_bf16,
     row_quant,
-    dot_decoded,
+    // The portable tile kernel is the definition, not a fast path.
+    tile_rows: 0,
+    tile_dot,
+    tile_fill,
 };
 
 /// Kernels that never round activations.
@@ -52,7 +55,9 @@ pub static EXACT: Kernels = Kernels {
     row_f16,
     row_bf16,
     row_quant: exact::row_quant,
-    dot_decoded,
+    tile_rows: 0,
+    tile_dot,
+    tile_fill,
 };
 
 /// Number of independent accumulators in float reductions.
@@ -522,38 +527,60 @@ unsafe fn dot_blocks(
     total
 }
 
-/// See [`DotDecoded`](super::DotDecoded). This is the definition the other
-/// backends are tested against.
-pub(super) unsafe fn dot_decoded(
-    q: *const i8,
-    scale: *const f32,
-    n: usize,
+/// See [`TileFill`](super::TileFill): the portable fill.
+pub(super) unsafe fn tile_fill(
+    tile: &mut Tile,
+    ty: TensorType,
+    height: usize,
+    data: &[u8],
+    row_bytes: usize,
+) {
+    tile.fill(ty, height, data, row_bytes);
+}
+
+/// See [`TileDot`](super::TileDot). This is the definition the other
+/// backends are tested against, for a tile of any height.
+pub(super) unsafe fn tile_dot(
+    tile: &Tile,
     act: ActRef,
+    scaled_sums: *const f32,
     group: usize,
-) -> f32 {
-    // SAFETY: the caller guarantees `n` weights, `n / 4` scales, and
-    // activations quantized for `n` elements in groups of `group`.
-    let (q, scale, a, act_scale) = unsafe {
+    out: *mut f32,
+) {
+    let (height, cols) = (tile.height, tile.cols);
+    // SAFETY: the caller guarantees activations quantized for `cols`
+    // elements in groups of `group`, their scaled sums when the tile has
+    // offsets, and room for one output per row.
+    let (a, act_scale, out) = unsafe {
         (
-            slice::from_raw_parts(q, n),
-            slice::from_raw_parts(scale, n / 4),
-            slice::from_raw_parts(act.q, n),
-            slice::from_raw_parts(act.scale, n / group),
+            slice::from_raw_parts(act.q, cols),
+            slice::from_raw_parts(act.scale, cols / group),
+            slice::from_raw_parts_mut(out, height),
         )
     };
-    let mut total = 0.0f32;
-    for (g, act_scale) in act_scale.iter().enumerate() {
-        let mut partial = 0.0f32;
-        for run in g * group / 4..(g + 1) * group / 4 {
-            let mut integer = 0i32;
-            for l in run * 4..run * 4 + 4 {
-                integer += q[l] as i32 * a[l] as i32;
+    for (r, out) in out.iter_mut().enumerate() {
+        let mut total = 0.0f32;
+        for (g, act_scale) in act_scale.iter().enumerate() {
+            let mut partial = 0.0f32;
+            for sub in g * group / 16..(g + 1) * group / 16 {
+                let mut integer = 0i32;
+                for col in sub * 16..sub * 16 + 16 {
+                    let weight = tile.q[(col / 4) * 4 * height + r * 4 + col % 4];
+                    integer += weight as i32 * a[col] as i32;
+                }
+                partial += tile.scale[sub * height + r] * integer as f32;
             }
-            partial += scale[run] * integer as f32;
+            total += partial * act_scale;
         }
-        total += partial * act_scale;
+        if tile.has_offset {
+            // SAFETY: see above.
+            let sums = unsafe { slice::from_raw_parts(scaled_sums, cols / 16) };
+            for (sub, sum) in sums.iter().enumerate() {
+                total += tile.offset[sub * height + r] * sum;
+            }
+        }
+        *out = total;
     }
-    total
 }
 
 /// Defines the row kernel of one quantized format on top of `dot_blocks`.
