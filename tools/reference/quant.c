@@ -16,6 +16,7 @@
 // says how to build and run it.
 #include "ggml.h"
 
+#include <ctype.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -23,11 +24,18 @@
 #include <string.h>
 
 // Rows per format, and elements per row. A row is a whole number of
-// blocks for every format.
-#define ROWS 4
+// blocks for every format. Two rows keep the files small and still use
+// every field of a block. The IQ grids are checked in full by a test of
+// their own, in src/tensor/quant.rs.
+#define ROWS 2
 #define COLS 256
 
+// Every quantized format SmaLLM reads.
 static const enum ggml_type TYPES[] = {
+    GGML_TYPE_Q4_0,    GGML_TYPE_Q4_1,   GGML_TYPE_Q5_0,  GGML_TYPE_Q5_1,
+    GGML_TYPE_Q8_0,    GGML_TYPE_IQ4_NL,
+    GGML_TYPE_Q2_K,    GGML_TYPE_Q3_K,   GGML_TYPE_Q4_K,  GGML_TYPE_Q5_K,
+    GGML_TYPE_Q6_K,
     GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
     GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S,
     GGML_TYPE_IQ1_S,   GGML_TYPE_IQ1_M,
@@ -115,8 +123,12 @@ int main(int argc, char ** argv) {
         }
         ggml_get_type_traits(type)->to_float(blocks, expanded, n);
 
+        // Files are named in lowercase: ggml writes q4_K, but iq4_xs.
+        char name[64];
+        snprintf(name, sizeof name, "%s", ggml_type_name(type));
+        for (char * c = name; *c; c++) *c = (char) tolower((unsigned char) *c);
         char path[4096];
-        snprintf(path, sizeof path, "%s/%s.bin", argv[1], ggml_type_name(type));
+        snprintf(path, sizeof path, "%s/%s.bin", argv[1], name);
         FILE * f = fopen(path, "wb");
         if (!f) {
             fprintf(stderr, "cannot write %s\n", path);

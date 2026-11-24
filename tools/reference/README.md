@@ -53,10 +53,10 @@ Each golden file records, for one model:
 
 ## Write the weight format vectors
 
-`tests/quant.rs` checks that SmaLLM expands the blocks of the IQ, TQ and
-MXFP4 formats to the same floats as ggml, bit for bit. Its vectors in
-`tests/golden/quant` come from `quant.c`, which needs only ggml's base
-library:
+`tests/quant.rs` checks that SmaLLM expands the blocks of every quantized
+format to the same floats as ggml, bit for bit. Only the sign of a zero
+may differ. Its vectors in `tests/golden/quant` come from `quant.c`, which
+needs only ggml's base library:
 
 ```sh
 cc -O2 tools/reference/quant.c -o quant -Illama.cpp/ggml/include \
@@ -71,8 +71,8 @@ the same on every run, so the files only change when ggml does. To check
 another format, add it to `TYPES` in `quant.c` and to `FORMATS` in
 `tests/quant.rs`.
 
-The grids these formats look weights up in come from ggml's source as
-well. `tools/gen_iq_tables.py` writes them to `src/tensor/iq_tables.rs`:
+The grids that the IQ formats look weights up in come from ggml's source
+as well. `tools/gen_iq_tables.py` writes them to `src/tensor/iq_tables.rs`:
 
 ```sh
 python3 tools/gen_iq_tables.py llama.cpp > src/tensor/iq_tables.rs

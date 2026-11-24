@@ -10,8 +10,19 @@
 use smallm::tensor::TensorType;
 use smallm::tensor::quant::{DecodedRow, decode_row, dequantize_row};
 
-/// The formats that have vectors, all checked against ggml.
-const FORMATS: [TensorType; 11] = [
+/// Every quantized format the engine reads, each with its own vectors.
+const FORMATS: [TensorType; 22] = [
+    TensorType::Q4_0,
+    TensorType::Q4_1,
+    TensorType::Q5_0,
+    TensorType::Q5_1,
+    TensorType::Q8_0,
+    TensorType::Iq4Nl,
+    TensorType::Q2K,
+    TensorType::Q3K,
+    TensorType::Q4K,
+    TensorType::Q5K,
+    TensorType::Q6K,
     TensorType::Iq4Xs,
     TensorType::Iq3S,
     TensorType::Iq3Xxs,
