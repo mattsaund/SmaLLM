@@ -247,17 +247,42 @@ fn worker(shared: &Shared, slot: usize) {
     }
 }
 
-/// A sensible default thread count: one thread per performance core.
+/// A sensible default thread count for generating: one thread per
+/// performance core.
 ///
-/// Matrix kernels gain nothing from two hardware threads sharing a core, so
-/// logical CPUs are not counted twice. On a CPU that mixes fast and slow
-/// cores, only the fast ones are counted. The slow cores add little, and
-/// they are where the rest of the system keeps running.
+/// Generation reads every weight once per token, so it waits on memory, and
+/// slow cores only add threads that the fast ones then wait for. Matrix
+/// kernels also gain nothing from two hardware threads sharing a core, so
+/// logical CPUs are not counted twice.
 pub fn default_threads() -> usize {
-    let logical = thread::available_parallelism()
+    let logical = logical_cpus();
+    core_counts().map_or(logical, |cores| cores.fast.clamp(1, logical))
+}
+
+/// A sensible default thread count for reading prompts: one thread per
+/// physical core, fast and slow alike.
+///
+/// A prompt is read in batches, where every weight serves many tokens, so
+/// the work is arithmetic and every core adds to it. On an Intel Core
+/// i7-14700K, 20 threads read a prompt 25 percent faster than its 8
+/// performance cores alone. Hardware threads of a shared core made it
+/// slower again.
+pub fn default_batch_threads() -> usize {
+    let logical = logical_cpus();
+    core_counts().map_or(logical, |cores| cores.all.clamp(1, logical))
+}
+
+fn logical_cpus() -> usize {
+    thread::available_parallelism()
         .map(|n| n.get())
-        .unwrap_or(1);
-    performance_cores().map_or(logical, |cores| cores.clamp(1, logical))
+        .unwrap_or(1)
+}
+
+/// Physical cores: the fast ones, and all of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Cores {
+    fast: usize,
+    all: usize,
 }
 
 /// Counts the cores in the fast group of a CPU, given one speed rating per
@@ -280,13 +305,13 @@ fn fast_cores(ratings: &[u64]) -> Option<usize> {
     Some(ratings.iter().filter(|&&rating| rating > midpoint).count())
 }
 
-/// Counts performance cores from the kernel's CPU topology.
+/// Counts cores from the kernel's CPU topology.
 ///
 /// Logical CPUs are grouped into physical cores by package and core id.
 /// Each core is rated by its capacity, which ARM kernels report, or else by
 /// its top frequency, which tells the core types of an x86 CPU apart.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn performance_cores() -> Option<usize> {
+fn core_counts() -> Option<Cores> {
     use std::collections::HashMap;
     use std::fs;
 
@@ -323,15 +348,19 @@ fn performance_cores() -> Option<usize> {
     }
     let capacities: Vec<u64> = cores.values().map(|rating| rating.0).collect();
     let frequencies: Vec<u64> = cores.values().map(|rating| rating.1).collect();
-    fast_cores(&capacities)
+    let fast = fast_cores(&capacities)
         .or_else(|| fast_cores(&frequencies))
-        .or(Some(cores.len()))
+        .unwrap_or(cores.len());
+    Some(Cores {
+        fast,
+        all: cores.len(),
+    })
 }
 
-/// Counts performance cores on Apple silicon and physical cores on Intel.
+/// Counts performance cores on Apple silicon, and all physical cores.
 #[cfg(target_os = "macos")]
-fn performance_cores() -> Option<usize> {
-    use std::ffi::{c_char, c_int, c_void};
+fn core_counts() -> Option<Cores> {
+    use std::ffi::{CStr, c_char, c_int, c_void};
     unsafe extern "C" {
         fn sysctlbyname(
             name: *const c_char,
@@ -341,7 +370,7 @@ fn performance_cores() -> Option<usize> {
             new_len: usize,
         ) -> c_int;
     }
-    for name in [c"hw.perflevel0.physicalcpu", c"hw.physicalcpu"] {
+    let read = |name: &CStr| {
         let mut value: c_int = 0;
         let mut size = std::mem::size_of::<c_int>();
         // SAFETY: `value` and `size` describe a writable integer, and the
@@ -355,17 +384,18 @@ fn performance_cores() -> Option<usize> {
                 0,
             )
         };
-        if status == 0 && value > 0 {
-            return Some(value as usize);
-        }
-    }
-    None
+        (status == 0 && value > 0).then_some(value as usize)
+    };
+    let all = read(c"hw.physicalcpu")?;
+    // Intel Macs have one kind of core and no performance levels.
+    let fast = read(c"hw.perflevel0.physicalcpu").unwrap_or(all);
+    Some(Cores { fast, all })
 }
 
-/// Counts the physical cores in the highest efficiency class, which is how
-/// Windows names the fastest core type.
+/// Counts the physical cores, and those in the highest efficiency class,
+/// which is how Windows names the fastest core type.
 #[cfg(windows)]
-fn performance_cores() -> Option<usize> {
+fn core_counts() -> Option<Cores> {
     /// Asks for one record per physical core.
     const RELATION_PROCESSOR_CORE: u32 = 0;
     /// Byte offsets inside a record: its size, and the class of its core.
@@ -422,7 +452,10 @@ fn performance_cores() -> Option<usize> {
         offset += size;
     }
     let fastest = *classes.iter().max()?;
-    Some(classes.iter().filter(|&&class| class == fastest).count())
+    Some(Cores {
+        fast: classes.iter().filter(|&&class| class == fastest).count(),
+        all: classes.len(),
+    })
 }
 
 /// Elsewhere the topology is not read. Most x86 CPUs run two hardware
@@ -433,13 +466,17 @@ fn performance_cores() -> Option<usize> {
     target_os = "macos",
     windows
 )))]
-fn performance_cores() -> Option<usize> {
-    let logical = thread::available_parallelism().ok()?.get();
-    if cfg!(any(target_arch = "x86", target_arch = "x86_64")) && logical >= 4 {
-        Some(logical / 2)
+fn core_counts() -> Option<Cores> {
+    let logical = logical_cpus();
+    let physical = if cfg!(any(target_arch = "x86", target_arch = "x86_64")) && logical >= 4 {
+        logical / 2
     } else {
-        Some(logical)
-    }
+        logical
+    };
+    Some(Cores {
+        fast: physical,
+        all: physical,
+    })
 }
 
 #[cfg(test)]

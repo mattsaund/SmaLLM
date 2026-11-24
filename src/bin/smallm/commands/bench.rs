@@ -100,10 +100,10 @@ pub fn main(raw: impl Iterator<Item = String>) -> Result<(), String> {
     row(
         "engine",
         format!(
-            "smallm {}, {} kernels, {} threads",
+            "smallm {}, {} kernels, {}",
             smallm::VERSION,
             session.kernels(),
-            session.threads()
+            super::thread_counts(&session)
         ),
     );
     row(

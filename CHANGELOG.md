@@ -3,6 +3,13 @@
 Each version is a `v` tag, with ready-made binaries and libraries on its
 [release page](https://github.com/mattsaund/SmaLLM/releases).
 
+## Unreleased
+
+- **Prompt threads.** Prompts are read on every physical core, efficiency
+  cores included, while generation stays on the performance cores.
+  `--threads-batch` (and the `threads-batch` setting) chooses the count.
+  Prompts read about 28 percent faster on an Intel Core i7-14700K.
+
 ## 0.2.0 - 2026-11-24
 
 - **Architectures.** Fourteen in all. New: `gemma4`, `lfm2`, `lfm3`,

@@ -282,9 +282,15 @@ cost of starting a loop matters more than anything else in the pool:
   rounding the activations to 8 bits, and the gate of the feed-forward
   network. Left serial, they were a fifth of the time on eight threads.
 
-The default thread count is one per performance core. Two hardware threads
-on one core do not help these kernels, and on CPUs with fast and slow cores
-the slow ones add nothing to generation.
+Generation and prompt reading get separate pools of threads, because
+they are limited by different things. Generating one token reads every
+weight once, so it waits on memory: one thread per performance core, and
+the slow cores would only add threads for the fast ones to wait on. A
+prompt is read in batches, where each weight serves many tokens, so it is
+arithmetic and every core helps: one thread per physical core, slow cores
+included. On an Intel Core i7-14700K that reads a prompt 28 percent faster
+than the eight performance cores alone. Two hardware threads on one core
+help neither.
 
 ## Sampling and the generation loop
 

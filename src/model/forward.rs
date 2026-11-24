@@ -44,7 +44,7 @@ use crate::error::{Error, Result};
 use crate::gguf::Mapping;
 use crate::kernels::{self, Kernels};
 use crate::tensor::quant::dequantize_row;
-use crate::threads::{ThreadPool, default_threads};
+use crate::threads::{ThreadPool, default_batch_threads, default_threads};
 
 use super::Model;
 use super::config::{Activation, Config, Gating, LayerSpec, Mixer, Rope, Routing};
@@ -170,8 +170,13 @@ pub struct SessionConfig {
     /// Context window in tokens. Zero picks the model's training context,
     /// capped at 4096. Any size is accepted: the cache grows as it fills.
     pub n_ctx: usize,
-    /// Threads to compute with. Zero picks one per performance core.
+    /// Threads to generate with. Zero picks one per performance core.
     pub threads: usize,
+    /// Threads to read prompts with. Zero picks one per physical core,
+    /// efficiency cores included, unless `threads` is set, which it then
+    /// follows. Reading a prompt is arithmetic that every core speeds up,
+    /// where generating waits on memory.
+    pub batch_threads: usize,
     /// Tokens evaluated together while reading a prompt. Zero picks 32.
     /// Larger batches read prompts faster and use more scratch memory.
     pub batch: usize,
@@ -444,7 +449,10 @@ unsafe impl Sync for Slots {}
 pub struct Session {
     model: Arc<Model>,
     kernels: &'static Kernels,
+    /// Threads for generating, one token at a time.
     pool: ThreadPool,
+    /// Threads for reading prompts, when their number differs.
+    batch_pool: Option<ThreadPool>,
     kv: KvCache,
     conv: ConvState,
     n_ctx: usize,
@@ -481,11 +489,17 @@ impl Session {
         } else {
             config.threads
         };
-        if threads > 4096 || batch > 1 << 16 {
+        let batch_threads = match (config.batch_threads, config.threads) {
+            (0, 0) => default_batch_threads(),
+            (0, _) => threads,
+            (chosen, _) => chosen,
+        };
+        if threads > 4096 || batch_threads > 4096 || batch > 1 << 16 {
             return Err(Error::invalid("thread count or batch size out of range"));
         }
         let kernels = config.kernels.unwrap_or_else(kernels::best);
         let pool = ThreadPool::new(threads);
+        let batch_pool = (batch_threads != threads).then(|| ThreadPool::new(batch_threads));
 
         let d = c.n_embd;
         let is_conv: Vec<bool> = c
@@ -558,7 +572,7 @@ impl Session {
                 attended: vec![0.0; batch * q_dim],
                 gates: vec![0.0; batch * gated_heads],
                 slots: Slots(
-                    (0..pool.threads())
+                    (0..threads.max(batch_threads))
                         .map(|_| UnsafeCell::new((Vec::new(), Vec::new())))
                         .collect(),
                 ),
@@ -593,6 +607,7 @@ impl Session {
             model,
             kernels,
             pool,
+            batch_pool,
             kv: KvCache::new(&shapes),
             conv,
             n_ctx,
@@ -620,9 +635,14 @@ impl Session {
         &self.tokens
     }
 
-    /// Number of threads the session computes with.
+    /// Number of threads the session generates with.
     pub fn threads(&self) -> usize {
         self.pool.threads()
+    }
+
+    /// Number of threads the session reads prompts with.
+    pub fn batch_threads(&self) -> usize {
+        self.batch_pool.as_ref().unwrap_or(&self.pool).threads()
     }
 
     /// Name of the kernel backend in use.
@@ -746,6 +766,7 @@ impl Session {
             model,
             kernels,
             pool,
+            batch_pool,
             kv,
             conv,
             state_end,
@@ -760,6 +781,12 @@ impl Session {
         }
         let kernels: &'static Kernels = kernels;
         let model: &Model = model;
+        // A batch of tokens is arithmetic and gets every core. One token
+        // waits on memory and gets the fast ones.
+        let pool: &ThreadPool = match batch_pool {
+            Some(batch_pool) if tokens.len() > 1 => batch_pool,
+            _ => pool,
+        };
         let (config, weights) = (model.config(), model.weights());
         let map = model.gguf().mapping();
         let Scratch {

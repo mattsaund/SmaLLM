@@ -94,10 +94,10 @@ pub fn main(raw: impl Iterator<Item = String>) -> Result<(), String> {
     };
     if verbose {
         eprintln!(
-            "{}\nloaded in {:.1} ms, {} threads, {} kernels, context {}",
+            "{}\nloaded in {:.1} ms, {}, {} kernels, context {}",
             describe(model),
             loaded.load_time.as_secs_f64() * 1e3,
-            session.threads(),
+            super::thread_counts(&session),
             session.kernels(),
             session.n_ctx()
         );

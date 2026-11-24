@@ -122,6 +122,8 @@ pub struct SmallmSessionParams {
     pub n_batch: u32,
     /// Where to compute. Zero is the CPU, the only device so far.
     pub device: u32,
+    /// Threads to read prompts with.
+    pub n_threads_batch: u32,
 }
 
 /// Options for sampling. See `smallm_sampler_default_params`.
@@ -417,6 +419,7 @@ pub extern "C" fn smallm_session_default_params() -> SmallmSessionParams {
         n_threads: 0,
         n_batch: 0,
         device: 0,
+        n_threads_batch: 0,
     }
 }
 
@@ -447,6 +450,7 @@ pub unsafe extern "C" fn smallm_session_new(
     let config = SessionConfig {
         n_ctx: params.n_ctx as usize,
         threads: params.n_threads as usize,
+        batch_threads: params.n_threads_batch as usize,
         batch: params.n_batch as usize,
         kernels: None,
     };
@@ -1045,6 +1049,7 @@ mod tests {
                 n_threads: 2,
                 n_batch: 0,
                 device: 0,
+                n_threads_batch: 3,
             };
             let session = smallm_session_new(model, &params);
             assert!(!session.is_null(), "{}", last_error());

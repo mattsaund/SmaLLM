@@ -67,6 +67,7 @@ fn session(
         threads,
         batch,
         kernels,
+        ..Default::default()
     };
     Session::new(Arc::clone(model), config).unwrap()
 }
@@ -650,6 +651,31 @@ fn batching_and_threads_do_not_change_the_result() {
                 assert!(relative_error(&again, &narrow) < 1e-4);
             }
         }
+        // Reading prompts on more threads than generating changes nothing.
+        let config = SessionConfig {
+            n_ctx: 2048,
+            threads: 1,
+            batch_threads: 5,
+            batch: 32,
+            ..Default::default()
+        };
+        let mut split = Session::new(Arc::clone(&model), config).unwrap();
+        assert_eq!((split.threads(), split.batch_threads()), (1, 5));
+        split.eval(&LONG_PROMPT).unwrap();
+        assert_eq!(split.logits(), logits(&model, &LONG_PROMPT, 1, 32));
+        split.eval(&[3]).unwrap();
+        let mut whole = LONG_PROMPT.to_vec();
+        whole.push(3);
+        assert!(
+            relative_error(
+                split.logits(),
+                &logits(&model, &whole, 1, 1)
+                    .iter()
+                    .map(|v| *v as f64)
+                    .collect::<Vec<_>>()
+            ) < 1e-4
+        );
+
         // Feeding the prompt in pieces is the same as feeding it at once.
         let mut session = session(&model, 2, 4, None);
         session.eval(&PROMPT[..4]).unwrap();

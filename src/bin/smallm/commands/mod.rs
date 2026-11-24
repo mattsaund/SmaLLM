@@ -21,11 +21,16 @@ use crate::args::{Args, Spec, switch, value};
 use crate::models;
 
 /// Options of every command that runs a model.
-pub const SESSION_SPECS: [Spec; 3] = [
+pub const SESSION_SPECS: [Spec; 4] = [
     value(
         "threads",
         Some('t'),
-        "Threads to compute with (default: one per performance core)",
+        "Threads to generate with (default: one per performance core)",
+    ),
+    value(
+        "threads-batch",
+        None,
+        "Threads to read prompts with (default: every core, or --threads when set)",
     ),
     value(
         "ctx",
@@ -144,11 +149,26 @@ pub fn load_model(name: &str) -> Result<Loaded, String> {
     })
 }
 
+/// The thread counts of a session, for status lines: "8 threads" or
+/// "8 threads, 20 for prompts".
+pub fn thread_counts(session: &smallm::Session) -> String {
+    if session.batch_threads() == session.threads() {
+        format!("{} threads", session.threads())
+    } else {
+        format!(
+            "{} threads, {} for prompts",
+            session.threads(),
+            session.batch_threads()
+        )
+    }
+}
+
 /// Reads the session options.
 pub fn session_config(args: &Args) -> Result<SessionConfig, String> {
     Ok(SessionConfig {
         n_ctx: args.number("ctx")?.unwrap_or(0),
         threads: args.number("threads")?.unwrap_or(0),
+        batch_threads: args.number("threads-batch")?.unwrap_or(0),
         batch: args.number("batch")?.unwrap_or(0),
         kernels: None,
     })

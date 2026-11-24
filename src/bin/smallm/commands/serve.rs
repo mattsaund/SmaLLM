@@ -74,8 +74,8 @@ pub fn main(raw: impl Iterator<Item = String>) -> Result<(), String> {
         .map_or_else(|_| format!("{host}:{port}"), |address| address.to_string());
     eprintln!("{}", describe(model));
     eprintln!(
-        "{} threads, {} kernels, context {}, chat format {}",
-        session.threads(),
+        "{}, {} kernels, context {}, chat format {}",
+        super::thread_counts(&session),
         session.kernels(),
         session.n_ctx(),
         template.map_or("none", |template| template.name())
