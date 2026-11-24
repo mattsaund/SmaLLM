@@ -2,6 +2,7 @@
 // on this machine, to produce ground truth for SmaLLM tests and benchmarks.
 //
 //   ref tok    MODEL TEXTFILE [special]        token ids of the text
+//   ref tokraw MODEL TEXTFILE                  the same, without start and end tokens
 //   ref gen    MODEL TEXTFILE N [threads]      greedy generation: ids and text
 //   ref logits MODEL TEXTFILE OUTFILE          raw f32 logits after the prompt
 //   ref ids    MODEL IDSFILE OUTFILE           raw f32 logits after the token
@@ -80,6 +81,9 @@ int main(int argc, char ** argv) {
 
     struct llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = 0;
+    /* Tokenizing needs only the vocabulary, so a vocabulary file will do. */
+    const int tokenize_only = strcmp(mode, "tok") == 0 || strcmp(mode, "tokraw") == 0;
+    mp.vocab_only = tokenize_only;
     struct llama_model * model = llama_model_load_from_file(model_path, mp);
     if (!model) { fprintf(stderr, "cannot load model\n"); return 1; }
     const struct llama_vocab * vocab = llama_model_get_vocab(model);
@@ -165,15 +169,18 @@ int main(int argc, char ** argv) {
 
     size_t text_len;
     char * text = read_file(argv[3], &text_len);
-    const int special = (argc > 4 && strcmp(argv[4], "special") == 0) || strcmp(mode, "tok") != 0;
+    const int special = (argc > 4 && strcmp(argv[4], "special") == 0) || !tokenize_only;
+    /* tokraw adds no start and end tokens, like the tokenizer test files. */
+    const int add_special = strcmp(mode, "tokraw") != 0;
 
     int cap = (int) text_len + 16;
     llama_token * toks = malloc(sizeof(llama_token) * cap);
-    int n = llama_tokenize(vocab, text, (int) text_len, toks, cap, true, special);
+    int n = llama_tokenize(vocab, text, (int) text_len, toks, cap, add_special, special);
     if (n < 0) { fprintf(stderr, "tokenize failed\n"); return 1; }
 
-    if (strcmp(mode, "tok") == 0) {
+    if (tokenize_only) {
         for (int i = 0; i < n; i++) printf("%d%c", toks[i], i + 1 < n ? ' ' : '\n');
+        if (n == 0) printf("\n");
         return 0;
     }
 

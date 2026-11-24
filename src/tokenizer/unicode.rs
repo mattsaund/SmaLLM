@@ -1,5 +1,7 @@
-//! Character classes and the byte-level alphabet used by BPE tokenizers.
+//! Character classes, case and accent mappings, and the byte-level
+//! alphabet used by BPE tokenizers.
 
+use super::unicode_maps::{LOWERCASE, NFD};
 use super::unicode_tables::{BY_NUMBER, RUNS};
 
 pub(super) use super::unicode_tables::Category;
@@ -92,6 +94,55 @@ pub(super) fn is_punctuation(c: char) -> bool {
 /// The Unicode White_Space property.
 pub(super) fn is_whitespace(c: char) -> bool {
     c.is_whitespace()
+}
+
+/// A control character in llama.cpp's sense: general category C, except
+/// code points that are not assigned.
+pub(super) fn is_control(c: char) -> bool {
+    let category = category(c);
+    category.major() == 'C' && category != Category::Cn
+}
+
+/// Unicode general category M: accents and other marks.
+pub(super) fn is_mark(c: char) -> bool {
+    category(c).major() == 'M'
+}
+
+/// Unicode general category S.
+pub(super) fn is_symbol(c: char) -> bool {
+    category(c).major() == 'S'
+}
+
+/// The simple lowercase form of `c`, by llama.cpp's table. One character
+/// for one, unlike Rust's full mapping, which can give two.
+pub(super) fn to_lower(c: char) -> char {
+    let code_point = c as u32;
+    let index = LOWERCASE.partition_point(|&(first, ..)| first <= code_point);
+    let Some(&(first, count, step, offset)) = index.checked_sub(1).map(|i| &LOWERCASE[i]) else {
+        return c;
+    };
+    let distance = code_point - first;
+    if distance % step as u32 == 0 && distance / (step as u32) < count as u32 {
+        char::from_u32(code_point.wrapping_add_signed(offset)).unwrap_or(c)
+    } else {
+        c
+    }
+}
+
+/// The first code point of the canonical decomposition of `c`, which for
+/// an accented letter is the letter without its accent. llama.cpp
+/// decomposes only this far.
+pub(super) fn decompose_first(c: char) -> char {
+    let code_point = c as u32;
+    let index = NFD.partition_point(|&(first, _)| first <= code_point);
+    let Some(&(first, packed)) = index.checked_sub(1).map(|i| &NFD[i]) else {
+        return c;
+    };
+    if code_point - first <= packed >> 21 {
+        char::from_u32(packed & ((1 << 21) - 1)).unwrap_or(c)
+    } else {
+        c
+    }
 }
 
 /// Neither whitespace, a letter nor a number.

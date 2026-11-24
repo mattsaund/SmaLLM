@@ -255,9 +255,10 @@ fn malformed_tokenizers_are_rejected() {
         .strings("tokenizer.ggml.tokens", &[b"a"]);
     assert!(Tokenizer::from_gguf(&Gguf::from_bytes(builder.build()).unwrap()).is_err());
 
+    // A tokenizer type this engine does not know.
     let mut builder = Builder::new();
     builder
-        .string("tokenizer.ggml.model", "bert")
+        .string("tokenizer.ggml.model", "rwkv")
         .strings("tokenizer.ggml.tokens", &[b"a"]);
     assert!(Tokenizer::from_gguf(&Gguf::from_bytes(builder.build()).unwrap()).is_err());
 
