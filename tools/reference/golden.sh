@@ -60,4 +60,7 @@ granite-4.0-h-350m-Q4_K_M.gguf             granite.txt 32
 granite-4.0-h-tiny-Q4_K_M.gguf             granite.txt 32
 rwkv7-g1d-0.1b-Q8_0.gguf                   rwkv-world.txt 32
 rwkv-6-world-1.6b-Q4_K.gguf                rwkv-world.txt 32
+DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf deepseek2.txt 32
+Moonlight-16B-A3B-Instruct-Q4_K_M.gguf     kimi.txt    32
+deepseek-moe-16b-chat.Q4_K_M.gguf          deepseek2.txt 32
 TABLE

@@ -317,6 +317,17 @@ twenty of Gemma 4 do, and convolution layers cost nothing per position. A
 conversation can be rolled back to any earlier position, which is how a
 chat that shares its beginning with the last one skips the shared part.
 
+DeepSeek V2 and V3 attend through a latent. Each position keeps one small
+latent vector and one rotary key that every head shares: 576 floats per
+layer in DeepSeek V2 Lite, where its heads' keys and values would take
+5,120. A head's key and value are projections of the latent, but the engine
+never computes them. It moves each query into the latent space instead,
+through the key half of the head's projection, and scores the latents
+directly. The weighted sum of latents then goes through the value half.
+Older files store both halves in one matrix, whose key rows are read
+transposed, one row at a time. Newer files store the key half transposed
+already. `model/forward/mla.rs` has the details.
+
 A convolution layer keeps the inputs of its last few positions instead of
 a cache, a few kilobytes. Rolling it back needs inputs that are gone, so
 `model/conv.rs` keeps the last eight positions' inputs as well, and saves

@@ -32,14 +32,16 @@
 //! ```
 //!
 //! Gemma 4 also adds a small input of its own to every block, looked up per
-//! token. The differences between architectures are all in [`Config`] and
-//! in which optional tensors a layer has.
+//! token. DeepSeek's latent attention is in `forward/mla.rs`. The
+//! differences between architectures are all in [`Config`] and in which
+//! optional tensors a layer has.
 //!
 //! A Mamba block mixes positions through a recurrent state instead, and
 //! most Mamba models have no feed-forward network. `forward/mamba.rs` has
 //! its math.
 
 mod mamba;
+mod mla;
 
 use std::cell::UnsafeCell;
 use std::ops::Range;
@@ -64,6 +66,7 @@ use super::weights::{
     PerLayerInputs, PerLayerWeights, Plain,
 };
 use mamba::MambaScratch;
+use mla::MlaScratch;
 
 /// Context length used when the caller does not choose one.
 const DEFAULT_CONTEXT: usize = 4096;
@@ -538,6 +541,7 @@ struct Scratch {
     experts: ExpertScratch,
     per_layer: PerLayerScratch,
     rwkv: RwkvScratch,
+    mla: MlaScratch,
     acts: ActScratch,
     rope: RopeTables,
 }
@@ -710,18 +714,21 @@ impl Session {
             experts,
             per_layer,
             rwkv: RwkvScratch::new(c, model.weights(), batch),
+            mla: MlaScratch::new(&model, batch),
             acts: ActScratch::default(),
             rope: RopeTables::new(c, rope_factors(&model, n_ctx)),
         };
         // Layers that read another layer's cache have none of their own.
-        let shapes: Vec<(usize, usize)> = c
+        // Latent attention keeps keys only, and reads values out of them.
+        let shapes: Vec<(usize, usize, usize)> = c
             .layers
             .iter()
             .map(|layer| {
                 if layer.owns_kv() {
-                    (layer.n_head_kv, layer.head_dim)
+                    let values = if c.mla.is_some() { 0 } else { layer.head_dim };
+                    (layer.n_head_kv, layer.head_dim, values)
                 } else {
-                    (0, 0)
+                    (0, 0, 0)
                 }
             })
             .collect();
@@ -961,6 +968,7 @@ impl Session {
             experts,
             per_layer,
             rwkv: rwkv_scratch,
+            mla: mla_scratch,
             acts,
             rope,
         } = scratch;
@@ -1057,6 +1065,9 @@ impl Session {
                 MixerWeights::ShortConv(weights) => pass.short_conv(&run, weights, h, conv_scratch),
                 MixerWeights::Mamba(weights) => pass.mamba(&run, weights, h, mamba),
                 MixerWeights::Rwkv(_) => unreachable!("RWKV blocks took their own path"),
+                MixerWeights::Mla(weights) => {
+                    pass.latent_attention(&run, weights, h, attention, mla_scratch)
+                }
             }
             let n_active = run.active.len();
             if n_active == 0 {
@@ -1659,6 +1670,9 @@ fn choose(
     }
     taken.clear();
     taken.resize(scores.len(), false);
+    if routing.groups > 1 {
+        keep_best_groups(routing, bias, scores, taken);
+    }
     let first = chosen.len();
     for _ in 0..routing.used {
         let mut best: Option<(usize, f32)> = None;
@@ -1688,6 +1702,41 @@ fn choose(
     }
     if routing.scale != 1.0 {
         weights.iter_mut().for_each(|w| w.1 *= routing.scale);
+    }
+}
+
+/// Routing limited to groups of experts (DeepSeek V3), as llama.cpp does
+/// it: each group is rated by the sum of its two best scores after the
+/// choice bias, and the experts outside the `routing.groups_used` best
+/// groups are marked as taken, so that none of them is chosen.
+fn keep_best_groups(routing: &Routing, bias: Option<&[f32]>, scores: &[f32], taken: &mut [bool]) {
+    let size = routing.count / routing.groups;
+    let key = |expert: usize| scores[expert] + bias.map_or(0.0, |bias| bias[expert]);
+    let rating = |group: usize| {
+        let (mut best, mut second) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+        for expert in group * size..(group + 1) * size {
+            let key = key(expert);
+            if key > best {
+                (best, second) = (key, best);
+            } else if key > second {
+                second = key;
+            }
+        }
+        if size > 1 { best + second } else { best }
+    };
+    // Every group starts out of reach, and the best ones are let back in
+    // one at a time. A group's first expert tells whether it is in.
+    taken.fill(true);
+    for _ in 0..routing.groups_used {
+        let mut best: Option<(usize, f32)> = None;
+        for group in (0..routing.groups).filter(|&group| taken[group * size]) {
+            let rating = rating(group);
+            if best.is_none_or(|(_, top)| rating > top) {
+                best = Some((group, rating));
+            }
+        }
+        let Some((group, _)) = best else { break };
+        taken[group * size..(group + 1) * size].fill(false);
     }
 }
 

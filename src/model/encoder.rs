@@ -296,6 +296,7 @@ impl Encoder {
             ungated: false,
             routing: None,
             rwkv: None,
+            mla: None,
         };
         Ok((config, encoder))
     }

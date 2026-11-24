@@ -11,6 +11,7 @@
 //! | `forward.rs` | The forward pass and the [`Session`] type.               |
 //! | `forward/mamba.rs` | Mamba blocks: a convolution and a selective scan. |
 //! | `rwkv.rs`    | RWKV blocks: time and channel mixing with a state.       |
+//! | `forward/mla.rs` | Latent attention (DeepSeek), a part of the forward pass. |
 
 mod config;
 mod conv;
@@ -32,14 +33,15 @@ use crate::gguf::Gguf;
 use crate::tokenizer::Tokenizer;
 
 pub use config::{
-    ARCHITECTURES, Activation, Config, Gating, LayerSpec, Mixer, Rope, Routing, Rwkv, Ssm, Yarn,
+    ARCHITECTURES, Activation, Config, Gating, LayerSpec, Mixer, Mla, Rope, Routing, Rwkv, Ssm,
+    Yarn,
 };
 pub use encoder::{ENCODERS, Embedder, Pooling, normalize};
 pub use forward::{Phase, Profile, Session, SessionConfig};
 pub use weights::{
-    AttentionWeights, ChannelMix, ConvWeights, Dense, ExpertMatrix, Experts, FeedForward, Layer,
-    Linear, LowRank, MambaWeights, Matrix, MixerWeights, PerLayerInputs, PerLayerWeights, Plain,
-    TimeMix, TimeMix6, TimeMix7, TimeMixVersion, Weights,
+    Absorb, AttentionWeights, ChannelMix, ConvWeights, Dense, ExpertMatrix, Experts, FeedForward,
+    HeadMatrix, Layer, Linear, LowRank, MambaWeights, Matrix, MixerWeights, MlaWeights,
+    PerLayerInputs, PerLayerWeights, Plain, TimeMix, TimeMix6, TimeMix7, TimeMixVersion, Weights,
 };
 
 /// A model file, opened and ready to run.
