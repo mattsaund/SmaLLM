@@ -1,17 +1,18 @@
 //! A loaded model and the sessions that run it.
 //!
-//! | File         | Role                                                    |
-//! |--------------|---------------------------------------------------------|
-//! | `config.rs`  | Hyperparameters, and the switches between architectures. |
-//! | `weights.rs` | Finds each tensor in the file and checks its shape.      |
-//! | `kv.rs`      | The key/value cache, grown in chunks.                    |
-//! | `conv.rs`    | The state of short convolution blocks, with rollback.    |
-//! | `encoder.rs` | Encoder models, for embeddings and reranking.            |
-//! | `matmul.rs`  | The parallel matrix multiply.                            |
-//! | `forward.rs` | The forward pass and the [`Session`] type.               |
-//! | `forward/mamba.rs` | Mamba blocks: a convolution and a selective scan. |
-//! | `rwkv.rs`    | RWKV blocks: time and channel mixing with a state.       |
-//! | `forward/mla.rs` | Latent attention (DeepSeek), a part of the forward pass. |
+//! | File               | Role                                                     |
+//! |--------------------|----------------------------------------------------------|
+//! | `config.rs`        | Hyperparameters, and the switches between architectures. |
+//! | `weights.rs`       | Finds each tensor in the file and checks its shape.      |
+//! | `kv.rs`            | The key/value cache, grown in chunks.                    |
+//! | `conv.rs`          | The state of short convolution blocks, with rollback.    |
+//! | `recurrent.rs`     | The state of recurrent blocks, with a saved copy.        |
+//! | `encoder.rs`       | Encoder models, for embeddings and reranking.            |
+//! | `matmul.rs`        | The parallel matrix multiply.                            |
+//! | `forward.rs`       | The forward pass and the [`Session`] type.               |
+//! | `forward/mla.rs`   | Latent attention (DeepSeek V2 and V3).                   |
+//! | `forward/mamba.rs` | Mamba blocks: a convolution and a selective scan.        |
+//! | `rwkv.rs`          | RWKV blocks: time and channel mixing with a state.       |
 
 mod config;
 mod conv;

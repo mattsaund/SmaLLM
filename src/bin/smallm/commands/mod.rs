@@ -118,7 +118,8 @@ pub const TEMPLATE_SPECS: [Spec; 2] = [
     value(
         "template",
         None,
-        "Chat format: chatml, llama3, llama2, mistral, gemma, phi3, zephyr, deepseek",
+        "Chat format: chatml, llama3, llama2, mistral, gemma, gemma4, granite, phi3, phi4-mini, \
+         zephyr, deepseek, deepseek2, kimi, harmony, rwkv-world",
     ),
     switch(
         "raw",
@@ -215,9 +216,13 @@ pub fn chat_template(args: &Args, model: &Model) -> Result<Option<Template>, Str
         return Ok(None);
     }
     if let Some(name) = args.get("template") {
-        return Template::from_name(name)
-            .map(Some)
-            .ok_or_else(|| format!("unknown chat template '{name}'"));
+        return Template::from_name(name).map(Some).ok_or_else(|| {
+            let known: Vec<&str> = Template::ALL.iter().map(|t| t.name()).collect();
+            format!(
+                "unknown chat template '{name}'. Known: {}",
+                known.join(", ")
+            )
+        });
     }
     Ok(model.chat_template().and_then(Template::detect))
 }
@@ -301,6 +306,14 @@ pub fn human_count(count: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_template_help_names_every_chat_format() {
+        let help = TEMPLATE_SPECS[0].help;
+        for template in Template::ALL {
+            assert!(help.contains(template.name()), "{}", template.name());
+        }
+    }
 
     #[test]
     fn the_stats_line_says_speed_and_context() {

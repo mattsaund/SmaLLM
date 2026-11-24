@@ -382,7 +382,6 @@ fn rotate(vector: &mut [f32], table: &[f32], rope: Rope) {
     }
 }
 
-/// RMS normalization with a learned gain: `out = x / rms(x) * weight`.
 /// Normalizes `x` into `out`: LayerNorm when there is a bias, RMS norm
 /// otherwise.
 fn norm(
@@ -411,6 +410,7 @@ fn layer_norm(x: &[f32], weight: &[f32], bias: &[f32], eps: f32, out: &mut [f32]
     }
 }
 
+/// RMS normalization with a learned gain: `out = x / rms(x) * weight`.
 fn rms_norm(kernels: &Kernels, x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
     let scale = 1.0 / (kernels.sum_squares(x) / x.len() as f32 + eps).sqrt();
     for ((out, value), gain) in out.iter_mut().zip(x).zip(weight) {
