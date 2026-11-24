@@ -2,6 +2,7 @@
 
 use smallm::chat::Template;
 use smallm::gguf::{Value, ValueType};
+use smallm::model::{LayerSpec, Mixer};
 use smallm::tokenizer::Kind;
 
 use super::{describe, human_count, load_model, main_weight_type};
@@ -48,15 +49,58 @@ pub fn main(raw: impl Iterator<Item = String>) -> Result<(), String> {
     row("layers", config.n_layer.to_string());
     row(
         "width",
-        format!("{} (feed-forward {})", config.n_embd, config.n_ff),
-    );
-    row(
-        "attention",
         format!(
-            "{} heads of {}, {} key/value heads",
-            config.n_head, config.head_dim, config.n_head_kv
+            "{} (feed-forward {})",
+            config.n_embd,
+            spread(config.layers.iter().map(|layer| layer.n_ff))
         ),
     );
+    let attention: Vec<&LayerSpec> = config
+        .layers
+        .iter()
+        .filter(|layer| layer.mixer == Mixer::Attention)
+        .collect();
+    if !attention.is_empty() {
+        let heads = spread(attention.iter().map(|layer| layer.n_head));
+        let widths = spread(attention.iter().map(|layer| layer.head_dim));
+        let kv_heads = spread(attention.iter().map(|layer| layer.n_head_kv));
+        row(
+            "attention",
+            format!("{heads} heads of {widths}, {kv_heads} key/value heads"),
+        );
+    }
+    let (n_attention, n_conv) = config.mixers();
+    if n_conv > 0 {
+        row(
+            "blocks",
+            format!("{n_attention} attention, {n_conv} short convolution"),
+        );
+    }
+    let windowed: Vec<usize> = attention
+        .iter()
+        .filter(|layer| layer.window > 0)
+        .map(|layer| layer.window)
+        .collect();
+    if let Some(window) = windowed.first() {
+        row(
+            "window",
+            format!(
+                "{window} positions in {} of {} attention layers",
+                windowed.len(),
+                attention.len()
+            ),
+        );
+    }
+    let sharing = attention
+        .iter()
+        .filter(|layer| layer.kv_source.is_some())
+        .count();
+    if sharing > 0 {
+        row(
+            "cache",
+            format!("{sharing} layers read the keys and values of earlier ones"),
+        );
+    }
     row(
         "context",
         format!("{} tokens in training", config.n_ctx_train),
@@ -101,6 +145,19 @@ pub fn main(raw: impl Iterator<Item = String>) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Shows a per-layer size: one number when every layer agrees, otherwise
+/// the smallest and the largest.
+fn spread(values: impl Iterator<Item = usize>) -> String {
+    let (low, high) = values.fold((usize::MAX, 0), |(low, high), value| {
+        (low.min(value), high.max(value))
+    });
+    match (low, high) {
+        (usize::MAX, _) => "none".to_string(),
+        (low, high) if low == high => low.to_string(),
+        (low, high) => format!("{low} to {high}"),
+    }
 }
 
 /// Formats a metadata value on one line. Long strings and arrays are cut.

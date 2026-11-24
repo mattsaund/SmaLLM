@@ -3,6 +3,26 @@
 Each version is a `v` tag, with ready-made binaries and libraries on its
 [release page](https://github.com/mattsaund/SmaLLM/releases).
 
+## Unreleased
+
+- **Architectures.** `gemma4`, `lfm2` and `lfm3`. Layers can now differ in
+  how they mix positions, in their head count and width, in rotation and
+  window, and in feed-forward width. Layers that reuse an earlier layer's
+  keys and values (Gemma 4) cost no cache memory, and after the last layer
+  that keeps state, only the token whose logits are wanted is computed.
+- **Hybrid models.** Short convolution blocks, as in LFM2 and LFM3, keep a
+  few kilobytes of state. A rollback of up to eight tokens costs nothing,
+  and a longer one goes back to a state saved every 256 tokens.
+- **Tokenizers.** The word splitting rules of all 67 BPE families llama.cpp
+  knows, run by a small regular expression engine, and Gemma 4's tokenizer.
+  End tokens are found as llama.cpp finds them.
+- **Chat formats.** Gemma 4's.
+- **Readouts.** Speed and context use after each answer in a terminal, and
+  in the server's responses as llama.cpp's `timings`.
+- **Downloads.** One progress bar under a log of every step, with resumed
+  downloads checked against Hugging Face's SHA-256. The installers show the
+  same.
+
 ## 0.1.0 - 2026-11-23
 
 The first version.

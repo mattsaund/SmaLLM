@@ -66,9 +66,14 @@ characters and joins the best adjacent pair until none is left. A heap keeps
 the cost of a long word near `n log n` steps instead of `n * n`.
 
 BPE models split text into words first, and each model family defines a
-word with its own regular expression. A regex engine would be the largest
-part of the tokenizer, so the few expressions in use are written out as
-small scanners in `tokenizer/pretok.rs`.
+word with its own regular expressions. `tokenizer/pretok_table.rs` holds the
+expressions of every family llama.cpp knows, generated from its source by
+`tools/gen_pretok.py`. A small backtracking regex engine in
+`tokenizer/regex.rs` runs them. The common ones are also written out as
+scanners in `tokenizer/pretok.rs`, which are several times faster, and a
+test checks every scanner against its expression on thousands of texts.
+Gemma 4 has a family of its own: it splits only at newlines and merges raw
+UTF-8 bytes with spaces written as `▁`.
 
 Control tokens such as `<|im_end|>` are only recognized in text the engine
 trusts. A chat is rendered as a list of parts, markup and message text
@@ -77,23 +82,42 @@ apart, and only markup is searched for control tokens. Somebody typing
 
 ## The forward pass
 
-Every supported architecture is the same decoder-only transformer with a
-few switches, so there is one forward pass and no per-architecture code:
+Every supported architecture is a stack of the same block, so there is one
+forward pass and no per-architecture code:
 
 ```
 h      = norm(x)
-q k v  = h * Wq, h * Wk, h * Wv          (optional per-head norm)
-q k    = rotate by position (RoPE)
-a      = softmax(q . K) . V               over every earlier position
-x     += [norm] (a * Wo)
+x     += [norm] mix(h)                   attention or a short convolution
 h      = norm(x)
 x     += [norm] ((act(h * Wgate) * (h * Wup)) * Wdown)
 ```
 
-`model/config.rs` turns the architecture name into the switches: how
-positions are rotated, which activation the feed-forward network uses,
-whether embeddings are scaled, whether queries and keys are normalized, and
-whether some layers only look at a sliding window.
+Most blocks mix positions with attention:
+
+```
+q k v  = h * Wq, h * Wk, h * Wv          (optional per-head norms)
+q k    = rotate by position (RoPE)
+a      = softmax(q . K) . V               over the visible positions
+mix    = [gate] a * Wo
+```
+
+The LFM models replace some of them with a short convolution, which looks
+at the last few positions only:
+
+```
+b c s  = h * Wb, h * Wc, h * Ws
+y      = sum over taps i of kernel[i] * (b * s)[position - taps + 1 + i]
+mix    = (c * y) * Wout
+```
+
+`model/config.rs` turns the architecture name and its metadata into a few
+model-wide switches (how positions are rotated, the activation, embedding
+and logit scaling) and one `LayerSpec` per block. A layer's spec says how it
+mixes positions, how many heads it has and how wide they are, how much of
+each head rotates and with which base, how far back it looks, and whether
+it reads another layer's keys and values. Layers can differ in all of
+these, which is what Gemma 4 and the LFM models need. Gemma 4 also gives
+each block a small input of its own, looked up per token.
 
 Three choices keep it fast:
 
@@ -101,9 +125,11 @@ Three choices keep it fast:
   value projections share one input, and so do the two halves of the
   feed-forward gate. The input is prepared once and the threads are woken
   once for the group.
-- **The last layer does less.** Only the final token's logits are read, so
-  in the last layer only that token goes through the output projection and
-  the feed-forward network.
+- **The last layers do less.** Only the final token's logits are read.
+  Once no later layer keeps anything for later tokens, only that token goes
+  on through the rest of the model. That is the last layer in most models,
+  and more than half of Gemma 4, whose last twenty layers reuse the caches
+  of earlier ones.
 - **Positions are exact.** Rotation angles are computed in 64-bit floats,
   which keeps them accurate hundreds of thousands of tokens in.
 
@@ -213,9 +239,18 @@ The cache is allocated in chunks of 256 positions, as positions are filled:
 - Nothing is reserved up front, which matters on systems that do not
   overcommit memory and in 32-bit address spaces.
 
-A position costs `layers x key/value heads x head size x 8` bytes. A
+A position costs `key/value heads x head size x 8` bytes for every layer
+that has a cache. Layers that reuse another layer's cache, as the last
+twenty of Gemma 4 do, and convolution layers cost nothing per position. A
 conversation can be rolled back to any earlier position, which is how a
 chat that shares its beginning with the last one skips the shared part.
+
+A convolution layer keeps the inputs of its last few positions instead of
+a cache, a few kilobytes. Rolling it back needs inputs that are gone, so
+`model/conv.rs` keeps the last eight positions' inputs as well, and saves
+every layer's state each 256 positions. A short rollback costs nothing. A
+longer one restores the last saved state before the cut and reads the
+tokens after it again.
 
 ## Threads
 
@@ -297,7 +332,7 @@ are nearly tied.
 ## What the engine does not do
 
 - It computes on the CPU. GPUs and NPUs are planned as further backends.
-- It runs text models of four architectures. No images, audio or
-  embeddings.
-- It knows eight chat formats and does not interpret templates.
+- It runs text models of seven architectures. No images, audio or
+  embeddings, and no mixture-of-experts models yet.
+- It knows nine chat formats and does not interpret templates.
 - It is little-endian only, like the GGUF files themselves.

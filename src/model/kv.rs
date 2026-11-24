@@ -7,6 +7,9 @@
 //! - The context window has no built-in maximum. It ends where memory does.
 //! - Nothing is reserved up front, which matters on systems that refuse to
 //!   overcommit memory and on 32-bit address spaces.
+//!
+//! Layers can differ in their number of heads and head width, and a layer
+//! without a cache of its own, such as a convolution block, takes no space.
 
 /// Positions held by one chunk.
 pub const CHUNK_POSITIONS: usize = 256;
@@ -21,29 +24,46 @@ struct HeadCache {
     values: Vec<Box<[f32]>>,
 }
 
-/// Keys and values for every layer, head and position.
-pub struct KvCache {
-    /// Key/value heads per layer.
+/// Where one layer's heads are in the cache.
+#[derive(Clone, Copy)]
+struct LayerShape {
+    /// Index of the layer's first head in `heads`.
+    first: usize,
+    /// Key/value heads of the layer. Zero for a layer without a cache.
     n_heads: usize,
     /// Width of one head's key or value vector.
     head_dim: usize,
+}
+
+/// Keys and values for every layer, head and position.
+pub struct KvCache {
+    layers: Vec<LayerShape>,
     /// One cache per layer and head, layer by layer.
     heads: Vec<HeadCache>,
+    /// Width of each head in `heads`.
+    head_dims: Vec<usize>,
     /// Positions that hold valid data.
     len: usize,
 }
 
 impl KvCache {
-    /// An empty cache for `n_layer` layers of `n_heads` key/value heads,
-    /// each `head_dim` wide.
-    pub fn new(n_layer: usize, n_heads: usize, head_dim: usize) -> KvCache {
-        let heads = (0..n_layer * n_heads)
-            .map(|_| HeadCache::default())
-            .collect();
+    /// An empty cache. `shapes` gives each layer's number of key/value heads
+    /// and their width. Zero heads means the layer has no cache.
+    pub fn new(shapes: &[(usize, usize)]) -> KvCache {
+        let mut layers = Vec::with_capacity(shapes.len());
+        let mut head_dims = Vec::new();
+        for &(n_heads, head_dim) in shapes {
+            layers.push(LayerShape {
+                first: head_dims.len(),
+                n_heads,
+                head_dim,
+            });
+            head_dims.extend(std::iter::repeat_n(head_dim, n_heads));
+        }
         KvCache {
-            n_heads,
-            head_dim,
-            heads,
+            layers,
+            heads: head_dims.iter().map(|_| HeadCache::default()).collect(),
+            head_dims,
             len: 0,
         }
     }
@@ -55,22 +75,23 @@ impl KvCache {
 
     /// Bytes of memory currently allocated.
     pub fn allocated_bytes(&self) -> usize {
-        let chunks: usize = self
-            .heads
+        self.heads
             .iter()
-            .map(|head| head.keys.len() + head.values.len())
-            .sum();
-        chunks * CHUNK_POSITIONS * self.head_dim * std::mem::size_of::<f32>()
+            .zip(&self.head_dims)
+            .map(|(head, dim)| (head.keys.len() + head.values.len()) * CHUNK_POSITIONS * dim)
+            .sum::<usize>()
+            * std::mem::size_of::<f32>()
     }
 
     /// Makes room for positions `0..positions` in every layer.
     pub fn reserve(&mut self, positions: usize) {
         let chunks = positions.div_ceil(CHUNK_POSITIONS);
-        let chunk_len = CHUNK_POSITIONS * self.head_dim;
-        for head in &mut self.heads {
+        for (head, &dim) in self.heads.iter_mut().zip(&self.head_dims) {
             while head.keys.len() < chunks {
-                head.keys.push(vec![0.0; chunk_len].into_boxed_slice());
-                head.values.push(vec![0.0; chunk_len].into_boxed_slice());
+                head.keys
+                    .push(vec![0.0; CHUNK_POSITIONS * dim].into_boxed_slice());
+                head.values
+                    .push(vec![0.0; CHUNK_POSITIONS * dim].into_boxed_slice());
             }
         }
     }
@@ -102,17 +123,17 @@ impl KvCache {
     /// Stores the key and value of `position` in `layer`. Both hold every
     /// head side by side. The position must have been reserved.
     pub fn write(&mut self, layer: usize, position: usize, key: &[f32], value: &[f32]) {
+        let shape = self.layers[layer];
+        let dim = shape.head_dim;
         let (chunk, start) = (
             position / CHUNK_POSITIONS,
-            (position % CHUNK_POSITIONS) * self.head_dim,
+            (position % CHUNK_POSITIONS) * dim,
         );
-        let heads = &mut self.heads[layer * self.n_heads..(layer + 1) * self.n_heads];
-        let parts = key
-            .chunks_exact(self.head_dim)
-            .zip(value.chunks_exact(self.head_dim));
+        let heads = &mut self.heads[shape.first..shape.first + shape.n_heads];
+        let parts = key.chunks_exact(dim).zip(value.chunks_exact(dim));
         for (head, (key, value)) in heads.iter_mut().zip(parts) {
-            head.keys[chunk][start..start + self.head_dim].copy_from_slice(key);
-            head.values[chunk][start..start + self.head_dim].copy_from_slice(value);
+            head.keys[chunk][start..start + dim].copy_from_slice(key);
+            head.values[chunk][start..start + dim].copy_from_slice(value);
         }
     }
 
@@ -127,13 +148,15 @@ impl KvCache {
         end: usize,
         mut visit: impl FnMut(usize, &[f32], &[f32]),
     ) {
-        let cache = &self.heads[layer * self.n_heads + head];
+        let shape = self.layers[layer];
+        let cache = &self.heads[shape.first + head];
+        let dim = shape.head_dim;
         let mut position = first;
         while position < end {
             let chunk = position / CHUNK_POSITIONS;
             let run_end = end.min((chunk + 1) * CHUNK_POSITIONS);
-            let start = (position % CHUNK_POSITIONS) * self.head_dim;
-            let stop = start + (run_end - position) * self.head_dim;
+            let start = (position % CHUNK_POSITIONS) * dim;
+            let stop = start + (run_end - position) * dim;
             visit(
                 position,
                 &cache.keys[chunk][start..stop],
@@ -177,7 +200,7 @@ mod tests {
     #[test]
     fn written_positions_read_back_across_chunks() {
         let (layers, heads, dim, positions) = (2, 3, 4, CHUNK_POSITIONS * 2 + 17);
-        let mut cache = KvCache::new(layers, heads, dim);
+        let mut cache = KvCache::new(&[(heads, dim); 2]);
         assert_eq!(cache.len(), 0);
         fill(&mut cache, layers, heads, positions, dim);
         assert_eq!(cache.len(), positions);
@@ -205,7 +228,7 @@ mod tests {
     #[test]
     fn runs_respect_the_requested_window() {
         let dim = 2;
-        let mut cache = KvCache::new(1, 2, dim);
+        let mut cache = KvCache::new(&[(2, dim)]);
         fill(&mut cache, 1, 2, CHUNK_POSITIONS + 10, dim);
         let mut runs = Vec::new();
         cache.for_each_run(
@@ -225,7 +248,7 @@ mod tests {
     #[test]
     fn memory_follows_the_filled_length() {
         let (layers, heads, dim) = (3, 2, 4);
-        let mut cache = KvCache::new(layers, heads, dim);
+        let mut cache = KvCache::new(&[(heads, dim); 3]);
         assert_eq!(cache.allocated_bytes(), 0);
         fill(&mut cache, layers, heads, 1, dim);
         let one_chunk = layers * heads * 2 * CHUNK_POSITIONS * dim * 4;
@@ -241,5 +264,26 @@ mod tests {
         assert_eq!(cache.len(), CHUNK_POSITIONS);
         cache.truncate(0);
         assert_eq!(cache.allocated_bytes(), 0);
+    }
+
+    #[test]
+    fn layers_can_differ_or_have_no_cache() {
+        // A wide layer, a layer without a cache, and a narrow one.
+        let mut cache = KvCache::new(&[(1, 8), (0, 0), (2, 4)]);
+        cache.reserve(1);
+        cache.write(0, 0, &[1.0; 8], &[2.0; 8]);
+        cache.write(2, 0, &[3.0; 8], &[4.0; 8]);
+        cache.set_len(1);
+        cache.for_each_run(0, 0, 0, 1, |_, keys, values| {
+            assert_eq!((keys, values), (&[1.0; 8][..], &[2.0; 8][..]));
+        });
+        cache.for_each_run(2, 1, 0, 1, |_, keys, values| {
+            assert_eq!((keys, values), (&[3.0; 4][..], &[4.0; 4][..]));
+        });
+        // Three heads of eight or four floats, keys and values.
+        assert_eq!(
+            cache.allocated_bytes(),
+            2 * CHUNK_POSITIONS * (8 + 4 + 4) * 4
+        );
     }
 }

@@ -50,25 +50,33 @@ mod attr {
     pub const SPECIAL: u8 = CONTROL | USER_DEFINED | UNKNOWN;
 }
 
-/// Token texts that end a turn or a document in the models in circulation.
-/// A model's own end tokens are added to these.
-const END_TOKENS: [&str; 16] = [
+/// Token texts that end a turn or a document in the models in circulation,
+/// as llama.cpp lists them. A model's own end tokens are added to these.
+const END_TOKENS: [&str; 24] = [
     "<|eot_id|>",
+    "<|eot|>",
     "<|im_end|>",
     "<|end|>",
-    "<end_of_turn>",
-    "<|endoftext|>",
-    "<|end_of_text|>",
-    "<|eom_id|>",
-    "<|eot|>",
     "<|return|>",
     "<|call|>",
+    "<|flush|>",
+    "<|calls|>",
+    "<end_of_turn>",
+    "<|endoftext|>",
     "</s>",
-    "<eos>",
+    "<|eom_id|>",
     "<EOT>",
     "_<EOT>",
+    "[EOT]",
+    "[EOS]",
+    "<|end_of_text|>",
     "<end_of_utterance>",
+    "<eos>",
+    "<turn|>",
+    "<|tool_response>",
     "<\u{ff5c}end\u{2581}of\u{2581}sentence\u{ff5c}>",
+    "[e~[",
+    "<|ifm|im_end|>",
 ];
 
 /// SentencePiece writes a space as this character.
@@ -243,13 +251,43 @@ impl Tokenizer {
         // whose text is a known end marker. Those are control tokens even
         // when the file does not say so.
         let mut end_tokens: Vec<u32> = [eos, eot, eom].into_iter().flatten().collect();
-        for text in END_TOKENS {
-            if let Some(id) = tokenizer.find(text.as_bytes()) {
-                tokenizer.attrs[id as usize] |= attr::CONTROL;
-                end_tokens.push(id);
-                eot = eot.or(Some(id));
-            }
+        let marked: Vec<u32> = END_TOKENS
+            .iter()
+            .filter_map(|text| tokenizer.find(text.as_bytes()))
+            .collect();
+        end_tokens.extend(&marked);
+        let has_end = |text: &str, ends: &[u32]| {
+            tokenizer
+                .find(text.as_bytes())
+                .is_some_and(|id| ends.contains(&id))
+        };
+        // Two exceptions, as in llama.cpp. Formats that end a reply with
+        // `<|return|>` or `<|flush|>` use `<|end|>` inside a reply.
+        let mut ordinary = Vec::new();
+        if (has_end("<|return|>", &end_tokens) && has_end("<|call|>", &end_tokens))
+            || (has_end("<|calls|>", &end_tokens) && has_end("<|flush|>", &end_tokens))
+        {
+            ordinary.extend(
+                tokenizer
+                    .find(b"<|end|>")
+                    .map(|id| (id, attr::USER_DEFINED)),
+            );
         }
+        // And in Gemma 4 and a few other vocabularies, `</s>` is plain text.
+        if has_end("<|tool_response>", &end_tokens)
+            || has_end("<|plamo:eos|>", &end_tokens)
+            || tokenizer.find(b"<rfl:parameter name=\"").is_some()
+        {
+            ordinary.extend(tokenizer.find(b"</s>").map(|id| (id, attr::NORMAL)));
+        }
+        end_tokens.retain(|id| !ordinary.iter().any(|(other, _)| other == id));
+        for &id in &end_tokens {
+            tokenizer.attrs[id as usize] |= attr::CONTROL;
+        }
+        for &(id, flags) in &ordinary {
+            tokenizer.attrs[id as usize] = flags;
+        }
+        eot = eot.or_else(|| marked.into_iter().find(|id| end_tokens.contains(id)));
         end_tokens.sort_unstable();
         end_tokens.dedup();
         tokenizer.end_tokens = end_tokens;

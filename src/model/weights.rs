@@ -2,7 +2,8 @@
 //!
 //! Weight matrices are never copied. A [`Matrix`] records where a tensor
 //! sits in the file mapping, and the kernels read it from there. Only the
-//! small vectors, norm weights and biases, are expanded to f32.
+//! small vectors, norm weights, biases and convolution kernels, are expanded
+//! to f32.
 //!
 //! Binding checks every shape against the configuration, so the forward
 //! pass can index without further checks.
@@ -12,7 +13,7 @@ use crate::gguf::{Gguf, TensorInfo};
 use crate::tensor::TensorType;
 use crate::tensor::quant::dequantize_row;
 
-use super::config::Config;
+use super::config::{Config, Mixer};
 
 /// A weight matrix stored in the model file, one row after another.
 #[derive(Clone, Copy, Debug)]
@@ -43,17 +44,57 @@ pub struct Linear {
     pub bias: Option<Vec<f32>>,
 }
 
-/// The weights of one transformer block.
-pub struct Layer {
-    pub attn_norm: Vec<f32>,
+/// The weights of an attention block.
+pub struct AttentionWeights {
     pub q: Linear,
-    pub k: Linear,
-    pub v: Linear,
+    /// Keys and values. `None` in a layer that reads another layer's cache.
+    /// The value map is `None` when the keys, before their norm and
+    /// rotation, serve as values (Gemma 4).
+    pub kv: Option<(Linear, Option<Linear>)>,
     /// Per-head normalization of queries and keys, when the model has it.
     pub q_norm: Option<Vec<f32>>,
     pub k_norm: Option<Vec<f32>>,
-    pub attn_out: Linear,
-    /// Normalization of the attention output, when the model has it.
+    /// One gate per head on the attention output, when the model has it:
+    /// each head's output is scaled by the sigmoid of its gate.
+    pub gate: Option<Linear>,
+    pub out: Linear,
+}
+
+/// The weights of a short convolution block.
+///
+/// The file stores one input projection whose output is three vectors side
+/// by side. They are bound as three maps: the input gate `b`, the output
+/// gate `c` and the signal `x`.
+pub struct ConvWeights {
+    pub b: Linear,
+    pub c: Linear,
+    pub x: Linear,
+    /// The kernel, tap by tap: `kernel[tap * n_embd + channel]`. The last
+    /// tap applies to the current position.
+    pub kernel: Vec<f32>,
+    pub out_proj: Linear,
+}
+
+/// What a block mixes positions with.
+pub enum MixerWeights {
+    Attention(AttentionWeights),
+    ShortConv(ConvWeights),
+}
+
+/// A layer's part of the per-layer token embeddings (Gemma 4).
+pub struct PerLayerWeights {
+    /// Projects the hidden state down to the per-layer width.
+    pub gate: Linear,
+    /// Projects it back up.
+    pub proj: Linear,
+    pub post_norm: Vec<f32>,
+}
+
+/// The weights of one block.
+pub struct Layer {
+    pub attn_norm: Vec<f32>,
+    pub mixer: MixerWeights,
+    /// Normalization of the mixer's output, when the model has it.
     pub attn_post_norm: Option<Vec<f32>>,
     pub ffn_norm: Vec<f32>,
     pub ffn_gate: Linear,
@@ -61,6 +102,19 @@ pub struct Layer {
     pub ffn_down: Linear,
     /// Normalization of the feed-forward output, when the model has it.
     pub ffn_post_norm: Option<Vec<f32>>,
+    pub per_layer: Option<PerLayerWeights>,
+    /// A multiplier on the block's output, when the model has one.
+    pub output_scale: Option<f32>,
+}
+
+/// Token embeddings that give every layer its own extra input (Gemma 4).
+pub struct PerLayerInputs {
+    /// One row per token: every layer's slice side by side.
+    pub token_embd: Matrix,
+    /// Projects the main embedding to the same shape.
+    pub model_proj: Linear,
+    /// Normalizes each layer's slice of that projection.
+    pub proj_norm: Vec<f32>,
 }
 
 /// All weights of a model.
@@ -74,14 +128,14 @@ pub struct Weights {
     /// Per-frequency divisors for rotary angles, when the model has them.
     pub rope_factors: Option<Vec<f32>>,
     pub layers: Vec<Layer>,
+    pub per_layer_inputs: Option<PerLayerInputs>,
 }
 
 impl Weights {
-    /// Binds every tensor the configuration calls for. Fills in
-    /// `config.n_ff` when the metadata left it out.
+    /// Binds every tensor the configuration calls for. Fills in each
+    /// layer's `n_ff` when the metadata left it out.
     pub fn bind(file: &Gguf, config: &mut Config) -> Result<Weights> {
         let d = config.n_embd;
-        let (q_dim, kv_dim) = (config.q_dim(), config.kv_dim());
 
         let token_embd = matrix(file, "token_embd.weight", config.n_vocab, d)?;
         let output_matrix = match file.tensor("output.weight") {
@@ -94,58 +148,145 @@ impl Weights {
             rows: config.n_vocab,
             bias: optional_vector(file, "output.bias", config.n_vocab)?,
         };
-        let output_norm = vector(file, "output_norm.weight", d)?;
-        let rope_factors = optional_vector(file, "rope_freqs.weight", config.head_dim / 2)?;
+        // LFM2 files name the final norm after the embeddings.
+        let output_norm = match file.tensor("output_norm.weight") {
+            Some(_) => vector(file, "output_norm.weight", d)?,
+            None => vector(file, "token_embd_norm.weight", d)?,
+        };
+        // One table of rotary divisors serves every layer that uses one, so
+        // those layers must rotate the same number of elements.
+        let mut rotating = config
+            .layers
+            .iter()
+            .filter(|layer| layer.mixer == Mixer::Attention && layer.rope_factors);
+        let rope_factors = match rotating.next() {
+            Some(first) => {
+                if rotating.any(|layer| layer.rope_dims != first.rope_dims) {
+                    return Err(Error::unsupported(
+                        "rotary divisors for layers that rotate different widths",
+                    ));
+                }
+                optional_vector(file, "rope_freqs.weight", first.rope_dims / 2)?
+            }
+            None => None,
+        };
 
-        if config.n_ff == 0 {
-            config.n_ff = file
-                .tensor("blk.0.ffn_down.weight")
-                .map(TensorInfo::cols)
-                .ok_or_else(|| Error::format("missing tensor: blk.0.ffn_down.weight"))?;
-        }
-        let n_ff = config.n_ff;
+        let per_layer = config.per_layer_embd;
+        let per_layer_inputs = if per_layer > 0 {
+            let width = per_layer * config.n_layer;
+            Some(PerLayerInputs {
+                token_embd: matrix(file, "per_layer_token_embd.weight", config.n_vocab, width)?,
+                model_proj: whole(file, "per_layer_model_proj", width, d)?,
+                proj_norm: vector(file, "per_layer_proj_norm.weight", per_layer)?,
+            })
+        } else {
+            None
+        };
 
         let mut layers = Vec::with_capacity(config.n_layer);
-        for index in 0..config.n_layer {
+        for (index, spec) in config.layers.iter_mut().enumerate() {
             let name = |part: &str| format!("blk.{index}.{part}");
-            let whole = |part: &str, rows: usize, cols: usize| -> Result<Linear> {
-                Ok(Linear {
-                    matrix: matrix(file, &name(&format!("{part}.weight")), rows, cols)?,
-                    first_row: 0,
-                    rows,
-                    bias: optional_vector(file, &name(&format!("{part}.bias")), rows)?,
-                })
-            };
+            if spec.n_ff == 0 {
+                spec.n_ff = file
+                    .tensor(&name("ffn_down.weight"))
+                    .map(TensorInfo::cols)
+                    .ok_or_else(|| {
+                        Error::format(format!("missing tensor: {}", name("ffn_down.weight")))
+                    })?;
+            }
+            let n_ff = spec.n_ff;
+            let layer_whole =
+                |part: &str, rows: usize, cols: usize| whole(file, &name(part), rows, cols);
 
-            // Query, key and value are three tensors or one fused tensor.
-            let (q, k, v) = if file.tensor(&name("attn_qkv.weight")).is_some() {
-                let fused = matrix(file, &name("attn_qkv.weight"), q_dim + 2 * kv_dim, d)?;
-                let bias = optional_vector(file, &name("attn_qkv.bias"), q_dim + 2 * kv_dim)?;
-                let part = |first_row: usize, rows: usize| Linear {
-                    matrix: fused,
-                    first_row,
-                    rows,
-                    bias: bias
-                        .as_ref()
-                        .map(|b| b[first_row..first_row + rows].to_vec()),
-                };
-                (
-                    part(0, q_dim),
-                    part(q_dim, kv_dim),
-                    part(q_dim + kv_dim, kv_dim),
-                )
-            } else {
-                (
-                    whole("attn_q", q_dim, d)?,
-                    whole("attn_k", kv_dim, d)?,
-                    whole("attn_v", kv_dim, d)?,
-                )
+            let mixer = match spec.mixer {
+                Mixer::Attention => {
+                    let (q_dim, kv_dim) = (spec.q_dim(), spec.kv_dim());
+                    let owns_kv = spec.owns_kv();
+                    // Query, key and value are separate tensors or one fused
+                    // tensor. A layer that reads another layer's cache has
+                    // only a query.
+                    let (q, kv) = if file.tensor(&name("attn_qkv.weight")).is_some() {
+                        let fused = matrix(file, &name("attn_qkv.weight"), q_dim + 2 * kv_dim, d)?;
+                        let bias =
+                            optional_vector(file, &name("attn_qkv.bias"), q_dim + 2 * kv_dim)?;
+                        let part = |first_row: usize, rows: usize| Linear {
+                            matrix: fused,
+                            first_row,
+                            rows,
+                            bias: bias
+                                .as_ref()
+                                .map(|b| b[first_row..first_row + rows].to_vec()),
+                        };
+                        (
+                            part(0, q_dim),
+                            Some((part(q_dim, kv_dim), Some(part(q_dim + kv_dim, kv_dim)))),
+                        )
+                    } else {
+                        let q = layer_whole("attn_q", q_dim, d)?;
+                        let kv = if owns_kv {
+                            let k = layer_whole("attn_k", kv_dim, d)?;
+                            // Gemma 4 may leave out the values, and then the
+                            // keys serve as values.
+                            let v = match file.tensor(&name("attn_v.weight")) {
+                                None if config.value_norm => None,
+                                _ => Some(layer_whole("attn_v", kv_dim, d)?),
+                            };
+                            Some((k, v))
+                        } else {
+                            None
+                        };
+                        (q, kv)
+                    };
+                    MixerWeights::Attention(AttentionWeights {
+                        q,
+                        kv: if owns_kv { kv } else { None },
+                        q_norm: optional_vector(file, &name("attn_q_norm.weight"), spec.head_dim)?,
+                        k_norm: optional_vector(file, &name("attn_k_norm.weight"), spec.head_dim)?,
+                        gate: match file.tensor(&name("attn_gate.weight")) {
+                            Some(_) => Some(layer_whole("attn_gate", spec.n_head, d)?),
+                            None => None,
+                        },
+                        out: layer_whole("attn_output", d, q_dim)?,
+                    })
+                }
+                Mixer::ShortConv => {
+                    let taps = config.conv_kernel;
+                    let stored = vector(file, &name("shortconv.conv.weight"), taps * d)?;
+                    // Stored channel by channel. The convolution reads it
+                    // tap by tap.
+                    let mut kernel = vec![0.0; taps * d];
+                    for channel in 0..d {
+                        for tap in 0..taps {
+                            kernel[tap * d + channel] = stored[channel * taps + tap];
+                        }
+                    }
+                    let in_proj = layer_whole("shortconv.in_proj", 3 * d, d)?;
+                    let part = |index: usize| Linear {
+                        matrix: in_proj.matrix,
+                        first_row: index * d,
+                        rows: d,
+                        bias: in_proj
+                            .bias
+                            .as_ref()
+                            .map(|bias| bias[index * d..(index + 1) * d].to_vec()),
+                    };
+                    MixerWeights::ShortConv(ConvWeights {
+                        b: part(0),
+                        c: part(1),
+                        x: part(2),
+                        kernel,
+                        out_proj: layer_whole("shortconv.out_proj", d, d)?,
+                    })
+                }
             };
 
             // The gate is its own tensor, or the first half of a double
             // height `ffn_up`.
             let (ffn_gate, ffn_up) = if file.tensor(&name("ffn_gate.weight")).is_some() {
-                (whole("ffn_gate", n_ff, d)?, whole("ffn_up", n_ff, d)?)
+                (
+                    layer_whole("ffn_gate", n_ff, d)?,
+                    layer_whole("ffn_up", n_ff, d)?,
+                )
             } else {
                 let fused = matrix(file, &name("ffn_up.weight"), 2 * n_ff, d)?;
                 let part = |first_row: usize| Linear {
@@ -157,20 +298,28 @@ impl Weights {
                 (part(0), part(n_ff))
             };
 
+            let per_layer_weights = if per_layer > 0 {
+                Some(PerLayerWeights {
+                    gate: layer_whole("inp_gate", per_layer, d)?,
+                    proj: layer_whole("proj", d, per_layer)?,
+                    post_norm: vector(file, &name("post_norm.weight"), d)?,
+                })
+            } else {
+                None
+            };
+
             layers.push(Layer {
                 attn_norm: vector(file, &name("attn_norm.weight"), d)?,
-                q,
-                k,
-                v,
-                q_norm: optional_vector(file, &name("attn_q_norm.weight"), config.head_dim)?,
-                k_norm: optional_vector(file, &name("attn_k_norm.weight"), config.head_dim)?,
-                attn_out: whole("attn_output", d, q_dim)?,
+                mixer,
                 attn_post_norm: optional_vector(file, &name("post_attention_norm.weight"), d)?,
                 ffn_norm: vector(file, &name("ffn_norm.weight"), d)?,
                 ffn_gate,
                 ffn_up,
-                ffn_down: whole("ffn_down", d, n_ff)?,
+                ffn_down: layer_whole("ffn_down", d, n_ff)?,
                 ffn_post_norm: optional_vector(file, &name("post_ffw_norm.weight"), d)?,
+                per_layer: per_layer_weights,
+                output_scale: optional_vector(file, &name("layer_output_scale.weight"), 1)?
+                    .map(|scale| scale[0]),
             });
         }
         Ok(Weights {
@@ -179,8 +328,20 @@ impl Weights {
             output_norm,
             rope_factors,
             layers,
+            per_layer_inputs,
         })
     }
+}
+
+/// Binds the whole matrix `{name}.weight`, with `{name}.bias` when there is
+/// one.
+fn whole(file: &Gguf, name: &str, rows: usize, cols: usize) -> Result<Linear> {
+    Ok(Linear {
+        matrix: matrix(file, &format!("{name}.weight"), rows, cols)?,
+        first_row: 0,
+        rows,
+        bias: optional_vector(file, &format!("{name}.bias"), rows)?,
+    })
 }
 
 /// Looks up a tensor and requires a type this engine computes with.
@@ -220,7 +381,8 @@ fn matrix(file: &Gguf, name: &str, rows: usize, cols: usize) -> Result<Matrix> {
     })
 }
 
-/// Reads the vector `name` of `len` elements as f32.
+/// Reads the vector `name` of `len` elements as f32. A tensor of any shape
+/// with that many elements will do.
 fn vector(file: &Gguf, name: &str, len: usize) -> Result<Vec<f32>> {
     let (tensor, ty) = supported(file, name)?;
     if tensor.n_elements() != len {

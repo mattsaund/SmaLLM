@@ -1,37 +1,59 @@
 //! The forward pass: token ids in, next-token logits out.
 //!
 //! A [`Session`] is one conversation with a model. It owns the key/value
-//! cache, the scratch buffers and the thread pool. Evaluating tokens appends
-//! them to the context and leaves the logits for the token that follows.
+//! cache, the convolution state, the scratch buffers and the thread pool.
+//! Evaluating tokens appends them to the context and leaves the logits for
+//! the token that follows.
 //!
-//! Every block of the transformer does the same thing:
+//! Every block does the same two things:
 //!
 //! ```text
 //! h      = norm(x)
-//! q k v  = h * Wq, h * Wk, h * Wv          (optional per-head norm)
-//! q k    = rotate by position (RoPE)
-//! a      = softmax(q . K) . V               over every earlier position
-//! x     += [norm] (a * Wo)
+//! x     += [norm] mix(h)                 attention or a short convolution
 //! h      = norm(x)
 //! x     += [norm] ((act(h * Wgate) * (h * Wup)) * Wdown)
 //! ```
 //!
-//! The architecture differences are all in [`Config`] and in which optional
-//! tensors a layer has.
+//! Attention mixes in every visible earlier position:
+//!
+//! ```text
+//! q k v  = h * Wq, h * Wk, h * Wv        (optional per-head norms)
+//! q k    = rotate by position (RoPE)
+//! a      = softmax(q . K) . V            over the visible positions
+//! mix    = [gate] a * Wo
+//! ```
+//!
+//! A short convolution (the LFM models) mixes in the last few positions:
+//!
+//! ```text
+//! b c s  = h * Wb, h * Wc, h * Ws        two gates and a signal
+//! y      = sum over taps i of kernel[i] * (b * s)[position - taps + 1 + i]
+//! mix    = (c * y) * Wout
+//! ```
+//!
+//! Gemma 4 also adds a small input of its own to every block, looked up per
+//! token. The differences between architectures are all in [`Config`] and
+//! in which optional tensors a layer has.
 
 use std::cell::UnsafeCell;
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
+use crate::gguf::Mapping;
 use crate::kernels::{self, Kernels};
 use crate::tensor::quant::dequantize_row;
 use crate::threads::{ThreadPool, default_threads};
 
 use super::Model;
-use super::config::{Activation, Config, Rope};
+use super::config::{Activation, Config, LayerSpec, Mixer, Rope};
+use super::conv::ConvState;
 use super::kv::KvCache;
-use super::matmul::{ActScratch, Engine, Target};
+use super::matmul::{ActScratch, Engine, MAX_TARGETS, Target};
+use super::weights::{
+    AttentionWeights, ConvWeights, Matrix, MixerWeights, PerLayerInputs, PerLayerWeights,
+};
 
 /// Context length used when the caller does not choose one.
 const DEFAULT_CONTEXT: usize = 4096;
@@ -43,6 +65,10 @@ const DEFAULT_BATCH: usize = 32;
 const INLINE_ATTENTION_WORK: usize = 64 * 1024;
 
 /// The stages of a forward pass that [`Profile`] times separately.
+///
+/// Convolution blocks are timed with the attention stages: their input
+/// projection as `Project`, the convolution as `Attention` and their output
+/// projection as `AttentionOut`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
     /// Token embedding lookup and rotary tables.
@@ -152,33 +178,56 @@ pub struct SessionConfig {
     pub kernels: Option<&'static Kernels>,
 }
 
-/// The rotary position tables for the batch being evaluated.
-struct RopeTables {
-    /// Frequency of each element pair, for the global and the local base.
-    freqs: [Vec<f64>; 2],
+/// The rotary tables of one set of rotary settings.
+struct RopeKind {
+    /// Elements of a head that rotate.
+    dims: usize,
+    /// Angle per position of each rotated pair.
+    freqs: Vec<f64>,
     /// `(cos, sin)` of every pair, for each token of the batch.
-    tables: [Vec<f32>; 2],
-    /// True when some layers use the local base.
-    has_local: bool,
+    table: Vec<f32>,
+}
+
+/// The rotary position tables for the batch being evaluated. Layers with
+/// the same rotary settings share one table.
+struct RopeTables {
+    kinds: Vec<RopeKind>,
+    /// The table each layer reads. Unused for layers without attention.
+    of_layer: Vec<usize>,
 }
 
 impl RopeTables {
     fn new(config: &Config, factors: Option<&[f32]>) -> RopeTables {
-        let pairs = config.head_dim / 2;
-        let freqs = |base: f32| -> Vec<f64> {
-            (0..pairs)
-                .map(|i| {
-                    let frequency = (base as f64).powf(-2.0 * i as f64 / config.head_dim as f64);
-                    let divisor = factors.map_or(1.0, |f| f[i] as f64);
-                    frequency * config.rope_scale as f64 / divisor
-                })
-                .collect()
-        };
-        RopeTables {
-            freqs: [freqs(config.rope_base), freqs(config.rope_base_local)],
-            tables: [Vec::new(), Vec::new()],
-            has_local: config.local_layers.iter().any(|&local| local),
+        let mut kinds = Vec::new();
+        let mut settings = Vec::new();
+        let mut of_layer = Vec::with_capacity(config.n_layer);
+        for layer in &config.layers {
+            if layer.mixer != Mixer::Attention {
+                of_layer.push(0);
+                continue;
+            }
+            let factors = factors.filter(|_| layer.rope_factors);
+            let key = (
+                layer.rope_dims,
+                layer.rope_base.to_bits(),
+                layer.rope_scale.to_bits(),
+                factors.is_some(),
+            );
+            let index = match settings.iter().position(|seen| *seen == key) {
+                Some(index) => index,
+                None => {
+                    settings.push(key);
+                    kinds.push(RopeKind {
+                        dims: layer.rope_dims,
+                        freqs: frequencies(layer, factors),
+                        table: Vec::new(),
+                    });
+                    kinds.len() - 1
+                }
+            };
+            of_layer.push(index);
         }
+        RopeTables { kinds, of_layer }
     }
 
     /// Computes the tables for `count` tokens starting at `first_position`.
@@ -186,29 +235,39 @@ impl RopeTables {
     /// Angles are computed in double precision. A position far into a long
     /// context times a high frequency loses most of its fraction in f32.
     fn fill(&mut self, first_position: usize, count: usize) {
-        let bases = if self.has_local { 2 } else { 1 };
-        for base in 0..bases {
-            let freqs = &self.freqs[base];
-            let table = &mut self.tables[base];
-            table.clear();
+        for kind in &mut self.kinds {
+            kind.table.clear();
             for index in 0..count {
                 let position = (first_position + index) as f64;
-                for frequency in freqs {
+                for frequency in &kind.freqs {
                     let (sin, cos) = (position * frequency).sin_cos();
-                    table.push(cos as f32);
-                    table.push(sin as f32);
+                    kind.table.push(cos as f32);
+                    kind.table.push(sin as f32);
                 }
             }
         }
     }
 
-    /// The `(cos, sin)` pairs for token `index` of the batch.
-    fn row(&self, local: bool, index: usize, head_dim: usize) -> &[f32] {
-        &self.tables[usize::from(local)][index * head_dim..(index + 1) * head_dim]
+    /// The `(cos, sin)` pairs of `layer` for token `index` of the batch.
+    fn row(&self, layer: usize, index: usize) -> &[f32] {
+        let kind = &self.kinds[self.of_layer[layer]];
+        &kind.table[index * kind.dims..(index + 1) * kind.dims]
     }
 }
 
-/// Rotates one head's vector by its position.
+/// The angle per position of each rotated pair of a layer's heads.
+fn frequencies(layer: &LayerSpec, factors: Option<&[f32]>) -> Vec<f64> {
+    (0..layer.rope_dims / 2)
+        .map(|i| {
+            let exponent = -2.0 * i as f64 / layer.rope_dims as f64;
+            let frequency = (layer.rope_base as f64).powf(exponent);
+            let divisor = factors.map_or(1.0, |f| f[i] as f64);
+            frequency * layer.rope_scale as f64 / divisor
+        })
+        .collect()
+}
+
+/// Rotates the rotary part of one head by its position.
 fn rotate(vector: &mut [f32], table: &[f32], rope: Rope) {
     let half = vector.len() / 2;
     match rope {
@@ -246,23 +305,73 @@ fn rms_norm_in_place(kernels: &Kernels, x: &mut [f32], weight: &[f32], eps: f32)
     }
 }
 
-/// Buffers reused by every forward pass. Sizes are for a full batch.
-struct Scratch {
-    /// The hidden state, one row per token.
-    x: Vec<f32>,
-    /// A normalized copy of the hidden state, then projection outputs.
-    h: Vec<f32>,
+/// RMS normalization without a gain, in place.
+fn rms_norm_unit(kernels: &Kernels, x: &mut [f32], eps: f32) {
+    let scale = 1.0 / (kernels.sum_squares(x) / x.len() as f32 + eps).sqrt();
+    x.iter_mut().for_each(|value| *value *= scale);
+}
+
+/// Reads row `row` of `matrix` as f32.
+fn read_row(map: &Mapping, matrix: &Matrix, row: usize, out: &mut [f32]) {
+    let start = matrix.offset + row * matrix.row_bytes;
+    dequantize_row(
+        matrix.ty,
+        &map.as_slice()[start..start + matrix.row_bytes],
+        out,
+    );
+}
+
+/// Buffers of the attention blocks, sized for a full batch.
+struct AttentionScratch {
     q: Vec<f32>,
     k: Vec<f32>,
     v: Vec<f32>,
     /// The attention output before its projection.
     attended: Vec<f32>,
-    gate: Vec<f32>,
-    up: Vec<f32>,
-    acts: ActScratch,
-    rope: RopeTables,
+    /// Output gates, one per head, for models that have them.
+    gates: Vec<f32>,
     /// Attention scores and a scaled query, one pair per thread slot.
     slots: Slots,
+}
+
+/// Buffers of the convolution blocks. Empty for models without them.
+#[derive(Default)]
+struct ConvScratch {
+    /// The input gate, output gate and signal of each token.
+    b: Vec<f32>,
+    c: Vec<f32>,
+    signal: Vec<f32>,
+    /// The convolution's inputs: the saved state, then one row per token.
+    history: Vec<f32>,
+    /// One token's weighted sum over the kernel taps.
+    sum: Vec<f32>,
+}
+
+/// Buffers of Gemma 4's per-layer inputs. Empty for other models.
+#[derive(Default)]
+struct PerLayerScratch {
+    /// Each token's input to every layer, side by side.
+    inputs: Vec<f32>,
+    /// One token's row of the per-layer embeddings.
+    row: Vec<f32>,
+    /// The per-layer gate of each active token.
+    gate: Vec<f32>,
+}
+
+/// Buffers reused by every forward pass. Sizes are for a full batch.
+struct Scratch {
+    /// The hidden state, one row per token.
+    x: Vec<f32>,
+    /// A normalized copy of the hidden state, then block outputs.
+    h: Vec<f32>,
+    attention: AttentionScratch,
+    conv: ConvScratch,
+    /// The feed-forward gate and up projections.
+    gate: Vec<f32>,
+    up: Vec<f32>,
+    per_layer: PerLayerScratch,
+    acts: ActScratch,
+    rope: RopeTables,
 }
 
 /// Per-thread scratch for attention.
@@ -278,8 +387,13 @@ pub struct Session {
     kernels: &'static Kernels,
     pool: ThreadPool,
     kv: KvCache,
+    conv: ConvState,
     n_ctx: usize,
     batch: usize,
+    /// One past the last block that keeps something for later tokens: a
+    /// key/value cache or a convolution state. From that block on, only the
+    /// rows whose logits are wanted are computed in full.
+    state_end: usize,
     scratch: Scratch,
     /// Logits for the token after the last evaluated one.
     logits: Vec<f32>,
@@ -314,33 +428,95 @@ impl Session {
         let kernels = config.kernels.unwrap_or_else(kernels::best);
         let pool = ThreadPool::new(threads);
 
-        let (d, q_dim, kv_dim, n_ff) = (c.n_embd, c.q_dim(), c.kv_dim(), c.n_ff);
+        let d = c.n_embd;
+        let is_conv: Vec<bool> = c
+            .layers
+            .iter()
+            .map(|layer| layer.mixer == Mixer::ShortConv)
+            .collect();
+        let conv = ConvState::new(&is_conv, c.conv_kernel, d);
+        let conv_scratch = if is_conv.contains(&true) {
+            ConvScratch {
+                b: vec![0.0; batch * d],
+                c: vec![0.0; batch * d],
+                signal: vec![0.0; batch * d],
+                history: vec![0.0; (conv.rows() + batch) * d],
+                sum: vec![0.0; d],
+            }
+        } else {
+            ConvScratch::default()
+        };
+        let per = c.per_layer_embd;
+        let per_layer = if per > 0 {
+            PerLayerScratch {
+                inputs: vec![0.0; batch * per * c.n_layer],
+                row: vec![0.0; per * c.n_layer],
+                gate: vec![0.0; batch * per],
+            }
+        } else {
+            PerLayerScratch::default()
+        };
+        let gated_heads = model
+            .weights()
+            .layers
+            .iter()
+            .zip(&c.layers)
+            .filter(|(layer, _)| {
+                matches!(&layer.mixer, MixerWeights::Attention(attention) if attention.gate.is_some())
+            })
+            .map(|(_, spec)| spec.n_head)
+            .max()
+            .unwrap_or(0);
+        let (q_dim, kv_dim, n_ff) = (c.max_q_dim(), c.max_kv_dim(), c.max_n_ff());
         let scratch = Scratch {
             x: vec![0.0; batch * d],
             h: vec![0.0; batch * d],
-            q: vec![0.0; batch * q_dim],
-            k: vec![0.0; batch * kv_dim],
-            v: vec![0.0; batch * kv_dim],
-            attended: vec![0.0; batch * q_dim],
+            attention: AttentionScratch {
+                q: vec![0.0; batch * q_dim],
+                k: vec![0.0; batch * kv_dim],
+                v: vec![0.0; batch * kv_dim],
+                attended: vec![0.0; batch * q_dim],
+                gates: vec![0.0; batch * gated_heads],
+                slots: Slots(
+                    (0..pool.threads())
+                        .map(|_| UnsafeCell::new((Vec::new(), Vec::new())))
+                        .collect(),
+                ),
+            },
+            conv: conv_scratch,
             gate: vec![0.0; batch * n_ff],
             up: vec![0.0; batch * n_ff],
+            per_layer,
             acts: ActScratch::default(),
             rope: RopeTables::new(c, model.weights().rope_factors.as_deref()),
-            slots: Slots(
-                (0..pool.threads())
-                    .map(|_| UnsafeCell::new((Vec::new(), Vec::new())))
-                    .collect(),
-            ),
         };
-        let kv = KvCache::new(c.n_layer, c.n_head_kv, c.head_dim);
+        // Layers that read another layer's cache have none of their own.
+        let shapes: Vec<(usize, usize)> = c
+            .layers
+            .iter()
+            .map(|layer| {
+                if layer.owns_kv() {
+                    (layer.n_head_kv, layer.head_dim)
+                } else {
+                    (0, 0)
+                }
+            })
+            .collect();
+        let state_end = c
+            .layers
+            .iter()
+            .rposition(|layer| layer.owns_kv() || layer.mixer == Mixer::ShortConv)
+            .map_or(0, |index| index + 1);
         let logits = vec![0.0; c.n_vocab];
         Ok(Session {
             model,
             kernels,
             pool,
-            kv,
+            kv: KvCache::new(&shapes),
+            conv,
             n_ctx,
             batch,
+            state_end,
             scratch,
             logits,
             tokens: Vec::new(),
@@ -373,9 +549,10 @@ impl Session {
         self.kernels.name
     }
 
-    /// Bytes of memory held by the key/value cache.
+    /// Bytes of memory held for the context: the key/value cache and the
+    /// convolution state.
     pub fn cache_bytes(&self) -> usize {
-        self.kv.allocated_bytes()
+        self.kv.allocated_bytes() + self.conv.bytes()
     }
 
     /// Starts or stops timing the stages of every forward pass. Starting
@@ -401,9 +578,18 @@ impl Session {
 
     /// Removes every token from position `len` on. The logits are stale
     /// until the next [`eval`](Self::eval).
+    ///
+    /// A model with convolution blocks may have to read a few hundred
+    /// tokens before `len` again to rebuild their state (see `conv.rs`).
     pub fn truncate(&mut self, len: usize) {
-        self.kv.truncate(len);
-        self.tokens.truncate(len);
+        if len >= self.tokens.len() {
+            return;
+        }
+        let resume = self.conv.rewind(len);
+        self.kv.truncate(resume);
+        let replay = self.tokens[resume..len].to_vec();
+        self.tokens.truncate(resume);
+        self.run(&replay, false);
     }
 
     /// Empties the context.
@@ -430,12 +616,17 @@ impl Session {
                 "token id {bad} is outside the vocabulary of {n_vocab}"
             )));
         }
+        self.run(tokens, true);
+        Ok(())
+    }
+
+    /// Evaluates `tokens` in batches. Only the last batch computes logits,
+    /// and only when `want_logits` is set.
+    fn run(&mut self, tokens: &[u32], want_logits: bool) {
         let mut batches = tokens.chunks(self.batch).peekable();
         while let Some(batch) = batches.next() {
-            // Only the last batch needs logits.
-            self.forward(batch, batches.peek().is_none());
+            self.forward(batch, want_logits && batches.peek().is_none());
         }
-        Ok(())
     }
 
     /// Runs one batch through the model.
@@ -445,6 +636,8 @@ impl Session {
             kernels,
             pool,
             kv,
+            conv,
+            state_end,
             scratch,
             logits,
             tokens: history,
@@ -458,150 +651,92 @@ impl Session {
         let model: &Model = model;
         let (config, weights) = (model.config(), model.weights());
         let map = model.gguf().mapping();
-        let engine = Engine { kernels, pool, map };
         let Scratch {
             x,
             h,
-            q,
-            k,
-            v,
-            attended,
+            attention,
+            conv: conv_scratch,
             gate,
             up,
+            per_layer,
             acts,
             rope,
-            slots,
         } = scratch;
 
         let count = tokens.len();
         let first_position = kv.len();
-        let (d, q_dim, kv_dim, n_ff) =
-            (config.n_embd, config.q_dim(), config.kv_dim(), config.n_ff);
-        let (head_dim, eps) = (config.head_dim, config.norm_eps);
+        let (d, eps) = (config.n_embd, config.norm_eps);
 
         // Token embeddings start the hidden state.
-        let embd = &weights.token_embd;
         for (row, &token) in x.chunks_exact_mut(d).zip(tokens) {
-            let start = embd.offset + token as usize * embd.row_bytes;
-            dequantize_row(embd.ty, &map.as_slice()[start..start + embd.row_bytes], row);
+            read_row(map, &weights.token_embd, token as usize, row);
             if config.embedding_scale != 1.0 {
                 row.iter_mut()
                     .for_each(|value| *value *= config.embedding_scale);
             }
         }
-
         rope.fill(first_position, count);
         kv.reserve(first_position + count);
-        lap(profile, Phase::Embed);
+        let mut pass = Pass {
+            engine: Engine { kernels, pool, map },
+            config,
+            rope,
+            kv,
+            conv,
+            acts,
+            profile,
+            count,
+            first_position,
+        };
+        if let Some(inputs) = &weights.per_layer_inputs {
+            pass.per_layer_inputs(inputs, tokens, &x[..count * d], per_layer);
+        }
+        pass.lap(Phase::Embed);
 
-        for (index, layer) in weights.layers.iter().enumerate() {
-            // In the last layer only the final token still matters: nothing
-            // reads the other rows again. Their keys and values are still
-            // stored for later tokens to attend to.
-            let active = match (index + 1 == config.n_layer, want_logits) {
-                (false, _) => 0..count,
-                (true, true) => count - 1..count,
-                (true, false) => count..count,
-            };
-            let n_active = active.len();
-            let local = config.local_layers[index];
-
-            // Attention input: the normalized hidden state of every token.
-            for (out, row) in h.chunks_exact_mut(d).zip(x.chunks_exact(d)).take(count) {
-                rms_norm(kernels, row, &layer.attn_norm, eps, out);
-            }
-            lap(profile, Phase::Norm);
-            let k_out = &mut k[..count * kv_dim];
-            let v_out = &mut v[..count * kv_dim];
-            let q_out = &mut q[..n_active * q_dim];
-            if n_active == count {
-                let mut targets = [
-                    Target {
-                        linear: &layer.q,
-                        out: &mut *q_out,
-                    },
-                    Target {
-                        linear: &layer.k,
-                        out: &mut *k_out,
-                    },
-                    Target {
-                        linear: &layer.v,
-                        out: &mut *v_out,
-                    },
-                ];
-                engine.multiply(acts, &h[..count * d], d, &mut targets);
+        let state_end = *state_end;
+        for (index, (layer, spec)) in weights.layers.iter().zip(&config.layers).enumerate() {
+            // Before the last block that keeps state, every row matters.
+            // From it on, only the rows whose logits are wanted do, though
+            // that block still stores its state for every token.
+            let active = if index + 1 < state_end {
+                0..count
+            } else if want_logits {
+                count - 1..count
             } else {
-                let mut targets = [
-                    Target {
-                        linear: &layer.k,
-                        out: &mut *k_out,
-                    },
-                    Target {
-                        linear: &layer.v,
-                        out: &mut *v_out,
-                    },
-                ];
-                engine.multiply(acts, &h[..count * d], d, &mut targets);
-                let mut targets = [Target {
-                    linear: &layer.q,
-                    out: &mut *q_out,
-                }];
-                engine.multiply(acts, &h[active.start * d..active.end * d], d, &mut targets);
+                count..count
+            };
+            let keeps_state = spec.owns_kv() || spec.mixer == Mixer::ShortConv;
+            let inputs = if keeps_state {
+                0..count
+            } else {
+                active.clone()
+            };
+            if inputs.is_empty() {
+                continue;
             }
-            lap(profile, Phase::Project);
+            let run = LayerRun {
+                index,
+                spec,
+                inputs,
+                active,
+            };
 
-            // Per-head normalization, then rotation by position.
-            for (row, token) in k_out.chunks_exact_mut(kv_dim).zip(0..count) {
-                for head in row.chunks_exact_mut(head_dim) {
-                    if let Some(weight) = &layer.k_norm {
-                        rms_norm_in_place(kernels, head, weight, eps);
-                    }
-                    rotate(head, rope.row(local, token, head_dim), config.rope);
-                }
+            // The mixer: attention or a convolution over positions.
+            for token in run.inputs.clone() {
+                let row = token * d..(token + 1) * d;
+                rms_norm(kernels, &x[row.clone()], &layer.attn_norm, eps, &mut h[row]);
             }
-            for (row, token) in q_out.chunks_exact_mut(q_dim).zip(active.clone()) {
-                for head in row.chunks_exact_mut(head_dim) {
-                    if let Some(weight) = &layer.q_norm {
-                        rms_norm_in_place(kernels, head, weight, eps);
-                    }
-                    rotate(head, rope.row(local, token, head_dim), config.rope);
-                }
+            pass.lap(Phase::Norm);
+            match &layer.mixer {
+                MixerWeights::Attention(weights) => pass.attention(&run, weights, h, attention),
+                MixerWeights::ShortConv(weights) => pass.short_conv(&run, weights, h, conv_scratch),
             }
-            for (token, (key, value)) in k_out
-                .chunks_exact(kv_dim)
-                .zip(v_out.chunks_exact(kv_dim))
-                .enumerate()
-            {
-                kv.write(index, first_position + token, key, value);
-            }
-            lap(profile, Phase::Rotate);
+            let n_active = run.active.len();
             if n_active == 0 {
                 continue;
             }
-
-            // Attention, its output projection, and the residual update.
-            let window = if local { config.sliding_window } else { 0 };
-            let attended = &mut attended[..n_active * q_dim];
-            let query = Query {
-                q: q_out,
-                first_position: first_position + active.start,
-                window,
-            };
-            attend(&engine, kv, index, config, &query, slots, attended);
-            lap(profile, Phase::Attention);
-
-            let x_active = &mut x[active.start * d..active.end * d];
+            let x_active = &mut x[run.active.start * d..run.active.end * d];
             let h_active = &mut h[..n_active * d];
-            engine.multiply(
-                acts,
-                attended,
-                q_dim,
-                &mut [Target {
-                    linear: &layer.attn_out,
-                    out: &mut *h_active,
-                }],
-            );
-            lap(profile, Phase::AttentionOut);
             add_residual(
                 kernels,
                 x_active,
@@ -615,7 +750,8 @@ impl Session {
             for (out, row) in h_active.chunks_exact_mut(d).zip(x_active.chunks_exact(d)) {
                 rms_norm(kernels, row, &layer.ffn_norm, eps, out);
             }
-            lap(profile, Phase::Norm);
+            pass.lap(Phase::Norm);
+            let n_ff = spec.n_ff;
             let gate = &mut gate[..n_active * n_ff];
             let up = &mut up[..n_active * n_ff];
             let mut targets = [
@@ -628,12 +764,11 @@ impl Session {
                     out: &mut *up,
                 },
             ];
-            engine.multiply(acts, h_active, d, &mut targets);
-            lap(profile, Phase::FeedForwardUp);
+            pass.multiply(h_active, d, &mut targets);
+            pass.lap(Phase::FeedForwardUp);
             apply_gate(kernels, pool, config.activation, gate, up);
-            lap(profile, Phase::Activation);
-            engine.multiply(
-                acts,
+            pass.lap(Phase::Activation);
+            pass.multiply(
                 gate,
                 n_ff,
                 &mut [Target {
@@ -641,7 +776,7 @@ impl Session {
                     out: &mut *h_active,
                 }],
             );
-            lap(profile, Phase::FeedForwardDown);
+            pass.lap(Phase::FeedForwardDown);
             add_residual(
                 kernels,
                 x_active,
@@ -650,17 +785,24 @@ impl Session {
                 d,
                 eps,
             );
-            lap(profile, Phase::Norm);
+
+            if let Some(weights) = &layer.per_layer {
+                pass.per_layer_update(&run, weights, x_active, h_active, per_layer);
+            }
+            if let Some(scale) = layer.output_scale {
+                x_active.iter_mut().for_each(|value| *value *= scale);
+            }
+            pass.lap(Phase::Norm);
         }
-        kv.set_len(first_position + count);
+        pass.kv.set_len(first_position + count);
+        pass.conv.advance(first_position + count);
         history.extend_from_slice(tokens);
 
         if want_logits {
             let last = &x[(count - 1) * d..count * d];
             let normalized = &mut h[..d];
             rms_norm(kernels, last, &weights.output_norm, eps, normalized);
-            engine.multiply(
-                acts,
+            pass.multiply(
                 normalized,
                 d,
                 &mut [Target {
@@ -674,8 +816,334 @@ impl Session {
                     .iter_mut()
                     .for_each(|logit| *logit = cap * (*logit / cap).tanh());
             }
-            lap(profile, Phase::Logits);
+            pass.lap(Phase::Logits);
         }
+    }
+}
+
+/// What the steps of one forward pass share.
+struct Pass<'a> {
+    engine: Engine<'a>,
+    config: &'a Config,
+    rope: &'a RopeTables,
+    kv: &'a mut KvCache,
+    conv: &'a mut ConvState,
+    acts: &'a mut ActScratch,
+    profile: &'a mut Option<Profile>,
+    /// Tokens in the batch.
+    count: usize,
+    /// Context position of the batch's first token.
+    first_position: usize,
+}
+
+/// One block's share of a batch.
+struct LayerRun<'a> {
+    index: usize,
+    spec: &'a LayerSpec,
+    /// Rows the block reads: every row when it keeps state for later
+    /// tokens, otherwise the active rows.
+    inputs: Range<usize>,
+    /// Rows whose output is needed.
+    active: Range<usize>,
+}
+
+impl Pass<'_> {
+    fn lap(&mut self, phase: Phase) {
+        lap(self.profile, phase);
+    }
+
+    fn multiply(&mut self, x: &[f32], cols: usize, targets: &mut [Target<'_>]) {
+        self.engine.multiply(self.acts, x, cols, targets);
+    }
+
+    /// Multiplies the input rows of `h` by the `kept` targets, whose results
+    /// the block keeps for every token, and the active rows by the
+    /// `queried` targets. It is one multiply when the rows are the same, so
+    /// a generated token wakes the threads once.
+    fn project<'t>(
+        &mut self,
+        h: &[f32],
+        run: &LayerRun,
+        mut kept: Vec<Target<'t>>,
+        mut queried: Vec<Target<'t>>,
+    ) {
+        let d = self.config.n_embd;
+        let rows = |range: &Range<usize>| &h[range.start * d..range.end * d];
+        if run.inputs == run.active {
+            kept.append(&mut queried);
+            self.multiply(rows(&run.inputs), d, &mut kept);
+        } else {
+            self.multiply(rows(&run.inputs), d, &mut kept);
+            self.multiply(rows(&run.active), d, &mut queried);
+        }
+    }
+
+    /// An attention block. Reads the normalized inputs in `h` and leaves
+    /// the block's output for the active rows at the start of `h`.
+    fn attention(
+        &mut self,
+        run: &LayerRun,
+        w: &AttentionWeights,
+        h: &mut [f32],
+        s: &mut AttentionScratch,
+    ) {
+        let (config, rope, spec) = (self.config, self.rope, run.spec);
+        let kernels = self.engine.kernels;
+        let (d, eps) = (config.n_embd, config.norm_eps);
+        let (q_dim, kv_dim, head_dim) = (spec.q_dim(), spec.kv_dim(), spec.head_dim);
+        let (count, n_active) = (self.count, run.active.len());
+        let n_gates = if w.gate.is_some() { spec.n_head } else { 0 };
+        let q = &mut s.q[..n_active * q_dim];
+        let k = &mut s.k[..count * kv_dim];
+        let v = &mut s.v[..count * kv_dim];
+        let gates = &mut s.gates[..n_active * n_gates];
+
+        // Keys and values for every row the cache needs. Queries and gates
+        // for the active rows only.
+        let mut kept = Vec::with_capacity(MAX_TARGETS);
+        if let Some((wk, wv)) = &w.kv {
+            kept.push(Target {
+                linear: wk,
+                out: &mut *k,
+            });
+            if let Some(wv) = wv {
+                kept.push(Target {
+                    linear: wv,
+                    out: &mut *v,
+                });
+            }
+        }
+        let mut queried = Vec::with_capacity(MAX_TARGETS);
+        queried.push(Target {
+            linear: &w.q,
+            out: &mut *q,
+        });
+        if let Some(wg) = &w.gate {
+            queried.push(Target {
+                linear: wg,
+                out: &mut *gates,
+            });
+        }
+        self.project(h, run, kept, queried);
+        self.lap(Phase::Project);
+
+        // Per-head normalization, rotation by position, and the cache.
+        if let Some((_, wv)) = &w.kv {
+            if wv.is_none() {
+                v.copy_from_slice(k);
+            }
+            let rows = k.chunks_exact_mut(kv_dim).zip(v.chunks_exact_mut(kv_dim));
+            for (token, (key, value)) in rows.enumerate() {
+                let angles = rope.row(run.index, token);
+                for head in key.chunks_exact_mut(head_dim) {
+                    if let Some(weight) = &w.k_norm {
+                        rms_norm_in_place(kernels, head, weight, eps);
+                    }
+                    rotate(&mut head[..spec.rope_dims], angles, config.rope);
+                }
+                if config.value_norm {
+                    for head in value.chunks_exact_mut(head_dim) {
+                        rms_norm_unit(kernels, head, eps);
+                    }
+                }
+                self.kv
+                    .write(run.index, self.first_position + token, key, value);
+            }
+        }
+        for (row, token) in q.chunks_exact_mut(q_dim).zip(run.active.clone()) {
+            let angles = rope.row(run.index, token);
+            for head in row.chunks_exact_mut(head_dim) {
+                if let Some(weight) = &w.q_norm {
+                    rms_norm_in_place(kernels, head, weight, eps);
+                }
+                rotate(&mut head[..spec.rope_dims], angles, config.rope);
+            }
+        }
+        self.lap(Phase::Rotate);
+        if n_active == 0 {
+            return;
+        }
+
+        // A layer without a cache of its own reads an earlier layer's.
+        let out = &mut s.attended[..n_active * q_dim];
+        let query = Query {
+            q,
+            first_position: self.first_position + run.active.start,
+            window: spec.window,
+        };
+        let source = spec.kv_source.unwrap_or(run.index);
+        attend(&self.engine, self.kv, source, spec, &query, &s.slots, out);
+        self.lap(Phase::Attention);
+
+        // Each head's output is scaled by the sigmoid of its gate.
+        if n_gates > 0 {
+            for (row, gates) in out.chunks_exact_mut(q_dim).zip(gates.chunks_exact(n_gates)) {
+                for (head, &gate) in row.chunks_exact_mut(head_dim).zip(gates) {
+                    let scale = 1.0 / (1.0 + (-gate).exp());
+                    head.iter_mut().for_each(|value| *value *= scale);
+                }
+            }
+        }
+        self.multiply(
+            out,
+            q_dim,
+            &mut [Target {
+                linear: &w.out,
+                out: &mut h[..n_active * d],
+            }],
+        );
+        self.lap(Phase::AttentionOut);
+    }
+
+    /// A short convolution block. Reads the normalized inputs in `h` and
+    /// leaves the block's output for the active rows at the start of `h`.
+    fn short_conv(&mut self, run: &LayerRun, w: &ConvWeights, h: &mut [f32], s: &mut ConvScratch) {
+        let d = self.config.n_embd;
+        let (count, n_active, rows) = (self.count, run.active.len(), self.conv.rows());
+        let b = &mut s.b[..count * d];
+        let signal = &mut s.signal[..count * d];
+        let c = &mut s.c[..n_active * d];
+        let kept = vec![
+            Target {
+                linear: &w.b,
+                out: &mut *b,
+            },
+            Target {
+                linear: &w.x,
+                out: &mut *signal,
+            },
+        ];
+        let queried = vec![Target {
+            linear: &w.c,
+            out: &mut *c,
+        }];
+        self.project(h, run, kept, queried);
+        self.lap(Phase::Project);
+
+        // The convolution reads the inputs b * signal: the saved state of
+        // the positions before the batch, then one row per token.
+        let history = &mut s.history[..(rows + count) * d];
+        let (state, fresh) = history.split_at_mut(rows * d);
+        self.conv.read(run.index, self.first_position, state);
+        for ((input, b), signal) in fresh.iter_mut().zip(b.iter()).zip(signal.iter()) {
+            *input = b * signal;
+        }
+        // Each active token sums the inputs of the `taps` positions that
+        // end at its own, weighted per channel, then applies its gate c.
+        let sum = &mut s.sum[..d];
+        for (gate, token) in c.chunks_exact_mut(d).zip(run.active.clone()) {
+            sum.fill(0.0);
+            for (tap, weights) in w.kernel.chunks_exact(d).enumerate() {
+                let input = &history[(token + tap) * d..(token + tap + 1) * d];
+                for ((total, weight), value) in sum.iter_mut().zip(weights).zip(input) {
+                    *total += weight * value;
+                }
+            }
+            for (gate, total) in gate.iter_mut().zip(sum.iter()) {
+                *gate *= total;
+            }
+        }
+        self.conv
+            .write(run.index, self.first_position, count, history);
+        self.lap(Phase::Attention);
+        self.multiply(
+            c,
+            d,
+            &mut [Target {
+                linear: &w.out_proj,
+                out: &mut h[..n_active * d],
+            }],
+        );
+        self.lap(Phase::AttentionOut);
+    }
+
+    /// Gemma 4's per-layer inputs for each token: its own row of the
+    /// per-layer embeddings, plus a projection of its main embedding that
+    /// is normalized layer by layer.
+    fn per_layer_inputs(
+        &mut self,
+        w: &PerLayerInputs,
+        tokens: &[u32],
+        x: &[f32],
+        s: &mut PerLayerScratch,
+    ) {
+        let config = self.config;
+        let (d, per) = (config.n_embd, config.per_layer_embd);
+        let width = per * config.n_layer;
+        let inputs = &mut s.inputs[..tokens.len() * width];
+        self.multiply(
+            x,
+            d,
+            &mut [Target {
+                linear: &w.model_proj,
+                out: &mut *inputs,
+            }],
+        );
+        let projection_scale = 1.0 / (d as f32).sqrt();
+        let embedding_scale = (per as f32).sqrt();
+        for (row, &token) in inputs.chunks_exact_mut(width).zip(tokens) {
+            read_row(self.engine.map, &w.token_embd, token as usize, &mut s.row);
+            for (input, embedded) in row.chunks_exact_mut(per).zip(s.row.chunks_exact(per)) {
+                input
+                    .iter_mut()
+                    .for_each(|value| *value *= projection_scale);
+                rms_norm_in_place(self.engine.kernels, input, &w.proj_norm, config.norm_eps);
+                for (value, embedded) in input.iter_mut().zip(embedded) {
+                    *value =
+                        (*value + embedded * embedding_scale) * std::f32::consts::FRAC_1_SQRT_2;
+                }
+            }
+        }
+    }
+
+    /// Adds a block's per-layer input to the active rows `x`: the hidden
+    /// state picks what it needs from the input through a gate, and the
+    /// result is projected back up. `h` is scratch for the update.
+    fn per_layer_update(
+        &mut self,
+        run: &LayerRun,
+        w: &PerLayerWeights,
+        x: &mut [f32],
+        h: &mut [f32],
+        s: &mut PerLayerScratch,
+    ) {
+        let config = self.config;
+        let (d, per, n_active) = (config.n_embd, config.per_layer_embd, run.active.len());
+        let width = per * config.n_layer;
+        let gate = &mut s.gate[..n_active * per];
+        self.multiply(
+            x,
+            d,
+            &mut [Target {
+                linear: &w.gate,
+                out: &mut *gate,
+            }],
+        );
+        self.lap(Phase::FeedForwardUp);
+        for (gate, token) in gate.chunks_exact_mut(per).zip(run.active.clone()) {
+            let start = token * width + run.index * per;
+            self.engine
+                .kernels
+                .gelu_mul(gate, &s.inputs[start..start + per]);
+        }
+        self.lap(Phase::Activation);
+        self.multiply(
+            gate,
+            per,
+            &mut [Target {
+                linear: &w.proj,
+                out: &mut *h,
+            }],
+        );
+        self.lap(Phase::FeedForwardDown);
+        add_residual(
+            self.engine.kernels,
+            x,
+            h,
+            Some(&w.post_norm),
+            d,
+            config.norm_eps,
+        );
     }
 }
 
@@ -756,7 +1224,8 @@ impl SharedOutput {
     }
 }
 
-/// Computes attention for every token and head of `query`.
+/// Computes attention for every token and head of `query`, reading the
+/// keys and values of cache layer `layer`.
 ///
 /// For one head: score every visible position by the dot product of the
 /// query with that position's key, turn the scores into weights with a
@@ -769,14 +1238,14 @@ fn attend(
     engine: &Engine<'_>,
     kv: &KvCache,
     layer: usize,
-    config: &Config,
+    spec: &LayerSpec,
     query: &Query<'_>,
     slots: &Slots,
     out: &mut [f32],
 ) {
     let kernels = engine.kernels;
-    let (head_dim, q_dim, n_kv) = (config.head_dim, config.q_dim(), config.n_head_kv);
-    let shared = config.n_head / n_kv;
+    let (head_dim, q_dim, n_kv) = (spec.head_dim, spec.q_dim(), spec.n_head_kv);
+    let shared = spec.n_head / n_kv;
     let group_dim = shared * head_dim;
     let units = query.q.len() / q_dim * n_kv;
     let output = SharedOutput(out.as_mut_ptr());
@@ -804,7 +1273,7 @@ fn attend(
         scaled.extend(
             query.q[group..group + group_dim]
                 .iter()
-                .map(|value| value * config.attention_scale),
+                .map(|value| value * spec.attention_scale),
         );
         scores.clear();
         scores.resize(shared * visible, 0.0);

@@ -13,7 +13,9 @@ use crate::kernels::{self, Kernels};
 use crate::tensor::TensorType;
 use crate::testing::TinyModel;
 
-const ARCHS: [&str; 4] = ["llama", "qwen2", "qwen3", "gemma3"];
+const ARCHS: [&str; 7] = [
+    "llama", "qwen2", "qwen3", "gemma3", "gemma4", "lfm2", "lfm3",
+];
 
 const QUANT_TYPES: [TensorType; 11] = [
     TensorType::Q4_0,
@@ -96,28 +98,46 @@ mod oracle {
             .collect()
     }
 
-    fn rms_norm(x: &[f64], weight: &[f32], eps: f32) -> Vec<f64> {
+    /// Row `row` of a matrix.
+    fn row_of(model: &Model, matrix: &Matrix, row: usize) -> Vec<f64> {
+        let data = model.gguf().mapping().as_slice();
+        let mut out = vec![0.0f32; matrix.cols];
+        let start = matrix.offset + row * matrix.row_bytes;
+        dequantize_row(matrix.ty, &data[start..start + matrix.row_bytes], &mut out);
+        out.iter().map(|v| *v as f64).collect()
+    }
+
+    /// A whole tensor of the file, as stored.
+    fn tensor(model: &Model, name: &str) -> Vec<f64> {
+        let file = model.gguf();
+        let info = file.tensor(name).expect("tensor exists");
+        let mut out = vec![0.0f32; info.n_elements()];
+        dequantize_row(info.ty.unwrap(), file.tensor_data(info), &mut out);
+        out.iter().map(|v| *v as f64).collect()
+    }
+
+    fn rms_norm(x: &[f64], weight: Option<&[f32]>, eps: f32) -> Vec<f64> {
         let mean: f64 = x.iter().map(|v| v * v).sum::<f64>() / x.len() as f64;
         let scale = 1.0 / (mean + eps as f64).sqrt();
         x.iter()
-            .zip(weight)
-            .map(|(v, w)| v * scale * *w as f64)
+            .enumerate()
+            .map(|(i, v)| v * scale * weight.map_or(1.0, |w| w[i] as f64))
             .collect()
     }
 
     fn rotate(
         head: &mut [f64],
         position: usize,
-        base: f32,
-        config: &Config,
+        spec: &LayerSpec,
+        rope: Rope,
         factors: Option<&[f32]>,
     ) {
-        let n = head.len();
+        let n = spec.rope_dims;
         for i in 0..n / 2 {
-            let frequency = (base as f64).powf(-2.0 * i as f64 / n as f64);
+            let frequency = (spec.rope_base as f64).powf(-2.0 * i as f64 / n as f64);
             let divisor = factors.map_or(1.0, |f| f[i] as f64);
-            let angle = position as f64 * frequency * config.rope_scale as f64 / divisor;
-            let (a, b) = match config.rope {
+            let angle = position as f64 * frequency * spec.rope_scale as f64 / divisor;
+            let (a, b) = match rope {
                 Rope::Pairs => (2 * i, 2 * i + 1),
                 Rope::Halves => (i, i + n / 2),
             };
@@ -137,98 +157,204 @@ mod oracle {
         }
     }
 
-    /// The logits after `tokens`, computed from scratch.
-    pub fn logits(model: &Model, tokens: &[u32]) -> Vec<f64> {
+    fn add(x: &mut [f64], update: &[f64]) {
+        x.iter_mut()
+            .zip(update)
+            .for_each(|(value, delta)| *value += delta);
+    }
+
+    /// Each layer's keys and values for every position, once computed.
+    type Caches = [Option<(Vec<Vec<f64>>, Vec<Vec<f64>>)>];
+
+    /// Attention over every position of a layer, from scratch.
+    fn attention(
+        model: &Model,
+        index: usize,
+        a: &AttentionWeights,
+        inputs: &[Vec<f64>],
+        caches: &mut Caches,
+    ) -> Vec<Vec<f64>> {
         let (c, w) = (model.config(), model.weights());
-        let data = model.gguf().mapping().as_slice();
-        let (hd, kv_dim) = (c.head_dim, c.kv_dim());
-        let factors = w.rope_factors.as_deref();
-
-        let mut x: Vec<Vec<f64>> = tokens
-            .iter()
-            .map(|&token| {
-                let mut row = vec![0.0f32; c.n_embd];
-                let start = w.token_embd.offset + token as usize * w.token_embd.row_bytes;
-                dequantize_row(
-                    w.token_embd.ty,
-                    &data[start..start + w.token_embd.row_bytes],
-                    &mut row,
-                );
-                row.iter()
-                    .map(|v| *v as f64 * c.embedding_scale as f64)
-                    .collect()
-            })
-            .collect();
-
-        for (index, layer) in w.layers.iter().enumerate() {
-            let local = c.local_layers[index];
-            let base = if local {
-                c.rope_base_local
-            } else {
-                c.rope_base
-            };
-            let mut queries = Vec::new();
+        let spec = &c.layers[index];
+        let hd = spec.head_dim;
+        let factors = w.rope_factors.as_deref().filter(|_| spec.rope_factors);
+        if let Some((wk, wv)) = &a.kv {
             let mut keys = Vec::new();
             let mut values = Vec::new();
-            for (position, row) in x.iter().enumerate() {
-                let h = rms_norm(row, &layer.attn_norm, c.norm_eps);
-                let mut q = apply(model, &layer.q, &h);
-                let mut k = apply(model, &layer.k, &h);
-                for head in q.chunks_exact_mut(hd) {
-                    if let Some(weight) = &layer.q_norm {
-                        head.copy_from_slice(&rms_norm(head, weight, c.norm_eps));
-                    }
-                    rotate(head, position, base, c, factors);
-                }
-                for head in k.chunks_exact_mut(hd) {
-                    if let Some(weight) = &layer.k_norm {
-                        head.copy_from_slice(&rms_norm(head, weight, c.norm_eps));
-                    }
-                    rotate(head, position, base, c, factors);
-                }
-                queries.push(q);
-                keys.push(k);
-                values.push(apply(model, &layer.v, &h));
-            }
-
-            for position in 0..x.len() {
-                let first = if local && c.sliding_window > 0 {
-                    (position + 1).saturating_sub(c.sliding_window)
-                } else {
-                    0
+            for (position, h) in inputs.iter().enumerate() {
+                let mut k = apply(model, wk, h);
+                let mut v = match wv {
+                    Some(wv) => apply(model, wv, h),
+                    None => k.clone(),
                 };
-                let mut attended = vec![0.0f64; c.q_dim()];
-                for head in 0..c.n_head {
-                    let kv_head = head / (c.n_head / c.n_head_kv) * hd;
-                    debug_assert!(kv_head + hd <= kv_dim);
-                    let q = &queries[position][head * hd..(head + 1) * hd];
+                for head in k.chunks_exact_mut(hd) {
+                    let normed = rms_norm(head, a.k_norm.as_deref(), c.norm_eps);
+                    if a.k_norm.is_some() {
+                        head.copy_from_slice(&normed);
+                    }
+                    rotate(head, position, spec, c.rope, factors);
+                }
+                if c.value_norm {
+                    for head in v.chunks_exact_mut(hd) {
+                        head.copy_from_slice(&rms_norm(head, None, c.norm_eps));
+                    }
+                }
+                keys.push(k);
+                values.push(v);
+            }
+            caches[index] = Some((keys, values));
+        }
+        let (keys, values) = caches[spec.kv_source.unwrap_or(index)]
+            .as_ref()
+            .expect("the source layer ran first");
+        let group = spec.n_head / spec.n_head_kv;
+        inputs
+            .iter()
+            .enumerate()
+            .map(|(position, h)| {
+                let mut q = apply(model, &a.q, h);
+                for head in q.chunks_exact_mut(hd) {
+                    if a.q_norm.is_some() {
+                        head.copy_from_slice(&rms_norm(head, a.q_norm.as_deref(), c.norm_eps));
+                    }
+                    rotate(head, position, spec, c.rope, factors);
+                }
+                let first = match spec.window {
+                    0 => 0,
+                    window => (position + 1).saturating_sub(window),
+                };
+                let gates = a.gate.as_ref().map(|gate| apply(model, gate, h));
+                let mut attended = vec![0.0f64; spec.q_dim()];
+                for head in 0..spec.n_head {
+                    let kv_head = head / group * hd;
+                    let q = &q[head * hd..(head + 1) * hd];
                     let scores: Vec<f64> = (first..=position)
                         .map(|j| {
                             let k = &keys[j][kv_head..kv_head + hd];
                             q.iter().zip(k).map(|(a, b)| a * b).sum::<f64>()
-                                * c.attention_scale as f64
+                                * spec.attention_scale as f64
                         })
                         .collect();
                     let max = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
                     let total: f64 = scores.iter().map(|s| (s - max).exp()).sum();
+                    let gate = gates
+                        .as_ref()
+                        .map_or(1.0, |g| 1.0 / (1.0 + (-g[head]).exp()));
                     for (offset, score) in scores.iter().enumerate() {
-                        let weight = (score - max).exp() / total;
+                        let weight = (score - max).exp() / total * gate;
                         let v = &values[first + offset][kv_head..kv_head + hd];
                         for (out, value) in attended[head * hd..(head + 1) * hd].iter_mut().zip(v) {
                             *out += weight * value;
                         }
                     }
                 }
-                let mut update = apply(model, &layer.attn_out, &attended);
-                if let Some(weight) = &layer.attn_post_norm {
-                    update = rms_norm(&update, weight, c.norm_eps);
-                }
-                x[position]
-                    .iter_mut()
-                    .zip(&update)
-                    .for_each(|(value, delta)| *value += delta);
+                apply(model, &a.out, &attended)
+            })
+            .collect()
+    }
 
-                let h = rms_norm(&x[position], &layer.ffn_norm, c.norm_eps);
+    /// A short convolution over every position of a layer, from scratch.
+    /// The kernel is read as the file stores it, channel by channel.
+    fn short_conv(
+        model: &Model,
+        index: usize,
+        cw: &ConvWeights,
+        inputs: &[Vec<f64>],
+    ) -> Vec<Vec<f64>> {
+        let c = model.config();
+        let (d, taps) = (c.n_embd, c.conv_kernel);
+        let kernel = tensor(model, &format!("blk.{index}.shortconv.conv.weight"));
+        let gated: Vec<Vec<f64>> = inputs
+            .iter()
+            .map(|h| {
+                let b = apply(model, &cw.b, h);
+                let signal = apply(model, &cw.x, h);
+                b.iter().zip(&signal).map(|(b, s)| b * s).collect()
+            })
+            .collect();
+        inputs
+            .iter()
+            .enumerate()
+            .map(|(position, h)| {
+                let gate = apply(model, &cw.c, h);
+                let mixed: Vec<f64> = (0..d)
+                    .map(|channel| {
+                        // Tap `taps - 1` is the current position.
+                        let sum: f64 = (0..taps)
+                            .filter_map(|tap| {
+                                let earlier = (position + tap).checked_sub(taps - 1)?;
+                                Some(kernel[channel * taps + tap] * gated[earlier][channel])
+                            })
+                            .sum();
+                        gate[channel] * sum
+                    })
+                    .collect();
+                apply(model, &cw.out_proj, &mixed)
+            })
+            .collect()
+    }
+
+    /// The logits after `tokens`, computed from scratch.
+    pub fn logits(model: &Model, tokens: &[u32]) -> Vec<f64> {
+        let (c, w) = (model.config(), model.weights());
+        let eps = c.norm_eps;
+        let mut x: Vec<Vec<f64>> = tokens
+            .iter()
+            .map(|&token| {
+                row_of(model, &w.token_embd, token as usize)
+                    .iter()
+                    .map(|v| v * c.embedding_scale as f64)
+                    .collect()
+            })
+            .collect();
+
+        // Gemma 4: each token's input to every layer.
+        let per = c.per_layer_embd;
+        let per_layer: Vec<Vec<f64>> = match &w.per_layer_inputs {
+            None => Vec::new(),
+            Some(inputs) => x
+                .iter()
+                .zip(tokens)
+                .map(|(row, &token)| {
+                    let projected = apply(model, &inputs.model_proj, row);
+                    let own = row_of(model, &inputs.token_embd, token as usize);
+                    projected
+                        .chunks(per)
+                        .zip(own.chunks(per))
+                        .flat_map(|(projected, own)| {
+                            let scaled: Vec<f64> = projected
+                                .iter()
+                                .map(|v| v / (c.n_embd as f64).sqrt())
+                                .collect();
+                            let normed = rms_norm(&scaled, Some(&inputs.proj_norm), eps);
+                            normed
+                                .into_iter()
+                                .zip(own)
+                                .map(|(n, e)| (n + e * (per as f64).sqrt()) / 2f64.sqrt())
+                                .collect::<Vec<f64>>()
+                        })
+                        .collect()
+                })
+                .collect(),
+        };
+
+        let mut caches = vec![None; c.n_layer];
+        for (index, layer) in w.layers.iter().enumerate() {
+            let inputs: Vec<Vec<f64>> = x
+                .iter()
+                .map(|row| rms_norm(row, Some(&layer.attn_norm), eps))
+                .collect();
+            let updates = match &layer.mixer {
+                MixerWeights::Attention(a) => attention(model, index, a, &inputs, &mut caches),
+                MixerWeights::ShortConv(cw) => short_conv(model, index, cw, &inputs),
+            };
+            for (position, mut update) in updates.into_iter().enumerate() {
+                if let Some(weight) = &layer.attn_post_norm {
+                    update = rms_norm(&update, Some(weight), eps);
+                }
+                add(&mut x[position], &update);
+
+                let h = rms_norm(&x[position], Some(&layer.ffn_norm), eps);
                 let gate = apply(model, &layer.ffn_gate, &h);
                 let up = apply(model, &layer.ffn_up, &h);
                 let mixed: Vec<f64> = gate
@@ -238,19 +364,34 @@ mod oracle {
                     .collect();
                 let mut update = apply(model, &layer.ffn_down, &mixed);
                 if let Some(weight) = &layer.ffn_post_norm {
-                    update = rms_norm(&update, weight, c.norm_eps);
+                    update = rms_norm(&update, Some(weight), eps);
                 }
-                x[position]
-                    .iter_mut()
-                    .zip(&update)
-                    .for_each(|(value, delta)| *value += delta);
+                add(&mut x[position], &update);
+
+                if let Some(plw) = &layer.per_layer {
+                    let gate = apply(model, &plw.gate, &x[position]);
+                    let input = &per_layer[position][index * per..(index + 1) * per];
+                    let mixed: Vec<f64> = gate
+                        .iter()
+                        .zip(input)
+                        .map(|(g, i)| activate(*g, Activation::Gelu) * i)
+                        .collect();
+                    let update = apply(model, &plw.proj, &mixed);
+                    add(
+                        &mut x[position],
+                        &rms_norm(&update, Some(&plw.post_norm), eps),
+                    );
+                }
+                if let Some(scale) = layer.output_scale {
+                    x[position].iter_mut().for_each(|v| *v *= scale as f64);
+                }
             }
         }
 
         let last = rms_norm(
             x.last().expect("at least one token"),
-            &w.output_norm,
-            c.norm_eps,
+            Some(&w.output_norm),
+            eps,
         );
         let mut logits = apply(model, &w.output, &last);
         if c.logit_softcap > 0.0 {
@@ -267,14 +408,29 @@ mod oracle {
 fn float_models_match_the_oracle() {
     for arch in ARCHS {
         let mut variants = vec![TinyModel::new(arch, TensorType::F32)];
-        let mut fused = TinyModel::new(arch, TensorType::F32);
-        fused.fused = true;
-        fused.bias = true;
-        variants.push(fused);
-        let mut with_factors = TinyModel::new(arch, TensorType::F32);
-        with_factors.rope_factors = true;
-        with_factors.n_head_kv = 4;
-        variants.push(with_factors);
+        if !matches!(arch, "gemma4" | "lfm3") {
+            let mut fused = TinyModel::new(arch, TensorType::F32);
+            fused.fused = true;
+            fused.bias = true;
+            variants.push(fused);
+            let mut with_factors = TinyModel::new(arch, TensorType::F32);
+            with_factors.rope_factors = true;
+            with_factors.n_head_kv = 4;
+            variants.push(with_factors);
+        }
+        if arch == "llama" || arch == "qwen3" {
+            // Only part of each head rotates.
+            let mut partial = TinyModel::new(arch, TensorType::F32);
+            partial.rope_dims = partial.head_dim() / 2;
+            variants.push(partial);
+        }
+        if arch == "gemma4" {
+            // Values of their own, and no layers that share caches.
+            let mut plain = TinyModel::new(arch, TensorType::F32);
+            plain.values_from_keys = false;
+            plain.shared_kv = 0;
+            variants.push(plain);
+        }
         if arch == "gemma3" {
             let mut windowed = TinyModel::new(arch, TensorType::F32);
             windowed.window = 3;
@@ -426,6 +582,81 @@ fn rolling_back_restores_an_earlier_state() {
 }
 
 #[test]
+fn new_layer_kinds_batch_and_thread_exactly() {
+    // Batches below the tile route compute each token the same way, so the
+    // convolution state, shared caches and skipped rows must not change a
+    // bit of the result.
+    for arch in ["gemma4", "lfm2", "lfm3"] {
+        for ty in [TensorType::F32, TensorType::Q8_0] {
+            let model = load(&TinyModel::new(arch, ty));
+            let expected = logits(&model, &PROMPT, 1, 1);
+            for (threads, batch) in [(1, 2), (1, 7), (4, 3), (3, 5)] {
+                assert_eq!(
+                    logits(&model, &PROMPT, threads, batch),
+                    expected,
+                    "{arch} {} threads {threads} batch {batch}",
+                    ty.name()
+                );
+            }
+            // Large batches add in another order, so only rounding differs.
+            let wide = logits(&model, &LONG_PROMPT, 3, 32);
+            let narrow: Vec<f64> = logits(&model, &LONG_PROMPT, 1, 1)
+                .iter()
+                .map(|v| *v as f64)
+                .collect();
+            let error = relative_error(&wide, &narrow);
+            assert!(error < 1e-3, "{arch} {}: error {error}", ty.name());
+        }
+    }
+}
+
+#[test]
+fn new_layer_kinds_stay_close_to_the_oracle_when_quantized() {
+    for arch in ["gemma4", "lfm2", "lfm3"] {
+        for ty in [TensorType::Q8_0, TensorType::Q4_0, TensorType::Q4K] {
+            let model = load(&TinyModel::new(arch, ty));
+            let expected = oracle::logits(&model, &PROMPT);
+            let error = relative_error(&logits(&model, &PROMPT, 2, 4), &expected);
+            assert!(error < 0.08, "{arch} {}: error {error}", ty.name());
+        }
+    }
+}
+
+#[test]
+fn convolution_state_survives_rolling_back() {
+    // Long enough to pass two checkpoints of the convolution state.
+    let tokens: Vec<u32> = (0..600u32).map(|i| 3 + (i * 7) % 37).collect();
+    let next = [30, 31, 32];
+    for arch in ["lfm2", "lfm3"] {
+        let model = load(&TinyModel::new(arch, TensorType::F32));
+        let mut session = session(&model, 2, 5, None);
+        session.eval(&tokens).unwrap();
+        let full_size = session.cache_bytes();
+        // Short cuts stay within the recent inputs. Long ones restore a
+        // checkpoint and read the tokens after it again.
+        for len in [599, 596, 520, 300, 256, 255, 3, 0] {
+            session.truncate(len);
+            assert_eq!(session.tokens(), &tokens[..len]);
+            session.eval(&next).unwrap();
+            let mut expected = tokens[..len].to_vec();
+            expected.extend(next);
+            assert_eq!(
+                session.logits(),
+                logits(&model, &expected, 2, 5),
+                "{arch} cut to {len}"
+            );
+            // Back to the whole context for the next cut.
+            session.truncate(len);
+            session.eval(&tokens[len..]).unwrap();
+            assert_eq!(session.logits(), logits(&model, &tokens, 2, 5));
+        }
+        assert_eq!(session.cache_bytes(), full_size);
+        session.clear();
+        assert!(session.cache_bytes() < full_size / 4);
+    }
+}
+
+#[test]
 fn a_long_context_crosses_cache_chunks() {
     let mut spec = TinyModel::new("llama", TensorType::F32);
     spec.n_layer = 1;
@@ -454,11 +685,13 @@ fn a_sliding_window_hides_older_positions() {
     assert_ne!(logits(&load(&narrow), &PROMPT, 1, 4), reference);
 
     let model = load(&narrow);
-    assert_eq!(model.config().sliding_window, 2);
-    assert_eq!(
-        model.config().local_layers,
-        [true, true, true, true, true, false]
-    );
+    let windows: Vec<usize> = model
+        .config()
+        .layers
+        .iter()
+        .map(|layer| layer.window)
+        .collect();
+    assert_eq!(windows, [2, 2, 2, 2, 2, 0]);
 }
 
 #[test]
@@ -503,7 +736,7 @@ fn model_facts_are_reported() {
         ("qwen3", "tiny test model")
     );
     assert_eq!(
-        (c.n_vocab, c.n_embd, c.n_ff, c.head_dim),
+        (c.n_vocab, c.n_embd, c.layers[0].n_ff, c.layers[0].head_dim),
         (40, 256, 256, 64)
     );
     assert_eq!(model.tokenizer().n_tokens(), 40);

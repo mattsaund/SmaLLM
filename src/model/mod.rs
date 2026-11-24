@@ -5,10 +5,12 @@
 //! | `config.rs`  | Hyperparameters, and the switches between architectures. |
 //! | `weights.rs` | Finds each tensor in the file and checks its shape.      |
 //! | `kv.rs`      | The key/value cache, grown in chunks.                    |
+//! | `conv.rs`    | The state of short convolution blocks, with rollback.    |
 //! | `matmul.rs`  | The parallel matrix multiply.                            |
 //! | `forward.rs` | The forward pass and the [`Session`] type.               |
 
 mod config;
+mod conv;
 mod forward;
 mod kv;
 mod matmul;
@@ -23,9 +25,12 @@ use crate::error::Result;
 use crate::gguf::Gguf;
 use crate::tokenizer::Tokenizer;
 
-pub use config::{ARCHITECTURES, Activation, Config, Rope};
+pub use config::{ARCHITECTURES, Activation, Config, LayerSpec, Mixer, Rope};
 pub use forward::{Phase, Profile, Session, SessionConfig};
-pub use weights::{Layer, Linear, Matrix, Weights};
+pub use weights::{
+    AttentionWeights, ConvWeights, Layer, Linear, Matrix, MixerWeights, PerLayerInputs,
+    PerLayerWeights, Weights,
+};
 
 /// A model file, opened and ready to run.
 ///

@@ -113,14 +113,35 @@ pub(crate) struct TinyModel {
     pub window: usize,
     /// Stores per-frequency rotary divisors.
     pub rope_factors: bool,
+    /// Elements of each head that rotate. Zero for all of them.
+    pub rope_dims: usize,
+    /// Head width, when it is not `n_embd / n_head`. Sliding-window layers
+    /// of LFM3 and Gemma 4 use the default width, the others this one.
+    pub key_length: usize,
+    /// Taps of the short convolution, which then replaces attention in the
+    /// even layers (LFM models). Zero for none.
+    pub conv_kernel: usize,
+    /// Gates each attention head's output (LFM3).
+    pub head_gate: bool,
+    /// The last layers that read earlier layers' caches (Gemma 4).
+    pub shared_kv: usize,
+    /// Width of each layer's per-layer input (Gemma 4). Zero for none.
+    pub per_layer: usize,
+    /// Leaves out the value projections, so keys serve as values (Gemma 4).
+    pub values_from_keys: bool,
+    /// Scales the output of every block (Gemma 4).
+    pub output_scale: bool,
+    /// Doubles the feed-forward width of the second half of the layers.
+    pub wide_late_ff: bool,
     pub seed: u64,
 }
 
 impl TinyModel {
-    /// A two-layer model small enough to evaluate in microseconds.
+    /// A model small enough to evaluate in microseconds: two layers, or
+    /// more for the architectures whose layers differ.
     pub fn new(arch: &'static str, ty: TensorType) -> TinyModel {
         let width = ty.block_len().max(32);
-        TinyModel {
+        let mut model = TinyModel {
             arch,
             ty,
             n_embd: width,
@@ -129,26 +150,103 @@ impl TinyModel {
             n_head_kv: 2,
             n_ff: width,
             n_vocab: 40,
-            qk_norm: arch == "qwen3" || arch == "gemma3",
-            post_norm: arch == "gemma3",
+            qk_norm: matches!(arch, "qwen3" | "gemma3" | "gemma4" | "lfm2" | "lfm3"),
+            post_norm: matches!(arch, "gemma3" | "gemma4" | "lfm3"),
             bias: arch == "qwen2",
             fused: false,
             window: 0,
             rope_factors: false,
+            rope_dims: 0,
+            key_length: 0,
+            conv_kernel: 0,
+            head_gate: false,
+            shared_kv: 0,
+            per_layer: 0,
+            values_from_keys: false,
+            output_scale: false,
+            wide_late_ff: false,
             seed: 1,
+        };
+        match arch {
+            "lfm2" => {
+                model.n_layer = 4;
+                model.conv_kernel = 3;
+            }
+            "lfm3" => {
+                model.n_layer = 6;
+                model.conv_kernel = 4;
+                model.head_gate = true;
+                model.key_length = 2 * model.head_dim();
+                model.window = 3;
+                model.rope_factors = true;
+            }
+            "gemma4" => {
+                model.n_layer = 6;
+                model.n_head_kv = 1;
+                model.key_length = 2 * model.head_dim();
+                model.window = 3;
+                model.rope_factors = true;
+                model.shared_kv = 3;
+                model.per_layer = width;
+                model.values_from_keys = true;
+                model.output_scale = true;
+                model.wide_late_ff = true;
+            }
+            _ => {}
+        }
+        model
+    }
+
+    /// The default head width: the embedding split between the heads.
+    pub fn head_dim(&self) -> usize {
+        self.n_embd / self.n_head
+    }
+
+    /// True when layer `index` is a short convolution.
+    pub fn is_conv(&self, index: usize) -> bool {
+        self.conv_kernel > 0 && index % 2 == 0
+    }
+
+    /// True when layer `index` uses the sliding window, for the
+    /// architectures that store a flag per layer.
+    pub fn is_local(&self, index: usize) -> bool {
+        self.window > 0 && index % 3 != 2
+    }
+
+    /// True when the architecture stores one sliding-window flag per layer.
+    fn has_window_flags(&self) -> bool {
+        matches!(self.arch, "lfm3" | "gemma4") && self.window > 0
+    }
+
+    /// Head width of layer `index`.
+    pub fn layer_head_dim(&self, index: usize) -> usize {
+        let local = self.has_window_flags() && self.is_local(index);
+        match self.key_length {
+            0 => self.head_dim(),
+            _ if local => self.head_dim(),
+            width => width,
         }
     }
 
-    pub fn head_dim(&self) -> usize {
-        self.n_embd / self.n_head
+    /// Feed-forward width of layer `index`.
+    pub fn layer_n_ff(&self, index: usize) -> usize {
+        if self.wide_late_ff && index >= self.n_layer / 2 {
+            2 * self.n_ff
+        } else {
+            self.n_ff
+        }
+    }
+
+    /// True when layer `index` computes keys and values of its own.
+    fn owns_kv(&self, index: usize) -> bool {
+        !self.is_conv(index) && index + self.shared_kv < self.n_layer
     }
 
     /// Serializes the model as the bytes of a GGUF file.
     pub fn build(&self) -> Vec<u8> {
         let mut rng = Rng(self.seed);
         let arch = self.arch;
-        let (d, n_ff) = (self.n_embd, self.n_ff);
-        let (q_dim, kv_dim) = (d, self.n_head_kv * self.head_dim());
+        let d = self.n_embd;
         let mut builder = Builder::new();
         builder
             .string("general.architecture", arch)
@@ -156,18 +254,80 @@ impl TinyModel {
             .u32(&format!("{arch}.context_length"), 512)
             .u32(&format!("{arch}.embedding_length"), d as u32)
             .u32(&format!("{arch}.block_count"), self.n_layer as u32)
-            .u32(&format!("{arch}.feed_forward_length"), n_ff as u32)
             .u32(&format!("{arch}.attention.head_count"), self.n_head as u32)
-            .u32(
-                &format!("{arch}.attention.head_count_kv"),
-                self.n_head_kv as u32,
-            )
             .f32(&format!("{arch}.attention.layer_norm_rms_epsilon"), 1e-5)
             .f32(&format!("{arch}.rope.freq_base"), 10000.0);
+        let layers = 0..self.n_layer;
+        if self.wide_late_ff {
+            let widths: Vec<i32> = layers.clone().map(|i| self.layer_n_ff(i) as i32).collect();
+            builder.i32s(&format!("{arch}.feed_forward_length"), &widths);
+        } else {
+            builder.u32(&format!("{arch}.feed_forward_length"), self.n_ff as u32);
+        }
+        if self.conv_kernel > 0 {
+            // A convolution layer has no key/value heads.
+            let heads: Vec<i32> = layers
+                .clone()
+                .map(|i| {
+                    if self.is_conv(i) {
+                        0
+                    } else {
+                        self.n_head_kv as i32
+                    }
+                })
+                .collect();
+            builder
+                .i32s(&format!("{arch}.attention.head_count_kv"), &heads)
+                .u32(
+                    &format!("{arch}.shortconv.l_cache"),
+                    self.conv_kernel as u32,
+                );
+        } else {
+            builder.u32(
+                &format!("{arch}.attention.head_count_kv"),
+                self.n_head_kv as u32,
+            );
+        }
+        if self.key_length > 0 {
+            builder.u32(
+                &format!("{arch}.attention.key_length"),
+                self.key_length as u32,
+            );
+            if self.has_window_flags() {
+                builder.u32(
+                    &format!("{arch}.attention.key_length_swa"),
+                    self.head_dim() as u32,
+                );
+            }
+        }
+        if self.rope_dims > 0 {
+            builder.u32(
+                &format!("{arch}.rope.dimension_count"),
+                self.rope_dims as u32,
+            );
+        }
         if self.window > 0 {
             builder.u32(
                 &format!("{arch}.attention.sliding_window"),
                 self.window as u32,
+            );
+        }
+        if self.has_window_flags() {
+            let flags: Vec<bool> = layers.clone().map(|i| self.is_local(i)).collect();
+            builder
+                .bools(&format!("{arch}.attention.sliding_window_pattern"), &flags)
+                .f32(&format!("{arch}.rope.freq_base_swa"), 1000.0);
+        }
+        if self.shared_kv > 0 {
+            builder.u32(
+                &format!("{arch}.attention.shared_kv_layers"),
+                self.shared_kv as u32,
+            );
+        }
+        if self.per_layer > 0 {
+            builder.u32(
+                &format!("{arch}.embedding_length_per_layer_input"),
+                self.per_layer as u32,
             );
         }
 
@@ -199,9 +359,44 @@ impl TinyModel {
         let weight_scale = 1.5 / (d as f32).sqrt();
         matrix(&mut builder, "token_embd.weight", self.n_vocab, d, 1.0);
         matrix(&mut builder, "output.weight", self.n_vocab, d, weight_scale);
-        for layer in 0..self.n_layer {
+        if self.per_layer > 0 {
+            let width = self.per_layer * self.n_layer;
+            matrix(
+                &mut builder,
+                "per_layer_token_embd.weight",
+                self.n_vocab,
+                width,
+                1.0,
+            );
+            matrix(
+                &mut builder,
+                "per_layer_model_proj.weight",
+                width,
+                d,
+                weight_scale,
+            );
+        }
+        for layer in layers.clone() {
             let name = |part: &str| format!("blk.{layer}.{part}");
-            if self.fused {
+            let n_ff = self.layer_n_ff(layer);
+            let head_dim = self.layer_head_dim(layer);
+            let (q_dim, kv_dim) = (self.n_head * head_dim, self.n_head_kv * head_dim);
+            if self.is_conv(layer) {
+                matrix(
+                    &mut builder,
+                    &name("shortconv.in_proj.weight"),
+                    3 * d,
+                    d,
+                    weight_scale,
+                );
+                matrix(
+                    &mut builder,
+                    &name("shortconv.out_proj.weight"),
+                    d,
+                    d,
+                    weight_scale,
+                );
+            } else if self.fused {
                 matrix(
                     &mut builder,
                     &name("attn_qkv.weight"),
@@ -209,6 +404,46 @@ impl TinyModel {
                     d,
                     weight_scale,
                 );
+            } else {
+                matrix(&mut builder, &name("attn_q.weight"), q_dim, d, weight_scale);
+                if self.owns_kv(layer) {
+                    matrix(
+                        &mut builder,
+                        &name("attn_k.weight"),
+                        kv_dim,
+                        d,
+                        weight_scale,
+                    );
+                    if !self.values_from_keys {
+                        matrix(
+                            &mut builder,
+                            &name("attn_v.weight"),
+                            kv_dim,
+                            d,
+                            weight_scale,
+                        );
+                    }
+                }
+            }
+            if !self.is_conv(layer) {
+                matrix(
+                    &mut builder,
+                    &name("attn_output.weight"),
+                    d,
+                    q_dim,
+                    weight_scale,
+                );
+                if self.head_gate {
+                    matrix(
+                        &mut builder,
+                        &name("attn_gate.weight"),
+                        self.n_head,
+                        d,
+                        weight_scale,
+                    );
+                }
+            }
+            if self.fused {
                 matrix(
                     &mut builder,
                     &name("ffn_up.weight"),
@@ -217,21 +452,6 @@ impl TinyModel {
                     weight_scale,
                 );
             } else {
-                matrix(&mut builder, &name("attn_q.weight"), q_dim, d, weight_scale);
-                matrix(
-                    &mut builder,
-                    &name("attn_k.weight"),
-                    kv_dim,
-                    d,
-                    weight_scale,
-                );
-                matrix(
-                    &mut builder,
-                    &name("attn_v.weight"),
-                    kv_dim,
-                    d,
-                    weight_scale,
-                );
                 matrix(
                     &mut builder,
                     &name("ffn_gate.weight"),
@@ -243,18 +463,16 @@ impl TinyModel {
             }
             matrix(
                 &mut builder,
-                &name("attn_output.weight"),
-                d,
-                q_dim,
-                weight_scale,
-            );
-            matrix(
-                &mut builder,
                 &name("ffn_down.weight"),
                 d,
                 n_ff,
                 weight_scale,
             );
+            if self.per_layer > 0 {
+                let per = self.per_layer;
+                matrix(&mut builder, &name("inp_gate.weight"), per, d, weight_scale);
+                matrix(&mut builder, &name("proj.weight"), d, per, weight_scale);
+            }
         }
 
         // Vectors are always stored as f32.
@@ -262,35 +480,62 @@ impl TinyModel {
         let mut vector = |builder: &mut Builder, name: &str, len: usize, low: f32, high: f32| {
             builder.tensor_f32(name, &[len as u64], &rng.floats(len, low, high));
         };
-        vector(&mut builder, "output_norm.weight", d, 0.5, 1.5);
+        // LFM2 files name the final norm after the embeddings.
+        let output_norm = if arch == "lfm2" {
+            "token_embd_norm.weight"
+        } else {
+            "output_norm.weight"
+        };
+        vector(&mut builder, output_norm, d, 0.5, 1.5);
         if self.rope_factors {
+            // Divisors for the full-attention layers' rotation.
+            let full = (0..self.n_layer)
+                .find(|&i| !self.is_conv(i) && !(self.has_window_flags() && self.is_local(i)))
+                .map_or(self.head_dim(), |i| self.layer_head_dim(i));
+            let dims = if self.rope_dims > 0 {
+                self.rope_dims
+            } else {
+                full
+            };
+            vector(&mut builder, "rope_freqs.weight", dims / 2, 1.0, 8.0);
+        }
+        if self.per_layer > 0 {
             vector(
                 &mut builder,
-                "rope_freqs.weight",
-                self.head_dim() / 2,
-                1.0,
-                8.0,
+                "per_layer_proj_norm.weight",
+                self.per_layer,
+                0.5,
+                1.5,
             );
         }
-        for layer in 0..self.n_layer {
+        for layer in layers {
             let name = |part: &str| format!("blk.{layer}.{part}");
+            let head_dim = self.layer_head_dim(layer);
+            let (q_dim, kv_dim) = (self.n_head * head_dim, self.n_head_kv * head_dim);
             vector(&mut builder, &name("attn_norm.weight"), d, 0.5, 1.5);
             vector(&mut builder, &name("ffn_norm.weight"), d, 0.5, 1.5);
-            if self.qk_norm {
+            if self.is_conv(layer) {
+                let taps = self.conv_kernel as u64;
+                let mut taps_rng = Rng(self.seed ^ (0xc0 + layer as u64));
+                let kernel = taps_rng.floats(self.conv_kernel * d, -1.0, 1.0);
+                builder.tensor_f32(&name("shortconv.conv.weight"), &[taps, d as u64], &kernel);
+            } else if self.qk_norm {
                 vector(
                     &mut builder,
                     &name("attn_q_norm.weight"),
-                    self.head_dim(),
+                    head_dim,
                     0.5,
                     1.5,
                 );
-                vector(
-                    &mut builder,
-                    &name("attn_k_norm.weight"),
-                    self.head_dim(),
-                    0.5,
-                    1.5,
-                );
+                if self.owns_kv(layer) {
+                    vector(
+                        &mut builder,
+                        &name("attn_k_norm.weight"),
+                        head_dim,
+                        0.5,
+                        1.5,
+                    );
+                }
             }
             if self.post_norm {
                 vector(
@@ -302,7 +547,19 @@ impl TinyModel {
                 );
                 vector(&mut builder, &name("post_ffw_norm.weight"), d, 0.5, 1.5);
             }
-            if self.bias {
+            if self.per_layer > 0 {
+                vector(&mut builder, &name("post_norm.weight"), d, 0.5, 1.5);
+            }
+            if self.output_scale {
+                vector(
+                    &mut builder,
+                    &name("layer_output_scale.weight"),
+                    1,
+                    0.5,
+                    1.5,
+                );
+            }
+            if self.bias && !self.is_conv(layer) {
                 if self.fused {
                     vector(
                         &mut builder,

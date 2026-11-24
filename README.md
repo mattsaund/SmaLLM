@@ -70,11 +70,17 @@ message. In a chat, `/clear` starts over, `/system` sets a system message and
 
 ## What it runs
 
-**Models.** The Llama, Qwen2, Qwen3 and Gemma 3 architectures. That covers
-Llama 2 and 3, TinyLlama, SmolLM2, Mistral, Qwen2.5, Qwen3, the DeepSeek R1
-distillations and Gemma 3. The engine is tested against llama.cpp on eight
+**Models.** The Llama, Qwen2, Qwen3, Gemma 3, Gemma 4, LFM2 and LFM3
+architectures. That covers Llama 2 and 3, TinyLlama, SmolLM2, Mistral,
+Qwen2.5, Qwen3, the DeepSeek R1 distillations, Gemma 3, Gemma 4 and Liquid
+AI's LFM2, LFM2.5 and LFM3. The engine is tested against llama.cpp on eleven
 models. Tokens match exactly, and greedy output matches up to near ties
-between two candidates.
+between two candidates. LFM3 is newer than the llama.cpp it is tested
+against, so it is checked by hand against llama.cpp's source instead.
+
+**Tokenizers.** SentencePiece, byte-level BPE with the word splitting rules
+of all 67 families llama.cpp knows, and Gemma 4's. llama.cpp's own tokenizer
+test texts pass on every vocabulary it ships that uses one of these.
 
 **Weights.** F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K,
 Q5_K, Q6_K and IQ4_NL. Weights stay in the file's format and are memory
@@ -85,8 +91,8 @@ file.
 get hand-written kernels, picked when the program starts. Everything else,
 including 32-bit ARM and RISC-V, runs portable code.
 
-**Chat formats.** ChatML, Llama 3, Llama 2, Mistral, Gemma, Phi-3, Zephyr and
-DeepSeek, recognized from the model file.
+**Chat formats.** ChatML, Llama 3, Llama 2, Mistral, Gemma, Gemma 4, Phi-3,
+Zephyr and DeepSeek, recognized from the model file.
 
 ## Speed
 
@@ -274,13 +280,15 @@ static, with the header and the Python binding.
 ## Project status
 
 - [x] GGUF loading by memory map, with every read bounds-checked
-- [x] The Llama, Qwen2, Qwen3 and Gemma 3 architectures
+- [x] The Llama, Qwen2, Qwen3, Gemma 3, Gemma 4, LFM2 and LFM3 architectures, including hybrids of attention
+      and convolution layers
 - [x] Fourteen weight formats, float and quantized
 - [x] Kernels for AVX2, AVX-VNNI, NEON and the ARM dot product extension
 - [x] Prompt reading in tiles, up to twice as fast as llama.cpp
 - [x] A few megabytes of memory besides the model file
-- [x] SentencePiece and byte-level BPE tokenizers that match llama.cpp token for token on the test models
-- [x] Eight chat formats, recognized from the model file
+- [x] SentencePiece and byte-level BPE tokenizers for every word splitting family llama.cpp knows, matching it
+      token for token on its test texts
+- [x] Nine chat formats, recognized from the model file
 - [x] A context window with no built-in limit, tested at 262,144 tokens
 - [x] Chat, one-shot answers, model downloads and benchmarks from one program
 - [x] An OpenAI-compatible server with streaming
@@ -313,6 +321,7 @@ left out.
 
 - [ ] More architectures: Phi, Gemma 2, mixture-of-experts models such as Mixtral, and the families that are not
       transformers (RWKV, Mamba).
+- [ ] Encoder tokenizers (WordPiece and Unigram), which only the encoder models below use.
 - [ ] Encoder models, for embeddings and reranking.
 - [ ] Images and audio as input.
 - [ ] The remaining weight formats: IQ1, IQ2, IQ3, IQ4_XS and the ternary ones.
@@ -321,7 +330,7 @@ left out.
 **Generation**
 
 - [ ] Grammar-constrained output, and JSON that follows a schema.
-- [ ] Jinja chat templates, for models whose format is not one of the eight built in.
+- [ ] Jinja chat templates, for models whose format is not one of the nine built in.
 - [ ] More samplers: Mirostat, typical, DRY, XTC and dynamic temperature, and a bias on chosen tokens.
 - [ ] Token probabilities in the output.
 - [ ] Speculative decoding with a small draft model.

@@ -218,8 +218,26 @@ fn tinyllama_1_1b_q4_k_m() {
 }
 
 #[test]
+fn lfm2_5_350m_q4_k_m() {
+    check("LFM2.5-350M-Q4_K_M");
+}
+
+#[test]
+fn lfm2_5_1_2b_q4_k_m() {
+    check("LFM2.5-1.2B-Instruct-Q4_K_M");
+}
+
+#[test]
+fn gemma_4_e2b_q4_0() {
+    check("gemma-4-E2B-it-Q4_0");
+}
+
+#[test]
 fn every_golden_file_has_a_test() {
     let tested = [
+        "LFM2.5-350M-Q4_K_M",
+        "LFM2.5-1.2B-Instruct-Q4_K_M",
+        "gemma-4-E2B-it-Q4_0",
         "stories260K",
         "stories15M-q4_0",
         "SmolLM2-135M-Instruct-Q4_K_M",

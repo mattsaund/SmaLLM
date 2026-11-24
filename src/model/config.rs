@@ -1,14 +1,19 @@
 //! A model's hyperparameters, read from GGUF metadata.
 //!
-//! Every supported architecture is the same decoder-only transformer with a
-//! few switches. This file turns the architecture name into those switches,
-//! so the forward pass has no per-architecture code.
+//! Every supported architecture is a decoder-only stack of blocks. Each
+//! block first mixes information across positions, with attention or with a
+//! short convolution, and then runs a feed-forward network. This file turns
+//! the architecture name and its metadata into a few model-wide switches and
+//! one [`LayerSpec`] per block, so the forward pass has no per-architecture
+//! code.
 
 use crate::error::{Error, Result};
 use crate::gguf::Gguf;
 
 /// Architectures this engine runs, as named in `general.architecture`.
-pub const ARCHITECTURES: [&str; 4] = ["llama", "qwen2", "qwen3", "gemma3"];
+pub const ARCHITECTURES: [&str; 7] = [
+    "llama", "qwen2", "qwen3", "gemma3", "gemma4", "lfm2", "lfm3",
+];
 
 /// Which two elements of an attention head a rotary embedding rotates
 /// together.
@@ -16,7 +21,7 @@ pub const ARCHITECTURES: [&str; 4] = ["llama", "qwen2", "qwen3", "gemma3"];
 pub enum Rope {
     /// Neighbors: elements `2i` and `2i + 1`.
     Pairs,
-    /// Halves: elements `i` and `i + head_dim / 2`.
+    /// Halves: elements `i` and `i + rope_dims / 2`.
     Halves,
 }
 
@@ -25,6 +30,66 @@ pub enum Rope {
 pub enum Activation {
     Silu,
     Gelu,
+}
+
+/// How a block mixes information across positions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mixer {
+    /// Attention over earlier positions, with a key/value cache.
+    Attention,
+    /// A short causal convolution over the last few positions, gated, as in
+    /// Liquid AI's LFM models. It keeps a small state instead of a cache.
+    ShortConv,
+}
+
+/// The shape of one block.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayerSpec {
+    pub mixer: Mixer,
+    /// Attention heads. Zero in convolution blocks.
+    pub n_head: usize,
+    /// Key and value heads. Fewer than `n_head` when query heads share them
+    /// (grouped-query attention).
+    pub n_head_kv: usize,
+    /// Width of one attention head.
+    pub head_dim: usize,
+    /// Elements at the start of each head that rotate by position. The rest
+    /// pass through.
+    pub rope_dims: usize,
+    /// Rotary frequency base.
+    pub rope_base: f32,
+    /// Multiplier on every rotary angle. One unless the model was trained
+    /// with linear position scaling.
+    pub rope_scale: f32,
+    /// Divide the rotary frequencies by the model's `rope_freqs.weight`.
+    pub rope_factors: bool,
+    /// Positions the layer looks back, itself included. Zero for all.
+    pub window: usize,
+    /// The layer whose keys and values this layer reads, when it computes
+    /// none of its own.
+    pub kv_source: Option<usize>,
+    /// Multiplier on attention scores before the softmax.
+    pub attention_scale: f32,
+    /// Width of the feed-forward layer. Zero until the weights are bound,
+    /// when the file does not state it.
+    pub n_ff: usize,
+}
+
+impl LayerSpec {
+    /// Width of the query projection: all heads side by side.
+    pub fn q_dim(&self) -> usize {
+        self.n_head * self.head_dim
+    }
+
+    /// Width of the key and value projections.
+    pub fn kv_dim(&self) -> usize {
+        self.n_head_kv * self.head_dim
+    }
+
+    /// True when the layer computes and stores keys and values.
+    pub fn owns_kv(&self) -> bool {
+        self.mixer == Mixer::Attention && self.kv_source.is_none()
+    }
 }
 
 /// Everything the forward pass needs to know about a model's shape.
@@ -40,42 +105,29 @@ pub struct Config {
     pub n_ctx_train: usize,
     /// Width of the hidden state.
     pub n_embd: usize,
-    /// Number of transformer blocks.
+    /// Number of blocks.
     pub n_layer: usize,
-    /// Attention heads per block.
-    pub n_head: usize,
-    /// Key and value heads per block. Fewer than `n_head` when query heads
-    /// share them (grouped-query attention).
-    pub n_head_kv: usize,
-    /// Width of one attention head.
-    pub head_dim: usize,
-    /// Width of the feed-forward layer. Zero until the weights are bound,
-    /// when the file does not state it.
-    pub n_ff: usize,
+    /// The shape of each block.
+    pub layers: Vec<LayerSpec>,
     /// Epsilon inside every RMS normalization.
     pub norm_eps: f32,
     /// How rotary embeddings pair up elements.
     pub rope: Rope,
-    /// Rotary frequency base.
-    pub rope_base: f32,
-    /// Rotary frequency base in sliding-window layers.
-    pub rope_base_local: f32,
-    /// Multiplier on every rotary angle. One unless the model was trained
-    /// with linear position scaling.
-    pub rope_scale: f32,
     /// The feed-forward activation.
     pub activation: Activation,
     /// Multiplier on token embeddings.
     pub embedding_scale: f32,
-    /// Multiplier on attention scores before the softmax.
-    pub attention_scale: f32,
-    /// Positions a sliding-window layer can look back, itself included.
-    /// Zero when the model has no such layers.
-    pub sliding_window: usize,
-    /// Per layer: true when the layer uses the sliding window.
-    pub local_layers: Vec<bool>,
     /// Soft cap applied to the output logits. Zero for none.
     pub logit_softcap: f32,
+    /// Value vectors are RMS-normalized, without a learned gain, before
+    /// they are stored. Gemma 4 does this.
+    pub value_norm: bool,
+    /// Width of the short convolution, in positions. Zero when the model has
+    /// no convolution blocks.
+    pub conv_kernel: usize,
+    /// Width of each layer's slice of the per-layer token embeddings. Zero
+    /// for models without them. Gemma 4 has them.
+    pub per_layer_embd: usize,
 }
 
 impl Config {
@@ -92,87 +144,60 @@ impl Config {
                 ARCHITECTURES.join(", ")
             )));
         }
-        let key = |suffix: &str| format!("{arch}.{suffix}");
-        let required = |suffix: &str| {
-            file.get_usize(&key(suffix))
-                .filter(|&value| value > 0)
-                .ok_or_else(|| {
-                    Error::format(format!("missing or invalid metadata: {}", key(suffix)))
-                })
-        };
+        let meta = Meta { file, arch: &arch };
 
-        let n_ctx_train = required("context_length")?;
-        let n_embd = required("embedding_length")?;
-        let n_layer = required("block_count")?;
-        let n_head = required("attention.head_count")?;
-        let n_head_kv = file
-            .get_usize(&key("attention.head_count_kv"))
-            .filter(|&v| v > 0)
-            .unwrap_or(n_head);
-        let head_dim = file
-            .get_usize(&key("attention.key_length"))
-            .filter(|&v| v > 0)
-            .unwrap_or(n_embd / n_head);
-        let value_dim = file
-            .get_usize(&key("attention.value_length"))
-            .unwrap_or(head_dim);
-        let rope_dims = file
-            .get_usize(&key("rope.dimension_count"))
-            .unwrap_or(head_dim);
-        let n_ff = file.get_usize(&key("feed_forward_length")).unwrap_or(0);
-
-        if head_dim == 0 || head_dim % 2 != 0 {
-            return Err(Error::format(format!(
-                "attention head width {head_dim} must be even and non-zero"
-            )));
-        }
-        if n_head % n_head_kv != 0 {
-            return Err(Error::format(format!(
-                "{n_head} heads cannot share {n_head_kv} key/value heads"
-            )));
-        }
-        if value_dim != head_dim {
-            return Err(Error::unsupported(
-                "attention with different key and value widths",
-            ));
-        }
-        if rope_dims != head_dim {
-            return Err(Error::unsupported("rotary embeddings on part of a head"));
-        }
-        if file.get_usize(&key("expert_count")).unwrap_or(0) > 0 {
-            return Err(Error::unsupported("mixture-of-experts models"));
-        }
+        let n_ctx_train = meta.required("context_length")?;
+        let n_embd = meta.required("embedding_length")?;
+        let n_layer = meta.required("block_count")?;
         // Guard the sizes that later multiply into buffer lengths.
-        for (what, value) in [
-            ("layers", n_layer),
-            ("heads", n_head),
-            ("embedding width", n_embd),
-        ] {
+        for (what, value) in [("layers", n_layer), ("embedding width", n_embd)] {
             if value > 1 << 20 {
                 return Err(Error::format(format!(
                     "implausible number of {what}: {value}"
                 )));
             }
         }
+        let n_head = meta.per_layer("attention.head_count", n_layer)?;
+        let n_head_kv = meta
+            .per_layer("attention.head_count_kv", n_layer)
+            .unwrap_or_else(|_| n_head.clone());
+        let n_ff = meta
+            .per_layer("feed_forward_length", n_layer)
+            .unwrap_or_else(|_| vec![0; n_layer]);
+        if n_head.iter().any(|&heads| heads == 0 || heads > 1 << 16) {
+            return Err(Error::format(format!(
+                "missing or invalid metadata: {arch}.attention.head_count"
+            )));
+        }
+        if meta.usize("expert_count").unwrap_or(0) > 0 {
+            return Err(Error::unsupported("mixture-of-experts models"));
+        }
 
-        // Position scaling other than linear changes the rotary formula.
-        let mut rope_scale = 1.0;
-        match file.get_str(&key("rope.scaling.type")).unwrap_or("linear") {
-            "none" | "linear" => {
-                let factor = file
-                    .get_f32(&key("rope.scaling.factor"))
-                    .or_else(|| file.get_f32(&key("rope.scale_linear")))
-                    .unwrap_or(0.0);
-                if factor != 0.0 {
-                    rope_scale = 1.0 / factor;
-                }
-            }
-            other => {
-                return Err(Error::unsupported(format!(
-                    "rotary position scaling '{other}'"
-                )));
+        // Head widths: one for full attention, and maybe another for the
+        // sliding-window layers.
+        let head_dim = meta
+            .usize("attention.key_length")
+            .filter(|&width| width > 0)
+            .unwrap_or(n_embd / n_head[0]);
+        let head_dim_local = meta.usize("attention.key_length_swa").unwrap_or(head_dim);
+        for (key, width) in [
+            ("attention.value_length", head_dim),
+            ("attention.value_length_swa", head_dim_local),
+        ] {
+            if meta.usize(key).is_some_and(|value| value != width) {
+                return Err(Error::unsupported(
+                    "attention with different key and value widths",
+                ));
             }
         }
+        let rope_dims = meta.usize("rope.dimension_count").unwrap_or(head_dim);
+        let rope_dims_local = meta
+            .usize("rope.dimension_count_swa")
+            .unwrap_or(head_dim_local.min(rope_dims));
+        let rope_base = meta.f32("rope.freq_base").unwrap_or(10000.0);
+        let rope_base_local = meta.f32("rope.freq_base_swa").unwrap_or(10000.0);
+        let rope_scale = meta.rope_scale()?;
+        let window = meta.usize("attention.sliding_window").unwrap_or(0);
 
         let mut config = Config {
             name: file.get_str("general.name").unwrap_or("").to_string(),
@@ -180,82 +205,319 @@ impl Config {
             n_ctx_train,
             n_embd,
             n_layer,
-            n_head,
-            n_head_kv,
-            head_dim,
-            n_ff,
-            norm_eps: file
-                .get_f32(&key("attention.layer_norm_rms_epsilon"))
-                .unwrap_or(1e-5),
+            layers: (0..n_layer)
+                .map(|layer| LayerSpec {
+                    mixer: Mixer::Attention,
+                    n_head: n_head[layer],
+                    n_head_kv: n_head_kv[layer],
+                    head_dim,
+                    rope_dims,
+                    rope_base,
+                    rope_scale,
+                    rope_factors: true,
+                    window: 0,
+                    kv_source: None,
+                    attention_scale: 1.0 / (head_dim as f32).sqrt(),
+                    n_ff: n_ff[layer],
+                })
+                .collect(),
+            norm_eps: meta.f32("attention.layer_norm_rms_epsilon").unwrap_or(1e-5),
             rope: Rope::Halves,
-            rope_base: file.get_f32(&key("rope.freq_base")).unwrap_or(10000.0),
-            rope_base_local: 10000.0,
-            rope_scale,
             activation: Activation::Silu,
             embedding_scale: 1.0,
-            attention_scale: 1.0 / (head_dim as f32).sqrt(),
-            sliding_window: 0,
-            local_layers: vec![false; n_layer],
             logit_softcap: 0.0,
-            arch,
+            value_norm: false,
+            conv_kernel: 0,
+            per_layer_embd: 0,
+            arch: arch.clone(),
         };
 
-        match config.arch.as_str() {
+        // Turns layer `index` into a sliding-window layer with the widths
+        // and rotary settings those layers use.
+        let make_local = |layer: &mut LayerSpec| {
+            layer.window = window;
+            layer.head_dim = head_dim_local;
+            layer.rope_dims = rope_dims_local;
+            layer.rope_base = rope_base_local;
+            layer.rope_scale = 1.0;
+            layer.rope_factors = false;
+            layer.attention_scale = 1.0 / (head_dim_local as f32).sqrt();
+        };
+
+        match arch.as_str() {
             // Llama weights are stored so that neighbors rotate together.
             "llama" => config.rope = Rope::Pairs,
             "qwen2" | "qwen3" => {}
             "gemma3" => {
                 config.activation = Activation::Gelu;
                 config.embedding_scale = (n_embd as f32).sqrt();
-                config.logit_softcap = file
-                    .get_f32("gemma3.final_logit_softcapping")
-                    .unwrap_or(0.0);
+                config.logit_softcap = meta.f32("final_logit_softcapping").unwrap_or(0.0);
                 // The largest Gemma 3 scales attention by its nominal head
                 // width, which differs from the stored key width.
                 if n_layer == 62 {
-                    config.attention_scale = 1.0 / ((n_embd / n_head) as f32).sqrt();
+                    let scale = 1.0 / ((n_embd / n_head[0]) as f32).sqrt();
+                    config
+                        .layers
+                        .iter_mut()
+                        .for_each(|layer| layer.attention_scale = scale);
                 }
-                let window = file
-                    .get_usize("gemma3.attention.sliding_window")
-                    .unwrap_or(0);
                 if window > 0 {
-                    config.sliding_window = window;
-                    config.rope_base_local =
-                        file.get_f32("gemma3.rope.freq_base_swa").unwrap_or(10000.0);
-                    config.local_layers = sliding_window_layers(file, n_layer, 6);
+                    for (layer, local) in config
+                        .layers
+                        .iter_mut()
+                        .zip(meta.window_pattern(n_layer, 6))
+                    {
+                        if local {
+                            make_local(layer);
+                        }
+                    }
+                }
+            }
+            "gemma4" => {
+                config.activation = Activation::Gelu;
+                config.embedding_scale = (n_embd as f32).sqrt();
+                config.logit_softcap = meta.f32("final_logit_softcapping").unwrap_or(0.0);
+                config.value_norm = true;
+                config.per_layer_embd = meta.usize("embedding_length_per_layer_input").unwrap_or(0);
+                for (layer, local) in config
+                    .layers
+                    .iter_mut()
+                    .zip(meta.window_pattern(n_layer, 0))
+                {
+                    if local {
+                        make_local(layer);
+                    }
+                }
+                // Queries and keys are normalized, so scores need no scale.
+                config
+                    .layers
+                    .iter_mut()
+                    .for_each(|layer| layer.attention_scale = 1.0);
+                // The last layers read the keys and values of the last
+                // layer of their kind that has its own.
+                let shared = meta.usize("attention.shared_kv_layers").unwrap_or(0);
+                let first_shared = n_layer.saturating_sub(shared);
+                if shared > 0 && first_shared < 2 {
+                    return Err(Error::format("too many layers share their keys and values"));
+                }
+                for layer in &mut config.layers[first_shared..] {
+                    let local = layer.window > 0;
+                    layer.kv_source = Some(first_shared - if local { 2 } else { 1 });
+                }
+            }
+            "lfm2" | "lfm3" => {
+                config.conv_kernel = meta.required("shortconv.l_cache")?;
+                for layer in &mut config.layers {
+                    if layer.n_head_kv == 0 {
+                        layer.mixer = Mixer::ShortConv;
+                        layer.n_head = 0;
+                        layer.rope_dims = 0;
+                        layer.rope_factors = false;
+                    }
+                }
+                if arch == "lfm3" {
+                    for (layer, local) in config
+                        .layers
+                        .iter_mut()
+                        .zip(meta.window_pattern(n_layer, 0))
+                    {
+                        if local && layer.mixer == Mixer::Attention {
+                            make_local(layer);
+                        }
+                    }
+                } else if window > 0 {
+                    // LFM2 can window every attention layer.
+                    for layer in &mut config.layers {
+                        if layer.mixer == Mixer::Attention {
+                            layer.window = window;
+                        }
+                    }
                 }
             }
             _ => unreachable!("architecture was checked above"),
         }
+        config.check()?;
         Ok(config)
     }
 
-    /// Width of the query projection: all heads side by side.
-    pub fn q_dim(&self) -> usize {
-        self.n_head * self.head_dim
+    /// Checks the shapes that the forward pass relies on.
+    fn check(&self) -> Result<()> {
+        for (index, layer) in self.layers.iter().enumerate() {
+            if layer.mixer != Mixer::Attention {
+                continue;
+            }
+            if layer.head_dim == 0 || layer.head_dim % 2 != 0 || layer.head_dim > 1 << 14 {
+                return Err(Error::format(format!(
+                    "layer {index}: attention head width {} must be even and non-zero",
+                    layer.head_dim
+                )));
+            }
+            if layer.n_head_kv == 0 || layer.n_head % layer.n_head_kv != 0 {
+                return Err(Error::format(format!(
+                    "layer {index}: {} heads cannot share {} key/value heads",
+                    layer.n_head, layer.n_head_kv
+                )));
+            }
+            if layer.rope_dims > layer.head_dim || layer.rope_dims % 2 != 0 {
+                return Err(Error::format(format!(
+                    "layer {index}: {} rotary elements do not fit a head of {}",
+                    layer.rope_dims, layer.head_dim
+                )));
+            }
+            if let Some(source) = layer.kv_source {
+                let owner = &self.layers[source];
+                let same = owner.owns_kv()
+                    && owner.n_head_kv == layer.n_head_kv
+                    && owner.head_dim == layer.head_dim;
+                if source >= index || !same {
+                    return Err(Error::format(format!(
+                        "layer {index} cannot read the keys and values of layer {source}"
+                    )));
+                }
+            }
+        }
+        if self.conv_kernel == 1 || self.conv_kernel > 64 {
+            return Err(Error::format(format!(
+                "a short convolution of {} positions",
+                self.conv_kernel
+            )));
+        }
+        Ok(())
     }
 
-    /// Width of the key and value projections.
-    pub fn kv_dim(&self) -> usize {
-        self.n_head_kv * self.head_dim
+    /// The widest of each per-layer size, for sizing buffers.
+    pub fn max_q_dim(&self) -> usize {
+        self.layers.iter().map(LayerSpec::q_dim).max().unwrap_or(0)
+    }
+
+    pub fn max_kv_dim(&self) -> usize {
+        self.layers.iter().map(LayerSpec::kv_dim).max().unwrap_or(0)
+    }
+
+    pub fn max_n_ff(&self) -> usize {
+        self.layers
+            .iter()
+            .map(|layer| layer.n_ff)
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub fn max_head_dim(&self) -> usize {
+        self.layers
+            .iter()
+            .map(|layer| layer.head_dim)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The first attention block, which stands for the model in summaries.
+    pub fn attention(&self) -> Option<&LayerSpec> {
+        self.layers
+            .iter()
+            .find(|layer| layer.mixer == Mixer::Attention)
+    }
+
+    /// Number of blocks of each mixer: attention, then convolution.
+    pub fn mixers(&self) -> (usize, usize) {
+        let attention = self
+            .layers
+            .iter()
+            .filter(|layer| layer.mixer == Mixer::Attention)
+            .count();
+        (attention, self.n_layer - attention)
     }
 }
 
-/// Which layers use the sliding window.
-///
-/// The file holds either one flag per layer or a period: in every run of
-/// `period` layers, all but the last are windowed.
-fn sliding_window_layers(file: &Gguf, n_layer: usize, default_period: usize) -> Vec<bool> {
-    let key = "gemma3.attention.sliding_window_pattern";
-    if let Some(flags) = file.get_array(key) {
-        return (0..n_layer)
-            .map(|layer| flags.number(layer).unwrap_or(0.0) != 0.0)
-            .collect();
+/// Reads metadata keys under the architecture's prefix.
+struct Meta<'a> {
+    file: &'a Gguf,
+    arch: &'a str,
+}
+
+impl Meta<'_> {
+    fn key(&self, suffix: &str) -> String {
+        format!("{}.{suffix}", self.arch)
     }
-    let period = file.get_usize(key).unwrap_or(default_period);
-    (0..n_layer)
-        .map(|layer| period == 0 || layer % period < period - 1)
-        .collect()
+
+    fn usize(&self, suffix: &str) -> Option<usize> {
+        self.file.get_usize(&self.key(suffix))
+    }
+
+    fn f32(&self, suffix: &str) -> Option<f32> {
+        self.file.get_f32(&self.key(suffix))
+    }
+
+    fn required(&self, suffix: &str) -> Result<usize> {
+        self.usize(suffix)
+            .filter(|&value| value > 0)
+            .ok_or_else(|| {
+                Error::format(format!("missing or invalid metadata: {}", self.key(suffix)))
+            })
+    }
+
+    /// A number that is either one value for every layer, or an array with
+    /// one value per layer.
+    fn per_layer(&self, suffix: &str, n_layer: usize) -> Result<Vec<usize>> {
+        let key = self.key(suffix);
+        if let Some(array) = self.file.get_array(&key) {
+            if array.len() < n_layer {
+                return Err(Error::format(format!("{key} has fewer values than layers")));
+            }
+            return (0..n_layer)
+                .map(|layer| {
+                    array
+                        .number(layer)
+                        .filter(|value| *value >= 0.0 && *value <= u32::MAX as f64)
+                        .map(|value| value as usize)
+                        .ok_or_else(|| Error::format(format!("{key} holds a bad value")))
+                })
+                .collect();
+        }
+        self.file
+            .get_usize(&key)
+            .map(|value| vec![value; n_layer])
+            .ok_or_else(|| Error::format(format!("missing or invalid metadata: {key}")))
+    }
+
+    /// Which layers use the sliding window. The file holds one flag per
+    /// layer, or a period: in every run of `period` layers, all but the last
+    /// are windowed. `default_period` applies when it holds neither, and
+    /// zero then means no layer is windowed.
+    fn window_pattern(&self, n_layer: usize, default_period: usize) -> Vec<bool> {
+        let key = self.key("attention.sliding_window_pattern");
+        if let Some(flags) = self.file.get_array(&key) {
+            return (0..n_layer)
+                .map(|layer| flags.number(layer).unwrap_or(0.0) != 0.0)
+                .collect();
+        }
+        match self.file.get_usize(&key).unwrap_or(default_period) {
+            0 => vec![false; n_layer],
+            period => (0..n_layer)
+                .map(|layer| layer % period < period - 1)
+                .collect(),
+        }
+    }
+
+    /// The linear position scaling, as a multiplier on rotary angles. Other
+    /// kinds of scaling change the rotary formula, which is not done here.
+    fn rope_scale(&self) -> Result<f32> {
+        match self
+            .file
+            .get_str(&self.key("rope.scaling.type"))
+            .unwrap_or("linear")
+        {
+            "none" | "linear" => {
+                let factor = self
+                    .f32("rope.scaling.factor")
+                    .or_else(|| self.f32("rope.scale_linear"))
+                    .unwrap_or(0.0);
+                Ok(if factor != 0.0 { 1.0 / factor } else { 1.0 })
+            }
+            other => Err(Error::unsupported(format!(
+                "rotary position scaling '{other}'"
+            ))),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -286,16 +548,28 @@ mod tests {
     #[test]
     fn llama_defaults() {
         let c = config(&base("llama")).unwrap();
+        let layer = &c.layers[0];
         assert_eq!(
-            (c.n_embd, c.n_layer, c.n_head, c.n_head_kv, c.head_dim),
+            (
+                c.n_embd,
+                c.n_layer,
+                layer.n_head,
+                layer.n_head_kv,
+                layer.head_dim
+            ),
             (64, 12, 8, 4, 8)
         );
-        assert_eq!((c.q_dim(), c.kv_dim()), (64, 32));
+        assert_eq!((layer.q_dim(), layer.kv_dim()), (64, 32));
         assert_eq!(c.rope, Rope::Pairs);
         assert_eq!(c.activation, Activation::Silu);
-        assert_eq!(c.rope_base, 10000.0);
-        assert!((c.attention_scale - 1.0 / 8f32.sqrt()).abs() < 1e-7);
-        assert!(c.local_layers.iter().all(|local| !local));
+        assert_eq!(layer.rope_base, 10000.0);
+        assert!((layer.attention_scale - 1.0 / 8f32.sqrt()).abs() < 1e-7);
+        assert!(
+            c.layers
+                .iter()
+                .all(|layer| layer.window == 0 && layer.owns_kv())
+        );
+        assert_eq!(c.mixers(), (12, 0));
     }
 
     #[test]
@@ -313,11 +587,59 @@ mod tests {
         let c = config(&builder).unwrap();
         assert_eq!(c.activation, Activation::Gelu);
         assert_eq!(c.embedding_scale, 8.0);
-        assert_eq!(c.sliding_window, 512);
-        assert_eq!((c.rope_base, c.rope_base_local), (1e6, 10000.0));
-        // Every sixth layer sees the whole context.
-        let expected: Vec<bool> = (0..12).map(|layer| layer % 6 != 5).collect();
-        assert_eq!(c.local_layers, expected);
+        // Every sixth layer sees the whole context, with the global base.
+        for (index, layer) in c.layers.iter().enumerate() {
+            let local = index % 6 != 5;
+            assert_eq!(layer.window, if local { 512 } else { 0 });
+            assert_eq!(layer.rope_base, if local { 10000.0 } else { 1e6 });
+        }
+    }
+
+    #[test]
+    fn lfm_models_mix_convolution_and_attention() {
+        let mut builder = Builder::new();
+        builder
+            .string("general.architecture", "lfm2")
+            .u32("lfm2.context_length", 2048)
+            .u32("lfm2.embedding_length", 64)
+            .u32("lfm2.block_count", 4)
+            .u32("lfm2.attention.head_count", 8)
+            .i32s("lfm2.attention.head_count_kv", &[0, 0, 4, 0])
+            .u32("lfm2.shortconv.l_cache", 3);
+        let c = config(&builder).unwrap();
+        let mixers: Vec<Mixer> = c.layers.iter().map(|layer| layer.mixer).collect();
+        use Mixer::*;
+        assert_eq!(mixers, [ShortConv, ShortConv, Attention, ShortConv]);
+        assert_eq!((c.conv_kernel, c.mixers()), (3, (1, 3)));
+    }
+
+    #[test]
+    fn gemma4_layers_differ_by_kind_and_share_caches() {
+        let mut builder = Builder::new();
+        builder
+            .string("general.architecture", "gemma4")
+            .u32("gemma4.context_length", 2048)
+            .u32("gemma4.embedding_length", 64)
+            .u32("gemma4.block_count", 6)
+            .u32("gemma4.attention.head_count", 4)
+            .u32("gemma4.attention.head_count_kv", 1)
+            .u32("gemma4.attention.key_length", 32)
+            .u32("gemma4.attention.key_length_swa", 16)
+            .u32("gemma4.attention.sliding_window", 8)
+            .u32("gemma4.attention.shared_kv_layers", 2)
+            .bools(
+                "gemma4.attention.sliding_window_pattern",
+                &[true, false, true, false, true, false],
+            )
+            .i32s("gemma4.feed_forward_length", &[32, 32, 32, 64, 64, 64]);
+        let c = config(&builder).unwrap();
+        let heads: Vec<usize> = c.layers.iter().map(|layer| layer.head_dim).collect();
+        assert_eq!(heads, [16, 32, 16, 32, 16, 32]);
+        let sources: Vec<Option<usize>> = c.layers.iter().map(|layer| layer.kv_source).collect();
+        // Layers 4 and 5 read layers 2 and 3, the last of their kinds.
+        assert_eq!(sources, [None, None, None, None, Some(2), Some(3)]);
+        assert_eq!(c.layers[5].n_ff, 64);
+        assert!(c.value_norm && c.layers.iter().all(|layer| layer.attention_scale == 1.0));
     }
 
     #[test]
@@ -335,10 +657,6 @@ mod tests {
         let mut builder = base("llama");
         builder.string("llama.rope.scaling.type", "yarn");
         assert!(config(&builder).is_err());
-
-        let mut builder = base("llama");
-        builder.u32("llama.rope.dimension_count", 4);
-        assert!(config(&builder).is_err());
     }
 
     #[test]
@@ -354,12 +672,16 @@ mod tests {
         let mut builder = base("llama");
         builder.u32("llama.attention.key_length", 7);
         assert!(config(&builder).is_err());
+
+        let mut builder = base("llama");
+        builder.u32("llama.rope.dimension_count", 12);
+        assert!(config(&builder).is_err());
     }
 
     #[test]
     fn linear_position_scaling_is_applied() {
         let mut builder = base("llama");
         builder.f32("llama.rope.scaling.factor", 4.0);
-        assert_eq!(config(&builder).unwrap().rope_scale, 0.25);
+        assert_eq!(config(&builder).unwrap().layers[0].rope_scale, 0.25);
     }
 }

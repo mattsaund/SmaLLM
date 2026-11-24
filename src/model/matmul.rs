@@ -33,7 +33,7 @@ use crate::threads::ThreadPool;
 use super::weights::Linear;
 
 /// The most matrices one call can multiply.
-pub(super) const MAX_TARGETS: usize = 3;
+pub(super) const MAX_TARGETS: usize = 4;
 
 /// A chunk of rows should cost at least this many multiply-adds, or handing
 /// it to a thread costs more than computing it.

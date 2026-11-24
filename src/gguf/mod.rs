@@ -736,6 +736,17 @@ pub(crate) mod testing {
             self
         }
 
+        pub fn bools(&mut self, key: &str, values: &[bool]) -> &mut Builder {
+            self.key(key, 9);
+            self.entries.extend_from_slice(&7u32.to_le_bytes());
+            self.entries
+                .extend_from_slice(&(values.len() as u64).to_le_bytes());
+            for value in values {
+                self.entries.push(u8::from(*value));
+            }
+            self
+        }
+
         /// Adds a tensor. `dims` are innermost first, as GGUF stores them.
         pub fn tensor(
             &mut self,
