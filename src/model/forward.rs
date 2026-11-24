@@ -54,7 +54,7 @@ use super::matmul::{ActScratch, Engine, Target};
 use super::recurrent::{self, RecurrentState};
 use super::weights::{
     AttentionWeights, ConvWeights, Dense, Experts, FeedForward, Linear, Matrix, MixerWeights,
-    PerLayerInputs, PerLayerWeights,
+    PerLayerInputs, PerLayerWeights, Plain,
 };
 
 /// Context length used when the caller does not choose one.
@@ -369,6 +369,34 @@ fn rotate(vector: &mut [f32], table: &[f32], rope: Rope) {
 }
 
 /// RMS normalization with a learned gain: `out = x / rms(x) * weight`.
+/// Normalizes `x` into `out`: LayerNorm when there is a bias, RMS norm
+/// otherwise.
+fn norm(
+    kernels: &Kernels,
+    x: &[f32],
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    eps: f32,
+    out: &mut [f32],
+) {
+    match bias {
+        Some(bias) => layer_norm(x, weight, bias, eps, out),
+        None => rms_norm(kernels, x, weight, eps, out),
+    }
+}
+
+/// LayerNorm: `(x - mean) / sqrt(variance + eps) * weight + bias`. The sums
+/// are taken in double precision, as ggml takes them.
+fn layer_norm(x: &[f32], weight: &[f32], bias: &[f32], eps: f32, out: &mut [f32]) {
+    let n = x.len() as f64;
+    let mean = x.iter().map(|&v| v as f64).sum::<f64>() / n;
+    let variance = x.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / n;
+    let scale = 1.0 / (variance + eps as f64).sqrt();
+    for (((out, &v), w), b) in out.iter_mut().zip(x).zip(weight).zip(bias) {
+        *out = ((v as f64 - mean) * scale) as f32 * w + b;
+    }
+}
+
 fn rms_norm(kernels: &Kernels, x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
     let scale = 1.0 / (kernels.sum_squares(x) / x.len() as f32 + eps).sqrt();
     for ((out, value), gain) in out.iter_mut().zip(x).zip(weight) {
@@ -492,6 +520,9 @@ struct Scratch {
     /// The feed-forward gate and up projections.
     gate: Vec<f32>,
     up: Vec<f32>,
+    /// The normalized input of a parallel block, kept for its feed-forward
+    /// network while attention runs. Empty for other models.
+    parallel: Vec<f32>,
     experts: ExpertScratch,
     per_layer: PerLayerScratch,
     acts: ActScratch,
@@ -648,6 +679,11 @@ impl Session {
             conv: conv_scratch,
             gate: vec![0.0; batch * n_ff],
             up: vec![0.0; batch * n_ff],
+            parallel: if c.parallel {
+                vec![0.0; batch * d]
+            } else {
+                Vec::new()
+            },
             experts,
             per_layer,
             acts: ActScratch::default(),
@@ -885,6 +921,7 @@ impl Session {
             conv: conv_scratch,
             gate,
             up,
+            parallel,
             experts,
             per_layer,
             acts,
@@ -952,11 +989,24 @@ impl Session {
             };
 
             // The mixer: attention or a convolution over positions.
+            let attn_norm_bias = layer.attn_norm_bias.as_deref();
             for token in run.inputs.clone() {
                 let row = token * d..(token + 1) * d;
-                rms_norm(kernels, &x[row.clone()], &layer.attn_norm, eps, &mut h[row]);
+                norm(
+                    kernels,
+                    &x[row.clone()],
+                    &layer.attn_norm,
+                    attn_norm_bias,
+                    eps,
+                    &mut h[row],
+                );
             }
             pass.lap(Phase::Norm);
+            // A parallel block's feed-forward network reads the same input.
+            if config.parallel {
+                let rows = run.active.start * d..run.active.end * d;
+                parallel[..rows.len()].copy_from_slice(&h[rows]);
+            }
             match &layer.mixer {
                 MixerWeights::Attention(weights) => pass.attention(&run, weights, h, attention),
                 MixerWeights::ShortConv(weights) => pass.short_conv(&run, weights, h, conv_scratch),
@@ -978,12 +1028,17 @@ impl Session {
             );
 
             // Feed-forward: a gated network, or a mixture of them.
-            for (out, row) in h_active.chunks_exact_mut(d).zip(x_active.chunks_exact(d)) {
-                rms_norm(kernels, row, &layer.ffn_norm, eps, out);
+            if config.parallel {
+                h_active.copy_from_slice(&parallel[..n_active * d]);
+            } else {
+                for (out, row) in h_active.chunks_exact_mut(d).zip(x_active.chunks_exact(d)) {
+                    rms_norm(kernels, row, &layer.ffn_norm, eps, out);
+                }
             }
             pass.lap(Phase::Norm);
             match &layer.ffn {
                 FeedForward::Dense(dense) => pass.dense(dense, spec.n_ff, h_active, gate, up),
+                FeedForward::Plain(plain) => pass.plain(plain, spec.n_ff, h_active, gate, up),
                 FeedForward::Experts(weights) => {
                     pass.experts(weights, spec, h_active, (gate, up), experts)
                 }
@@ -1014,7 +1069,8 @@ impl Session {
         if want_logits {
             let last = &x[(count - 1) * d..count * d];
             let normalized = &mut h[..d];
-            rms_norm(kernels, last, &weights.output_norm, eps, normalized);
+            let bias = weights.output_norm_bias.as_deref();
+            norm(kernels, last, &weights.output_norm, bias, eps, normalized);
             pass.multiply(
                 normalized,
                 d,
@@ -1252,6 +1308,22 @@ impl Pass<'_> {
 
     /// A gated feed-forward network on the rows of `h`, which it replaces
     /// with its output.
+    /// An ungated feed-forward network: `down(act(up(x)))`. The activation
+    /// runs on the gate kernel, against ones.
+    fn plain(&mut self, w: &Plain, n_ff: usize, h: &mut [f32], act: &mut [f32], ones: &mut [f32]) {
+        let d = self.config.n_embd;
+        let rows = h.len() / d;
+        let (act, ones) = (&mut act[..rows * n_ff], &mut ones[..rows * n_ff]);
+        self.multiply(h, d, &mut [Target::new(&w.up, &mut *act)]);
+        self.lap(Phase::FeedForwardUp);
+        ones.fill(1.0);
+        let (kernels, pool) = (self.engine.kernels, self.engine.pool);
+        apply_gate(kernels, pool, self.config.activation, act, ones);
+        self.lap(Phase::Activation);
+        self.multiply(act, n_ff, &mut [Target::new(&w.down, h)]);
+        self.lap(Phase::FeedForwardDown);
+    }
+
     fn dense(&mut self, w: &Dense, n_ff: usize, h: &mut [f32], gate: &mut [f32], up: &mut [f32]) {
         let d = self.config.n_embd;
         let rows = h.len() / d;

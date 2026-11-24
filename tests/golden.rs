@@ -253,8 +253,14 @@ fn phi_4_mini_q4_k_m() {
 }
 
 #[test]
+fn phi_2_q4_k_m() {
+    check("phi-2.Q4_K_M");
+}
+
+#[test]
 fn every_golden_file_has_a_test() {
     let tested = [
+        "phi-2.Q4_K_M",
         "gemma-2-2b-it-Q4_K_M",
         "microsoft_Phi-4-mini-instruct-Q4_K_M",
         "LFM2-8B-A1B-Q4_K_M",

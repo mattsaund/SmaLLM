@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 use crate::gguf::Gguf;
 
 /// Architectures this engine runs, as named in `general.architecture`.
-pub const ARCHITECTURES: [&str; 17] = [
+pub const ARCHITECTURES: [&str; 18] = [
     "llama",
     "qwen2",
     "qwen3",
@@ -29,6 +29,7 @@ pub const ARCHITECTURES: [&str; 17] = [
     "gemma2",
     "phi3",
     "gpt-oss",
+    "phi2",
 ];
 
 /// Which two elements of an attention head a rotary embedding rotates
@@ -211,6 +212,14 @@ pub struct Config {
     pub long_context_after: usize,
     /// YaRN's settings, for models that stretch their positions that way.
     pub yarn: Option<Yarn>,
+    /// LayerNorm with a bias, where most models use RMS norm (Phi-2).
+    pub layer_norm: bool,
+    /// Attention and the feed-forward network read the same normalized
+    /// input, and both add to the hidden state (Phi-2).
+    pub parallel: bool,
+    /// The feed-forward network is `down(act(up(x)))`, without a gate
+    /// (Phi-2).
+    pub ungated: bool,
     /// The expert settings, for models with mixture-of-experts layers.
     pub routing: Option<Routing>,
 }
@@ -326,6 +335,9 @@ impl Config {
             rope_attn_factor: meta.f32("rope.scaling.attn_factor").unwrap_or(1.0),
             long_context_after: 0,
             yarn: meta.yarn(n_ctx_train),
+            layer_norm: false,
+            parallel: false,
+            ungated: false,
             routing,
             arch: arch.clone(),
         };
@@ -414,6 +426,16 @@ impl Config {
                 if let Some(routing) = &mut config.routing {
                     routing.gating = Gating::SoftmaxChosen;
                 }
+            }
+            // Phi-2 (and Phi-1.5) is built like GPT-J: LayerNorm, attention
+            // and an ungated GELU network side by side, part of each head
+            // rotated.
+            "phi2" => {
+                config.layer_norm = true;
+                config.parallel = true;
+                config.ungated = true;
+                config.activation = Activation::Gelu;
+                config.norm_eps = meta.f32("attention.layer_norm_epsilon").unwrap_or(1e-5);
             }
             // Phi-3 rotates halves. Its long-context versions bring two sets
             // of rotary divisors, chosen by the length of the session.

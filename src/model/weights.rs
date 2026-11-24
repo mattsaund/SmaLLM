@@ -145,18 +145,28 @@ pub struct Experts {
     pub shared: Option<(Dense, Option<Linear>)>,
 }
 
+/// An ungated feed-forward network: `down(act(up(x)))`.
+pub struct Plain {
+    pub up: Linear,
+    pub down: Linear,
+}
+
 /// The feed-forward part of a block.
 pub enum FeedForward {
     Dense(Box<Dense>),
     Experts(Box<Experts>),
+    Plain(Box<Plain>),
 }
 
 /// The weights of one block.
 pub struct Layer {
     pub attn_norm: Vec<f32>,
+    /// The bias of a LayerNorm (Phi-2).
+    pub attn_norm_bias: Option<Vec<f32>>,
     pub mixer: MixerWeights,
     /// Normalization of the mixer's output, when the model has it.
     pub attn_post_norm: Option<Vec<f32>>,
+    /// Empty when attention and the feed-forward network share one norm.
     pub ffn_norm: Vec<f32>,
     pub ffn: FeedForward,
     /// Normalization of the feed-forward output, when the model has it.
@@ -184,6 +194,8 @@ pub struct Weights {
     /// model ties them.
     pub output: Linear,
     pub output_norm: Vec<f32>,
+    /// The bias of a final LayerNorm (Phi-2).
+    pub output_norm_bias: Option<Vec<f32>>,
     /// Per-frequency divisors for rotary angles, when the model has them.
     pub rope_factors: Option<Vec<f32>>,
     /// The divisors a LongRoPE model uses past its original context. Its
@@ -214,6 +226,11 @@ impl Weights {
         let output_norm = match file.tensor("output_norm.weight") {
             Some(_) => vector(file, "output_norm.weight", d)?,
             None => vector(file, "token_embd_norm.weight", d)?,
+        };
+        let output_norm_bias = if config.layer_norm {
+            Some(vector(file, "output_norm.bias", d)?)
+        } else {
+            None
         };
         // One table of rotary divisors serves every layer that uses one, so
         // those layers must rotate the same number of elements.
@@ -371,7 +388,14 @@ impl Weights {
                                 ))
                             })?;
                     }
-                    FeedForward::Dense(Box::new(dense(file, &name("ffn"), "", d, spec.n_ff)?))
+                    if config.ungated {
+                        FeedForward::Plain(Box::new(Plain {
+                            up: layer_whole("ffn_up", spec.n_ff, d)?,
+                            down: layer_whole("ffn_down", d, spec.n_ff)?,
+                        }))
+                    } else {
+                        FeedForward::Dense(Box::new(dense(file, &name("ffn"), "", d, spec.n_ff)?))
+                    }
                 }
             };
 
@@ -389,6 +413,8 @@ impl Weights {
             // which elsewhere normalizes the attention output.
             let (attn_post_norm, ffn_norm) = if config.arch == "gpt-oss" {
                 (None, vector(file, &name("post_attention_norm.weight"), d)?)
+            } else if config.parallel {
+                (None, Vec::new())
             } else {
                 (
                     optional_vector(file, &name("post_attention_norm.weight"), d)?,
@@ -397,6 +423,11 @@ impl Weights {
             };
             layers.push(Layer {
                 attn_norm: vector(file, &name("attn_norm.weight"), d)?,
+                attn_norm_bias: if config.layer_norm {
+                    Some(vector(file, &name("attn_norm.bias"), d)?)
+                } else {
+                    None
+                },
                 mixer,
                 attn_post_norm,
                 ffn_norm,
@@ -411,6 +442,7 @@ impl Weights {
             token_embd,
             output,
             output_norm,
+            output_norm_bias,
             rope_factors,
             rope_factors_long,
             layers,
@@ -432,6 +464,7 @@ impl Weights {
                 bias: None,
             },
             output_norm: Vec::new(),
+            output_norm_bias: None,
             rope_factors: None,
             rope_factors_long: None,
             layers: Vec::new(),

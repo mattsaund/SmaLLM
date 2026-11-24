@@ -13,7 +13,7 @@ use crate::kernels::{self, Kernels};
 use crate::tensor::TensorType;
 use crate::testing::TinyModel;
 
-const ARCHS: [&str; 17] = [
+const ARCHS: [&str; 18] = [
     "llama",
     "qwen2",
     "qwen3",
@@ -31,6 +31,7 @@ const ARCHS: [&str; 17] = [
     "gemma2",
     "phi3",
     "gpt-oss",
+    "phi2",
 ];
 
 const QUANT_TYPES: [TensorType; 11] = [
@@ -139,6 +140,22 @@ mod oracle {
         x.iter()
             .enumerate()
             .map(|(i, v)| v * scale * weight.map_or(1.0, |w| w[i] as f64))
+            .collect()
+    }
+
+    /// LayerNorm when there is a bias, RMS norm otherwise.
+    fn norm(x: &[f64], weight: &[f32], bias: Option<&[f32]>, eps: f32) -> Vec<f64> {
+        let Some(bias) = bias else {
+            return rms_norm(x, Some(weight), eps);
+        };
+        let n = x.len() as f64;
+        let mean = x.iter().sum::<f64>() / n;
+        let variance = x.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n;
+        x.iter()
+            .enumerate()
+            .map(|(i, v)| {
+                (v - mean) / (variance + eps as f64).sqrt() * weight[i] as f64 + bias[i] as f64
+            })
             .collect()
     }
 
@@ -509,7 +526,7 @@ mod oracle {
         for (index, layer) in w.layers.iter().enumerate() {
             let inputs: Vec<Vec<f64>> = x
                 .iter()
-                .map(|row| rms_norm(row, Some(&layer.attn_norm), eps))
+                .map(|row| norm(row, &layer.attn_norm, layer.attn_norm_bias.as_deref(), eps))
                 .collect();
             let updates = match &layer.mixer {
                 MixerWeights::Attention(a) => attention(model, index, a, &inputs, &mut caches),
@@ -524,10 +541,22 @@ mod oracle {
                     .for_each(|v| *v *= c.residual_scale as f64);
                 add(&mut x[position], &update);
 
-                let h = rms_norm(&x[position], Some(&layer.ffn_norm), eps);
+                // A parallel block's network reads the block's input.
+                let h = if c.parallel {
+                    inputs[position].clone()
+                } else {
+                    rms_norm(&x[position], Some(&layer.ffn_norm), eps)
+                };
                 let mut update = match &layer.ffn {
                     FeedForward::Dense(dense) => feed_forward(model, dense, &h),
                     FeedForward::Experts(experts) => mixture(model, experts, &h),
+                    FeedForward::Plain(plain) => {
+                        let up: Vec<f64> = apply(model, &plain.up, &h)
+                            .iter()
+                            .map(|&u| activate(u, 1.0, c.activation))
+                            .collect();
+                        apply(model, &plain.down, &up)
+                    }
                 };
                 if let Some(weight) = &layer.ffn_post_norm {
                     update = rms_norm(&update, Some(weight), eps);
@@ -557,9 +586,10 @@ mod oracle {
             }
         }
 
-        let last = rms_norm(
+        let last = norm(
             x.last().expect("at least one token"),
-            Some(&w.output_norm),
+            &w.output_norm,
+            w.output_norm_bias.as_deref(),
             eps,
         );
         let mut logits = apply(model, &w.output, &last);

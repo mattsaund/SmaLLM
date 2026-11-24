@@ -161,6 +161,9 @@ pub(crate) struct TinyModel {
     /// gpt-oss: attention sinks, an output bias, biases on the router and
     /// on every expert, and the feed-forward norm under another name.
     pub gpt_oss: bool,
+    /// Phi-2: LayerNorm with biases, attention and an ungated network side
+    /// by side, biases on every projection and on the output.
+    pub phi2: bool,
     pub seed: u64,
 }
 
@@ -183,7 +186,7 @@ impl TinyModel {
                 "qwen3" | "qwen3moe" | "gemma3" | "gemma4" | "lfm2" | "lfm2moe" | "lfm3" | "olmoe"
             ),
             post_norm: matches!(arch, "gemma2" | "gemma3" | "gemma4" | "lfm3"),
-            bias: matches!(arch, "qwen2" | "qwen2moe" | "gpt-oss"),
+            bias: matches!(arch, "qwen2" | "qwen2moe" | "gpt-oss" | "phi2"),
             fused: false,
             window: 0,
             rope_factors: false,
@@ -208,6 +211,7 @@ impl TinyModel {
             longrope: arch == "phi3",
             yarn: matches!(arch, "qwen3" | "gpt-oss"),
             gpt_oss: arch == "gpt-oss",
+            phi2: arch == "phi2",
             seed: 1,
         };
         if matches!(
@@ -233,6 +237,8 @@ impl TinyModel {
             // Phi-3 stores query, key and value together, and the gate
             // with `up`.
             "phi3" => model.fused = true,
+            // Phi-2 rotates part of each head.
+            "phi2" => model.rope_dims = model.head_dim() / 2,
             // Every other layer of Gemma 2 and gpt-oss is windowed.
             "gemma2" | "gpt-oss" => {
                 model.n_layer = 4;
@@ -329,6 +335,7 @@ impl TinyModel {
             .u32(&format!("{arch}.block_count"), self.n_layer as u32)
             .u32(&format!("{arch}.attention.head_count"), self.n_head as u32)
             .f32(&format!("{arch}.attention.layer_norm_rms_epsilon"), 1e-5)
+            .f32(&format!("{arch}.attention.layer_norm_epsilon"), 1e-5)
             .f32(&format!("{arch}.rope.freq_base"), 10000.0);
         let layers = 0..self.n_layer;
         if self.wide_late_ff {
@@ -601,6 +608,15 @@ impl TinyModel {
                         weight_scale,
                     );
                 }
+            } else if self.phi2 {
+                matrix(&mut builder, &name("ffn_up.weight"), n_ff, d, weight_scale);
+                matrix(
+                    &mut builder,
+                    &name("ffn_down.weight"),
+                    d,
+                    n_ff,
+                    weight_scale,
+                );
             } else if self.fused {
                 matrix(
                     &mut builder,
@@ -652,6 +668,10 @@ impl TinyModel {
             "output_norm.weight"
         };
         vector(&mut builder, output_norm, d, 0.5, 1.5);
+        if self.phi2 {
+            vector(&mut builder, "output_norm.bias", d, -0.2, 0.2);
+            vector(&mut builder, "output.bias", self.n_vocab, -0.2, 0.2);
+        }
         if self.rope_factors {
             // Divisors for the full-attention layers' rotation.
             let full = (0..self.n_layer)
@@ -687,13 +707,23 @@ impl TinyModel {
             let head_dim = self.layer_head_dim(layer);
             let (q_dim, kv_dim) = (self.n_head * head_dim, self.n_head_kv * head_dim);
             vector(&mut builder, &name("attn_norm.weight"), d, 0.5, 1.5);
-            // gpt-oss calls its feed-forward norm the post-attention norm.
-            let ffn_norm = if self.gpt_oss {
-                "post_attention_norm.weight"
+            if self.phi2 {
+                // One LayerNorm, before attention and the network both.
+                let n_ff = self.layer_n_ff(layer);
+                vector(&mut builder, &name("attn_norm.bias"), d, -0.2, 0.2);
+                vector(&mut builder, &name("attn_output.bias"), d, -0.2, 0.2);
+                vector(&mut builder, &name("ffn_up.bias"), n_ff, -0.2, 0.2);
+                vector(&mut builder, &name("ffn_down.bias"), d, -0.2, 0.2);
             } else {
-                "ffn_norm.weight"
-            };
-            vector(&mut builder, &name(ffn_norm), d, 0.5, 1.5);
+                // gpt-oss calls its feed-forward norm the post-attention
+                // norm.
+                let ffn_norm = if self.gpt_oss {
+                    "post_attention_norm.weight"
+                } else {
+                    "ffn_norm.weight"
+                };
+                vector(&mut builder, &name(ffn_norm), d, 0.5, 1.5);
+            }
             if self.gpt_oss {
                 let n_ff = self.layer_n_ff(layer);
                 vector(
