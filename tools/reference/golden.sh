@@ -52,4 +52,7 @@ LFM2-8B-A1B-Q4_K_M.gguf                    chatml.txt  32
 granite-3.1-1b-a400m-instruct-Q4_K_M.gguf  granite.txt 32
 gemma-2-2b-it-Q4_K_M.gguf                  gemma.txt   32
 microsoft_Phi-4-mini-instruct-Q4_K_M.gguf  phi4-mini.txt 32
+DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf deepseek2.txt 32
+Moonlight-16B-A3B-Instruct-Q4_K_M.gguf     kimi.txt    32
+deepseek-moe-16b-chat.Q4_K_M.gguf          deepseek2.txt 32
 TABLE

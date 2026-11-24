@@ -78,10 +78,21 @@ pub fn main(raw: impl Iterator<Item = String>) -> Result<(), String> {
         let heads = spread(attention.iter().map(|layer| layer.n_head));
         let widths = spread(attention.iter().map(|layer| layer.head_dim));
         let kv_heads = spread(attention.iter().map(|layer| layer.n_head_kv));
-        row(
-            "attention",
-            format!("{heads} heads of {widths}, {kv_heads} key/value heads"),
-        );
+        let shape = match &config.mla {
+            // Latent attention caches a latent and one rotary key per
+            // position, which every head's key and value come from.
+            Some(mla) => {
+                let rotary = spread(attention.iter().map(|layer| layer.rope_dims));
+                format!(
+                    "{heads} heads, keys of {} and values of {}, from a latent of {} and a rotary key of {rotary}",
+                    mla.nope_dims + attention[0].rope_dims,
+                    mla.value_dims,
+                    mla.kv_rank
+                )
+            }
+            None => format!("{heads} heads of {widths}, {kv_heads} key/value heads"),
+        };
+        row("attention", shape);
     }
     let (n_attention, n_conv) = config.mixers();
     if n_conv > 0 {

@@ -292,6 +292,7 @@ impl Encoder {
             long_context_after: 0,
             yarn: None,
             routing: None,
+            mla: None,
         };
         Ok((config, encoder))
     }

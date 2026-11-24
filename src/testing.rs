@@ -82,6 +82,19 @@ pub(crate) fn random_weights(rng: &mut Rng, ty: TensorType, n: usize, magnitude:
     }
 }
 
+/// The type a matrix of `ty` is stored in when its rows are `cols` long:
+/// `ty` when they divide into its blocks, otherwise Q8_0, or f32 when they
+/// do not divide into Q8_0's blocks either. Quantizers do the same.
+pub(crate) fn fitting(ty: TensorType, cols: usize) -> TensorType {
+    if cols % ty.block_len() == 0 {
+        ty
+    } else if cols % TensorType::Q8_0.block_len() == 0 {
+        TensorType::Q8_0
+    } else {
+        TensorType::F32
+    }
+}
+
 /// The GGUF type id of a tensor type.
 pub(crate) fn type_id(ty: TensorType) -> u32 {
     (0..64)
@@ -144,8 +157,10 @@ pub(crate) struct TinyModel {
     pub gating: u32,
     /// A bias on the router scores, used only to choose (LFM2 MoE).
     pub choice_bias: bool,
-    /// A gated expert that every token goes through (Qwen2 MoE).
+    /// An expert that every token goes through (Qwen2 MoE, DeepSeek).
     pub shared_expert: bool,
+    /// Gates the shared expert's output (Qwen2 MoE).
+    pub shared_gate: bool,
     /// Stores each expert's gate and up projections as one tensor.
     pub fused_experts: bool,
     /// Query and key norms as wide as all heads together (OLMoE).
@@ -158,6 +173,29 @@ pub(crate) struct TinyModel {
     /// YaRN position scaling, with a short original context so that its
     /// ramp falls inside the small heads.
     pub yarn: bool,
+    /// Groups of experts for group-limited routing (DeepSeek V3). Zero for
+    /// none.
+    pub expert_groups: usize,
+    /// Groups a token's experts may come from.
+    pub groups_used: usize,
+    /// The router's multiplier on expert weights. One for none.
+    pub expert_scale: f32,
+    /// Overrides the architecture's default for normalizing expert
+    /// weights.
+    pub expert_norm: Option<bool>,
+    /// Width of the latent of latent attention (DeepSeek V2), which then
+    /// replaces attention. Zero for ordinary attention.
+    pub kv_rank: usize,
+    /// Width of the compressed query of latent attention. Zero for queries
+    /// projected from the hidden state directly.
+    pub q_rank: usize,
+    /// Widths of the unrotated part of a query or key head, and of a value
+    /// head, in latent attention. The rotary part is `rope_dims` wide.
+    pub nope_dims: usize,
+    pub value_dims: usize,
+    /// Stores the latent's up-projection as two tensors, the key half
+    /// transposed, as newer files do. Older files store one.
+    pub split_kv_b: bool,
     pub seed: u64,
 }
 
@@ -199,11 +237,21 @@ impl TinyModel {
             gating: 1,
             choice_bias: false,
             shared_expert: false,
+            shared_gate: true,
             fused_experts: false,
             wide_qk_norm: arch == "olmoe",
             granite_scales: matches!(arch, "granite" | "granitemoe"),
             longrope: arch == "phi3",
-            yarn: arch == "qwen3",
+            yarn: matches!(arch, "qwen3" | "deepseek2"),
+            expert_groups: 0,
+            groups_used: 0,
+            expert_scale: 1.0,
+            expert_norm: None,
+            kv_rank: 0,
+            q_rank: 0,
+            nope_dims: 0,
+            value_dims: 0,
+            split_kv_b: false,
             seed: 1,
         };
         if matches!(
@@ -226,6 +274,34 @@ impl TinyModel {
                 model.choice_bias = true;
             }
             "qwen2moe" => model.shared_expert = true,
+            // DeepSeek-MoE: a dense first layer, then experts with an
+            // ungated shared expert.
+            "deepseek" => {
+                model.n_layer = 3;
+                model.experts = 8;
+                model.experts_used = 3;
+                model.dense_lead = 1;
+                model.shared_expert = true;
+                model.shared_gate = false;
+                model.expert_scale = 1.5;
+            }
+            // DeepSeek V2: the same around latent attention, with keys and
+            // queries half rotary, and values as wide as keys. Variants add
+            // the compressed query, the split up-projection and V3's
+            // routing.
+            "deepseek2" => {
+                let head_dim = model.head_dim();
+                model.n_layer = 3;
+                model.experts = 8;
+                model.experts_used = 3;
+                model.dense_lead = 1;
+                model.shared_expert = true;
+                model.shared_gate = false;
+                model.kv_rank = width;
+                model.nope_dims = head_dim;
+                model.rope_dims = head_dim / 2;
+                model.value_dims = head_dim;
+            }
             // Phi-3 stores query, key and value together, and the gate
             // with `up`.
             "phi3" => model.fused = true,
@@ -410,7 +486,62 @@ impl TinyModel {
                 .u32(
                     &format!("{arch}.expert_feed_forward_length"),
                     self.n_ff as u32,
+                )
+                .u32(
+                    &format!("{arch}.leading_dense_block_count"),
+                    self.dense_lead as u32,
                 );
+            if self.expert_groups > 0 {
+                builder
+                    .u32(
+                        &format!("{arch}.expert_group_count"),
+                        self.expert_groups as u32,
+                    )
+                    .u32(
+                        &format!("{arch}.expert_group_used_count"),
+                        self.groups_used as u32,
+                    );
+            }
+            if self.expert_scale != 1.0 {
+                builder.f32(&format!("{arch}.expert_weights_scale"), self.expert_scale);
+            }
+            if let Some(normalize) = self.expert_norm {
+                builder.bool(&format!("{arch}.expert_weights_norm"), normalize);
+            }
+            if self.shared_expert {
+                builder.u32(&format!("{arch}.expert_shared_count"), 1);
+            }
+        }
+        if self.kv_rank > 0 {
+            // Newer files give the cache's widths as the key and value
+            // lengths, and the heads' widths under their own names.
+            let (rank, key) = (
+                self.kv_rank as u32,
+                (self.nope_dims + self.rope_dims) as u32,
+            );
+            builder
+                .u32(&format!("{arch}.attention.kv_lora_rank"), rank)
+                .u32(&format!("{arch}.attention.q_lora_rank"), self.q_rank as u32);
+            if self.split_kv_b {
+                builder
+                    .u32(
+                        &format!("{arch}.attention.key_length"),
+                        rank + self.rope_dims as u32,
+                    )
+                    .u32(&format!("{arch}.attention.value_length"), rank)
+                    .u32(&format!("{arch}.attention.key_length_mla"), key)
+                    .u32(
+                        &format!("{arch}.attention.value_length_mla"),
+                        self.value_dims as u32,
+                    );
+            } else {
+                builder
+                    .u32(&format!("{arch}.attention.key_length"), key)
+                    .u32(
+                        &format!("{arch}.attention.value_length"),
+                        self.value_dims as u32,
+                    );
+            }
         }
         if arch == "gemma2" {
             // Small caps, so that they matter for random weights.
@@ -428,6 +559,10 @@ impl TinyModel {
                 .string(&format!("{arch}.rope.scaling.type"), "yarn")
                 .f32(&format!("{arch}.rope.scaling.factor"), 4.0)
                 .u32(&format!("{arch}.rope.scaling.original_context_length"), 64);
+            if arch == "deepseek2" {
+                // As DeepSeek V2 files store it: a tenth of `mscale_all_dim`.
+                builder.f32(&format!("{arch}.rope.scaling.yarn_log_multiplier"), 0.0707);
+            }
         }
         if self.granite_scales {
             builder
@@ -459,8 +594,9 @@ impl TinyModel {
         let id = type_id(self.ty);
         let mut matrix =
             |builder: &mut Builder, name: &str, rows: usize, cols: usize, magnitude: f32| {
-                let data = random_weights(&mut rng, self.ty, rows * cols, magnitude);
-                builder.tensor(name, &[cols as u64, rows as u64], id, data);
+                let ty = fitting(self.ty, cols);
+                let data = random_weights(&mut rng, ty, rows * cols, magnitude);
+                builder.tensor(name, &[cols as u64, rows as u64], type_id(ty), data);
             };
         let weight_scale = 1.5 / (d as f32).sqrt();
         matrix(&mut builder, "token_embd.weight", self.n_vocab, d, 1.0);
@@ -502,6 +638,68 @@ impl TinyModel {
                     d,
                     weight_scale,
                 );
+            } else if self.kv_rank > 0 {
+                let (rank, rope) = (self.kv_rank, self.rope_dims);
+                let (nope, value) = (self.nope_dims, self.value_dims);
+                let q_width = self.n_head * (nope + rope);
+                if self.q_rank > 0 {
+                    let q_scale = 1.5 / (self.q_rank as f32).sqrt();
+                    let q_rank = self.q_rank;
+                    matrix(
+                        &mut builder,
+                        &name("attn_q_a.weight"),
+                        q_rank,
+                        d,
+                        weight_scale,
+                    );
+                    matrix(
+                        &mut builder,
+                        &name("attn_q_b.weight"),
+                        q_width,
+                        q_rank,
+                        q_scale,
+                    );
+                } else {
+                    matrix(
+                        &mut builder,
+                        &name("attn_q.weight"),
+                        q_width,
+                        d,
+                        weight_scale,
+                    );
+                }
+                matrix(
+                    &mut builder,
+                    &name("attn_kv_a_mqa.weight"),
+                    rank + rope,
+                    d,
+                    weight_scale,
+                );
+                let latent_scale = 1.5 / (rank as f32).sqrt();
+                if self.split_kv_b {
+                    // One matrix per head, stacked like the experts'.
+                    let mut head_rng = Rng(self.seed ^ (0xa0 + layer as u64));
+                    let n_head = self.n_head;
+                    let mut per_head = |builder: &mut Builder, part: &str, rows, cols| {
+                        let ty = fitting(self.ty, cols);
+                        let n = n_head * rows * cols;
+                        let data = random_weights(&mut head_rng, ty, n, latent_scale);
+                        let dims = [cols as u64, rows as u64, n_head as u64];
+                        builder.tensor(&name(part), &dims, type_id(ty), data);
+                    };
+                    per_head(&mut builder, "attn_k_b.weight", rank, nope);
+                    per_head(&mut builder, "attn_v_b.weight", value, rank);
+                } else {
+                    // Each head's key rows, then its value rows.
+                    let rows = self.n_head * (nope + value);
+                    matrix(
+                        &mut builder,
+                        &name("attn_kv_b.weight"),
+                        rows,
+                        rank,
+                        latent_scale,
+                    );
+                }
             } else if self.fused {
                 matrix(
                     &mut builder,
@@ -532,11 +730,17 @@ impl TinyModel {
                 }
             }
             if !self.is_conv(layer) {
+                // Latent attention's output reads its value heads.
+                let out_cols = if self.kv_rank > 0 {
+                    self.n_head * self.value_dims
+                } else {
+                    q_dim
+                };
                 matrix(
                     &mut builder,
                     &name("attn_output.weight"),
                     d,
-                    q_dim,
+                    out_cols,
                     weight_scale,
                 );
                 if self.head_gate {
@@ -710,13 +914,31 @@ impl TinyModel {
                         0.5,
                     );
                 }
-                if self.shared_expert {
+                if self.shared_expert && self.shared_gate {
                     vector(
                         &mut builder,
                         &name("ffn_gate_inp_shexp.weight"),
                         d,
                         -0.2,
                         0.2,
+                    );
+                }
+            }
+            if self.kv_rank > 0 {
+                vector(
+                    &mut builder,
+                    &name("attn_kv_a_norm.weight"),
+                    self.kv_rank,
+                    0.5,
+                    1.5,
+                );
+                if self.q_rank > 0 {
+                    vector(
+                        &mut builder,
+                        &name("attn_q_a_norm.weight"),
+                        self.q_rank,
+                        0.5,
+                        1.5,
                     );
                 }
             }

@@ -12,8 +12,9 @@ use crate::error::Error;
 use crate::kernels::{self, Kernels};
 use crate::tensor::TensorType;
 use crate::testing::TinyModel;
+use kv::CHUNK_POSITIONS;
 
-const ARCHS: [&str; 16] = [
+const ARCHS: [&str; 18] = [
     "llama",
     "qwen2",
     "qwen3",
@@ -30,6 +31,8 @@ const ARCHS: [&str; 16] = [
     "smollm3",
     "gemma2",
     "phi3",
+    "deepseek",
+    "deepseek2",
 ];
 
 const QUANT_TYPES: [TensorType; 11] = [
@@ -243,7 +246,25 @@ mod oracle {
             Gating::SoftmaxChosen => scores.clone(),
         };
         let key = |e: usize| probs[e] + w.choice_bias.as_ref().map_or(0.0, |b| b[e] as f64);
-        let mut order: Vec<usize> = (0..routing.count).collect();
+        // Group-limited routing: groups are ranked by the sum of their two
+        // best keys, and experts come from the best groups only.
+        let mut allowed = vec![true; routing.count];
+        if routing.groups > 1 {
+            let size = routing.count / routing.groups;
+            let mut ratings: Vec<(usize, f64)> = (0..routing.groups)
+                .map(|group| {
+                    let mut keys: Vec<f64> = (group * size..(group + 1) * size).map(key).collect();
+                    keys.sort_by(|a, b| b.total_cmp(a));
+                    (group, keys.iter().take(2).sum())
+                })
+                .collect();
+            ratings.sort_by(|a, b| b.1.total_cmp(&a.1));
+            allowed.fill(false);
+            for &(group, _) in &ratings[..routing.groups_used] {
+                allowed[group * size..(group + 1) * size].fill(true);
+            }
+        }
+        let mut order: Vec<usize> = (0..routing.count).filter(|&e| allowed[e]).collect();
         order.sort_by(|&a, &b| key(b).total_cmp(&key(a)));
         let chosen = &order[..routing.used];
         let mut weights: Vec<f64> = chosen.iter().map(|&e| probs[e]).collect();
@@ -384,6 +405,133 @@ mod oracle {
             .collect()
     }
 
+    /// A matrix of the file as `rows` vectors of `cols`, applied to `x`.
+    fn product(matrix: &[f64], rows: usize, cols: usize, x: &[f64]) -> Vec<f64> {
+        assert_eq!(matrix.len(), rows * cols);
+        matrix
+            .chunks_exact(cols)
+            .map(|row| row.iter().zip(x).map(|(w, v)| w * v).sum())
+            .collect()
+    }
+
+    /// Latent attention over every position of a layer, from scratch and
+    /// the way the paper writes it: each head rebuilds its keys and values
+    /// from the latent, and the queries stay as projected. The engine does
+    /// the opposite. Tensors are read by name, with the file's own layout.
+    fn latent_attention(model: &Model, index: usize, inputs: &[Vec<f64>]) -> Vec<Vec<f64>> {
+        let (c, file) = (model.config(), model.gguf());
+        let spec = &c.layers[index];
+        let (d, eps, n_head) = (c.n_embd, c.norm_eps, spec.n_head);
+        let meta = |key: &str| file.get_usize(&format!("{}.{key}", c.arch)).unwrap();
+        let name = |part: &str| format!("blk.{index}.{part}");
+        let has = |part: &str| file.tensor(&name(part)).is_some();
+        let weights = |part: &str| tensor(model, &name(part));
+        let gains = |part: &str| -> Vec<f32> { weights(part).iter().map(|v| *v as f32).collect() };
+
+        let (rank, rope) = (meta("attention.kv_lora_rank"), meta("rope.dimension_count"));
+        let (key, value) = if has("attn_k_b.weight") {
+            (
+                meta("attention.key_length_mla"),
+                meta("attention.value_length_mla"),
+            )
+        } else {
+            (meta("attention.key_length"), meta("attention.value_length"))
+        };
+        let nope = key - rope;
+        // Each head's key half `uk[h]` (nope rows of rank) and value half
+        // `uv[h]` (value rows of rank). Newer files store the key half
+        // transposed and the halves apart. Older ones stack each head's
+        // key rows and value rows in one matrix.
+        let mut uk = vec![vec![0.0; nope * rank]; n_head];
+        let mut uv = vec![vec![0.0; value * rank]; n_head];
+        if has("attn_k_b.weight") {
+            let (k_b, v_b) = (weights("attn_k_b.weight"), weights("attn_v_b.weight"));
+            for h in 0..n_head {
+                for r in 0..rank {
+                    for j in 0..nope {
+                        uk[h][j * rank + r] = k_b[(h * rank + r) * nope + j];
+                    }
+                }
+                uv[h].copy_from_slice(&v_b[h * value * rank..(h + 1) * value * rank]);
+            }
+        } else {
+            let kv_b = weights("attn_kv_b.weight");
+            for h in 0..n_head {
+                let first = h * (nope + value) * rank;
+                uk[h].copy_from_slice(&kv_b[first..first + nope * rank]);
+                uv[h].copy_from_slice(&kv_b[first + nope * rank..first + (nope + value) * rank]);
+            }
+        }
+
+        // Every position's keys and values, head by head.
+        let kv_a = weights("attn_kv_a_mqa.weight");
+        let latent_gain = gains("attn_kv_a_norm.weight");
+        let mut keys = Vec::new();
+        let mut values = Vec::new();
+        for (position, h) in inputs.iter().enumerate() {
+            let projected = product(&kv_a, rank + rope, d, h);
+            let latent = rms_norm(&projected[..rank], Some(&latent_gain), eps);
+            let mut shared = projected[rank..].to_vec();
+            rotate(&mut shared, position, spec, c, None);
+            let mut position_keys = Vec::new();
+            let mut position_values = Vec::new();
+            for h in 0..n_head {
+                let mut head_key = product(&uk[h], nope, rank, &latent);
+                head_key.extend(&shared);
+                position_keys.push(head_key);
+                position_values.push(product(&uv[h], value, rank, &latent));
+            }
+            keys.push(position_keys);
+            values.push(position_values);
+        }
+
+        let out = weights("attn_output.weight");
+        inputs
+            .iter()
+            .enumerate()
+            .map(|(position, h)| {
+                let q = if has("attn_q_a.weight") {
+                    let q_a = weights("attn_q_a.weight");
+                    let q_rank = q_a.len() / d;
+                    let compressed = product(&q_a, q_rank, d, h);
+                    let compressed =
+                        rms_norm(&compressed, Some(&gains("attn_q_a_norm.weight")), eps);
+                    product(
+                        &weights("attn_q_b.weight"),
+                        n_head * key,
+                        q_rank,
+                        &compressed,
+                    )
+                } else {
+                    product(&weights("attn_q.weight"), n_head * key, d, h)
+                };
+                let mut attended = Vec::new();
+                for (head, query) in q.chunks_exact(key).enumerate() {
+                    let mut query = query.to_vec();
+                    rotate(&mut query[nope..], position, spec, c, None);
+                    let scores: Vec<f64> = (0..=position)
+                        .map(|j| {
+                            let dot: f64 =
+                                query.iter().zip(&keys[j][head]).map(|(a, b)| a * b).sum();
+                            dot * spec.attention_scale as f64
+                        })
+                        .collect();
+                    let max = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    let total: f64 = scores.iter().map(|s| (s - max).exp()).sum();
+                    let mut mixed = vec![0.0; value];
+                    for (j, score) in scores.iter().enumerate() {
+                        let weight = (score - max).exp() / total;
+                        for (out, v) in mixed.iter_mut().zip(&values[j][head]) {
+                            *out += weight * v;
+                        }
+                    }
+                    attended.extend(mixed);
+                }
+                product(&out, d, n_head * value, &attended)
+            })
+            .collect()
+    }
+
     /// A short convolution over every position of a layer, from scratch.
     /// The kernel is read as the file stores it, channel by channel.
     fn short_conv(
@@ -478,6 +626,7 @@ mod oracle {
             let updates = match &layer.mixer {
                 MixerWeights::Attention(a) => attention(model, index, a, &inputs, &mut caches),
                 MixerWeights::ShortConv(cw) => short_conv(model, index, cw, &inputs),
+                MixerWeights::Mla(_) => latent_attention(model, index, &inputs),
             };
             for (position, mut update) in updates.into_iter().enumerate() {
                 if let Some(weight) = &layer.attn_post_norm {
@@ -540,6 +689,35 @@ mod oracle {
     }
 }
 
+/// DeepSeek V2 models beyond the default one, which stores its latent's
+/// up-projection as one tensor, as older files do:
+///
+/// - the up-projection in two tensors, as newer files store it, with values
+///   wider than the unrotated part of the keys;
+/// - DeepSeek V3: compressed queries, and experts chosen by sigmoid scores
+///   with a bias, from the best groups only, with normalized and scaled
+///   weights;
+/// - no YaRN, with the older up-projection and compressed queries.
+fn deepseek2_variants(ty: TensorType) -> Vec<TinyModel> {
+    let base = TinyModel::new("deepseek2", ty);
+    let mut split = base.clone();
+    split.split_kv_b = true;
+    split.value_dims = 2 * base.nope_dims;
+    let mut v3 = base.clone();
+    v3.split_kv_b = true;
+    v3.q_rank = base.n_embd;
+    v3.gating = 2;
+    v3.choice_bias = true;
+    v3.expert_groups = 4;
+    v3.groups_used = 2;
+    v3.expert_norm = Some(true);
+    v3.expert_scale = 2.5;
+    let mut plain = base.clone();
+    plain.yarn = false;
+    plain.q_rank = base.n_embd;
+    vec![split, v3, plain]
+}
+
 #[test]
 fn float_models_match_the_oracle() {
     for arch in ARCHS {
@@ -582,6 +760,9 @@ fn float_models_match_the_oracle() {
             windowed.window = 3;
             windowed.n_layer = 7;
             variants.push(windowed);
+        }
+        if arch == "deepseek2" {
+            variants.extend(deepseek2_variants(TensorType::F32));
         }
         for (index, spec) in variants.iter().enumerate() {
             let model = load(spec);
@@ -765,6 +946,8 @@ fn new_layer_kinds_batch_and_thread_exactly() {
         "lfm2moe",
         "olmoe",
         "granitemoe",
+        "deepseek",
+        "deepseek2",
     ] {
         for ty in [TensorType::F32, TensorType::Q8_0] {
             let model = load(&TinyModel::new(arch, ty));
@@ -791,7 +974,7 @@ fn new_layer_kinds_batch_and_thread_exactly() {
 
 #[test]
 fn new_layer_kinds_stay_close_to_the_oracle_when_quantized() {
-    for arch in ["gemma4", "lfm2", "lfm3", "qwen3moe", "lfm2moe"] {
+    for arch in ["gemma4", "lfm2", "lfm3", "qwen3moe", "lfm2moe", "deepseek"] {
         for ty in [TensorType::Q8_0, TensorType::Q4_0, TensorType::Q4K] {
             let model = load(&TinyModel::new(arch, ty));
             let expected = oracle::logits(&model, &PROMPT);
@@ -799,6 +982,123 @@ fn new_layer_kinds_stay_close_to_the_oracle_when_quantized() {
             assert!(error < 0.08, "{arch} {}: error {error}", ty.name());
         }
     }
+}
+
+#[test]
+fn latent_attention_matches_the_oracle_when_quantized() {
+    // Each file layout, in formats with small and large blocks. The large
+    // ones make the heads wide enough to spread over threads.
+    for ty in [
+        TensorType::Q8_0,
+        TensorType::Q4_0,
+        TensorType::Q4K,
+        TensorType::Q6K,
+    ] {
+        let mut specs = vec![TinyModel::new("deepseek2", ty)];
+        specs.extend(deepseek2_variants(ty));
+        for (index, spec) in specs.iter_mut().enumerate() {
+            // Without rounding activations, only float precision separates
+            // the engine from the oracle, whatever the weight format.
+            let model = load(spec);
+            let expected = oracle::logits(&model, &PROMPT);
+            let mut session = session(&model, 3, 4, Some(kernels::exact()));
+            session.eval(&PROMPT).unwrap();
+            let error = relative_error(session.logits(), &expected);
+            assert!(
+                error < 2e-4,
+                "{} variant {index} exact: error {error}",
+                ty.name()
+            );
+
+            // Rounded activations add a percent or so, and more in these
+            // models, whose random weights make them sensitive: rounding one
+            // activation the other way can move the logits by a few percent,
+            // or change a choice of experts. So this part runs without
+            // experts, on the formats whose random weights stay small, with
+            // a margin. A misread layout or a misplaced head is off by far
+            // more.
+            if ty == TensorType::Q6K {
+                continue;
+            }
+            spec.experts = 0;
+            let model = load(spec);
+            let expected = oracle::logits(&model, &PROMPT);
+            for (threads, batch) in [(1, 1), (4, 4), (3, 32)] {
+                let error = relative_error(&logits(&model, &PROMPT, threads, batch), &expected);
+                assert!(
+                    error < 0.12,
+                    "{} variant {index} threads {threads} batch {batch}: error {error}",
+                    ty.name()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn latent_attention_batches_and_threads_exactly() {
+    // Below the tile route every token is computed the same way, so how
+    // the prompt is split and spread must not change a bit.
+    for ty in [TensorType::F32, TensorType::Q8_0, TensorType::Q4K] {
+        for spec in deepseek2_variants(ty) {
+            let model = load(&spec);
+            let expected = logits(&model, &PROMPT, 1, 1);
+            for (threads, batch) in [(1, 2), (1, 7), (4, 3), (3, 5)] {
+                assert_eq!(
+                    logits(&model, &PROMPT, threads, batch),
+                    expected,
+                    "{} threads {threads} batch {batch}",
+                    ty.name()
+                );
+            }
+            // Large batches add in another order. With rounded activations
+            // that can round one of them the other way, which in a model this
+            // small moves the logits by a percent or two. The exact kernels
+            // show what is left of the reordering.
+            let exact = |threads, batch| {
+                let mut session = session(&model, threads, batch, Some(kernels::exact()));
+                session.eval(&LONG_PROMPT).unwrap();
+                session.logits().to_vec()
+            };
+            let narrow: Vec<f64> = exact(1, 1).iter().map(|v| *v as f64).collect();
+            let error = relative_error(&exact(3, 32), &narrow);
+            assert!(error < 1e-5, "{}: error {error}", ty.name());
+        }
+    }
+}
+
+#[test]
+fn group_limited_routing_changes_the_choice() {
+    // The V3 variant keeps two of four groups. Letting every group in must
+    // change the result, or the test above would not cover the groups.
+    let v3 = deepseek2_variants(TensorType::F32).remove(1);
+    assert_eq!(v3.expert_groups, 4);
+    let mut open = v3.clone();
+    open.expert_groups = 0;
+    let (grouped, ungrouped) = (load(&v3), load(&open));
+    let routing = grouped.config().routing.unwrap();
+    assert_eq!((routing.groups, routing.groups_used), (4, 2));
+    let expected = oracle::logits(&grouped, &PROMPT);
+    let unexpected = oracle::logits(&ungrouped, &PROMPT);
+    assert!(relative_error(&logits(&grouped, &PROMPT, 2, 4), &expected) < 2e-4);
+    assert!(relative_error(&logits(&ungrouped, &PROMPT, 2, 4), &unexpected) < 2e-4);
+    assert!(relative_error(&logits(&grouped, &PROMPT, 2, 4), &unexpected) > 1e-3);
+}
+
+#[test]
+fn latent_attention_caches_one_row_per_position() {
+    // A layer's cache holds the rotary key and the latent, and no values.
+    let spec = TinyModel::new("deepseek2", TensorType::F32);
+    let model = load(&spec);
+    let layer = &model.config().layers[0];
+    assert_eq!(
+        (layer.n_head_kv, layer.head_dim),
+        (1, spec.rope_dims + spec.kv_rank)
+    );
+    let mut session = session(&model, 1, 4, None);
+    session.eval(&PROMPT).unwrap();
+    let row = (spec.rope_dims + spec.kv_rank) * std::mem::size_of::<f32>();
+    assert_eq!(session.cache_bytes(), spec.n_layer * CHUNK_POSITIONS * row);
 }
 
 #[test]
@@ -841,7 +1141,7 @@ fn shifting_the_context_matches_a_fresh_start_in_one_layer() {
     // position, so after a shift the session holds exactly what a fresh one
     // reading the kept tokens would. Rotating keys back must get there.
     let tokens: Vec<u32> = (0..300u32).map(|i| 3 + (i * 7) % 37).collect();
-    for arch in ["llama", "qwen3", "gemma3", "lfm2", "smollm3"] {
+    for arch in ["llama", "qwen3", "gemma3", "lfm2", "smollm3", "deepseek2"] {
         let mut spec = TinyModel::new(arch, TensorType::F32);
         spec.n_layer = 1;
         spec.rope_factors = arch == "llama";
@@ -865,15 +1165,17 @@ fn shifting_the_context_matches_a_fresh_start_in_one_layer() {
 
 #[test]
 fn a_long_context_crosses_cache_chunks() {
-    let mut spec = TinyModel::new("llama", TensorType::F32);
-    spec.n_layer = 1;
-    let model = load(&spec);
-    let tokens: Vec<u32> = (0..600u32).map(|i| 3 + (i * 7) % 37).collect();
-    let expected = oracle::logits(&model, &tokens);
-    let got = logits(&model, &tokens, 4, 32);
-    let error = relative_error(&got, &expected);
-    assert!(error < 5e-4, "error {error}");
-    assert_eq!(logits(&model, &tokens, 2, 7), got);
+    for arch in ["llama", "deepseek2"] {
+        let mut spec = TinyModel::new(arch, TensorType::F32);
+        spec.n_layer = if arch == "llama" { 1 } else { 2 };
+        let model = load(&spec);
+        let tokens: Vec<u32> = (0..600u32).map(|i| 3 + (i * 7) % 37).collect();
+        let expected = oracle::logits(&model, &tokens);
+        let got = logits(&model, &tokens, 4, 32);
+        let error = relative_error(&got, &expected);
+        assert!(error < 5e-4, "{arch}: error {error}");
+        assert_eq!(logits(&model, &tokens, 2, 7), got, "{arch}");
+    }
 }
 
 #[test]

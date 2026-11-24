@@ -13,7 +13,7 @@ use crate::gguf::{Gguf, TensorInfo};
 use crate::tensor::TensorType;
 use crate::tensor::quant::dequantize_row;
 
-use super::config::{Config, Mixer};
+use super::config::{Config, LayerSpec, Mixer, Mla};
 
 /// A weight matrix stored in the model file, one row after another.
 #[derive(Clone, Copy, Debug)]
@@ -76,10 +76,68 @@ pub struct ConvWeights {
     pub out_proj: Linear,
 }
 
+/// One matrix per attention head, stored in one tensor, one head's rows
+/// after another's.
+#[derive(Clone, Copy, Debug)]
+pub struct HeadMatrix {
+    pub matrix: Matrix,
+    /// Rows of one head's matrix.
+    pub rows: usize,
+    /// Rows from one head's matrix to the next.
+    pub stride: usize,
+    /// Row where head zero's matrix starts.
+    pub offset: usize,
+}
+
+impl HeadMatrix {
+    /// Head `index`'s matrix as a linear map.
+    pub fn head(&self, index: usize) -> Linear {
+        Linear {
+            matrix: self.matrix,
+            first_row: index * self.stride + self.offset,
+            rows: self.rows,
+            bias: None,
+        }
+    }
+}
+
+/// How a latent attention block moves the unrotated part of each query
+/// head into the latent space: through the transpose of the key half of
+/// the head's up-projection.
+pub enum Absorb {
+    /// `attn_k_b`, which newer files store transposed already: per head,
+    /// one row per latent element. An ordinary multiply applies it.
+    Rows(HeadMatrix),
+    /// The key half of an older file's `attn_kv_b`: per head, one row per
+    /// element of the query's unrotated part. Each row is added to the
+    /// result, scaled by its element of the query.
+    Columns(HeadMatrix),
+}
+
+/// The weights of a latent attention block (DeepSeek V2 and V3). See
+/// [`Mla`](super::config::Mla) for the shape.
+pub struct MlaWeights {
+    /// The compression of the hidden state that queries are made from, and
+    /// its norm. `None` when `q` reads the hidden state itself.
+    pub q_a: Option<(Linear, Vec<f32>)>,
+    /// Every head's query: the unrotated part, then the rotary part.
+    pub q: Linear,
+    /// The latent, then the rotary key that all heads share.
+    pub kv_a: Linear,
+    /// Normalization of the latent.
+    pub kv_a_norm: Vec<f32>,
+    pub absorb: Absorb,
+    /// The value half of each head's up-projection: from the latent the
+    /// head attended to, to its value.
+    pub values: HeadMatrix,
+    pub out: Linear,
+}
+
 /// What a block mixes positions with.
 pub enum MixerWeights {
     Attention(AttentionWeights),
     ShortConv(ConvWeights),
+    Mla(MlaWeights),
 }
 
 /// A layer's part of the per-layer token embeddings (Gemma 4).
@@ -255,6 +313,12 @@ impl Weights {
                 |part: &str, rows: usize, cols: usize| whole(file, &name(part), rows, cols);
 
             let mixer = match spec.mixer {
+                Mixer::Attention if config.mla.is_some() => {
+                    let shape = config
+                        .mla
+                        .expect("the arm requires a latent attention shape");
+                    MixerWeights::Mla(mla(file, index, d, spec, &shape)?)
+                }
                 Mixer::Attention => {
                     let (q_dim, kv_dim) = (spec.q_dim(), spec.kv_dim());
                     let owns_kv = spec.owns_kv();
@@ -501,6 +565,64 @@ fn experts(file: &Gguf, index: usize, d: usize, count: usize) -> Result<Experts>
             offset: 0,
         },
         shared,
+    })
+}
+
+/// Binds the latent attention block of layer `index`.
+///
+/// Queries come from the hidden state directly (`attn_q`), or through a
+/// compression (`attn_q_a`, its norm, `attn_q_b`). The up-projection from
+/// the latent to every head's key and value is one tensor in older files
+/// (`attn_kv_b`, each head's key rows then its value rows). Newer files
+/// store its two halves apart, the key half transposed (`attn_k_b`,
+/// `attn_v_b`). Both are bound where they lie, without copying.
+fn mla(file: &Gguf, index: usize, d: usize, spec: &LayerSpec, shape: &Mla) -> Result<MlaWeights> {
+    let name = |part: &str| format!("blk.{index}.{part}");
+    let n_head = spec.n_head;
+    let (rank, nope, value) = (shape.kv_rank, shape.nope_dims, shape.value_dims);
+    let q_width = n_head * (nope + spec.rope_dims);
+    let (q_a, q) = match file.tensor(&name("attn_q_a.weight")) {
+        Some(tensor) => {
+            let q_rank = tensor.rows();
+            let q_a = whole(file, &name("attn_q_a"), q_rank, d)?;
+            let norm = vector(file, &name("attn_q_a_norm.weight"), q_rank)?;
+            let q = whole(file, &name("attn_q_b"), q_width, q_rank)?;
+            (Some((q_a, norm)), q)
+        }
+        None => (None, whole(file, &name("attn_q"), q_width, d)?),
+    };
+    let (absorb, values) = if file.tensor(&name("attn_k_b.weight")).is_some() {
+        let per_head = |part: &str, rows: usize, cols: usize| -> Result<HeadMatrix> {
+            Ok(HeadMatrix {
+                matrix: stacked(file, &name(part), n_head, rows, cols)?,
+                rows,
+                stride: rows,
+                offset: 0,
+            })
+        };
+        (
+            Absorb::Rows(per_head("attn_k_b.weight", rank, nope)?),
+            per_head("attn_v_b.weight", value, rank)?,
+        )
+    } else {
+        let stride = nope + value;
+        let both = matrix(file, &name("attn_kv_b.weight"), n_head * stride, rank)?;
+        let half = |rows: usize, offset: usize| HeadMatrix {
+            matrix: both,
+            rows,
+            stride,
+            offset,
+        };
+        (Absorb::Columns(half(nope, 0)), half(value, nope))
+    };
+    Ok(MlaWeights {
+        q_a,
+        q,
+        kv_a: whole(file, &name("attn_kv_a_mqa"), rank + spec.rope_dims, d)?,
+        kv_a_norm: vector(file, &name("attn_kv_a_norm.weight"), rank)?,
+        absorb,
+        values,
+        out: whole(file, &name("attn_output"), d, n_head * value)?,
     })
 }
 

@@ -100,6 +100,7 @@ SmaLLM/
 │   │   ├── encoder.rs       embedding and reranking models (BERT)
 │   │   ├── matmul.rs        the parallel matrix multiply
 │   │   ├── forward.rs       the forward pass and the Session type
+│   │   ├── forward/mla.rs   latent attention (DeepSeek V2 and V3)
 │   │   └── tests.rs         the forward pass against a slow oracle
 │   ├── sampler.rs           picks the next token
 │   ├── chat.rs              chat formats

@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 use crate::gguf::Gguf;
 
 /// Architectures this engine runs, as named in `general.architecture`.
-pub const ARCHITECTURES: [&str; 16] = [
+pub const ARCHITECTURES: [&str; 18] = [
     "llama",
     "qwen2",
     "qwen3",
@@ -28,6 +28,8 @@ pub const ARCHITECTURES: [&str; 16] = [
     "smollm3",
     "gemma2",
     "phi3",
+    "deepseek",
+    "deepseek2",
 ];
 
 /// Which two elements of an attention head a rotary embedding rotates
@@ -70,6 +72,11 @@ pub struct Routing {
     pub normalize: bool,
     /// Multiplier on the weights. One for none.
     pub scale: f32,
+    /// Groups the experts are split into, for routing limited to the best
+    /// groups (DeepSeek V3). Zero or one for no groups.
+    pub groups: usize,
+    /// Groups a token's experts may come from.
+    pub groups_used: usize,
 }
 
 /// YaRN, a way to stretch rotary positions over a longer context than the
@@ -87,6 +94,25 @@ pub struct Yarn {
     /// Multiplier on rotated values, before the part each layer's scaling
     /// adds. One for most models: see `RopeTables::new`.
     pub attn_factor: f32,
+}
+
+/// The shape of multi-head latent attention (DeepSeek V2 and V3).
+///
+/// Each position stores one small latent vector and one rotary key that
+/// every head shares. A head's own key and value are projections of that
+/// latent. The engine never computes them: it moves each query into the
+/// latent space instead (see `forward/mla.rs`). So the cache holds
+/// `kv_rank + rope_dims` floats per position and layer, which is that
+/// layer's `head_dim`, and the layer has one key/value head.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Mla {
+    /// Width of the latent vector.
+    pub kv_rank: usize,
+    /// Elements at the start of each query and key head that do not
+    /// rotate. The rotary part follows, `rope_dims` wide.
+    pub nope_dims: usize,
+    /// Width of each value head.
+    pub value_dims: usize,
 }
 
 /// How a block mixes information across positions.
@@ -208,6 +234,9 @@ pub struct Config {
     pub yarn: Option<Yarn>,
     /// The expert settings, for models with mixture-of-experts layers.
     pub routing: Option<Routing>,
+    /// The latent attention shape, for models whose attention layers use
+    /// it (DeepSeek V2 and V3).
+    pub mla: Option<Mla>,
 }
 
 impl Config {
@@ -228,7 +257,13 @@ impl Config {
 
         let n_ctx_train = meta.required("context_length")?;
         let n_embd = meta.required("embedding_length")?;
-        let n_layer = meta.required("block_count")?;
+        // A file with multi-token prediction counts its extra blocks as
+        // layers. They come last, and this engine does not run them.
+        let n_layer = meta
+            .required("block_count")?
+            .checked_sub(meta.usize("nextn_predict_layers").unwrap_or(0))
+            .filter(|&layers| layers > 0)
+            .ok_or_else(|| Error::format("more prediction blocks than blocks"))?;
         // Guard the sizes that later multiply into buffer lengths.
         for (what, value) in [("layers", n_layer), ("embedding width", n_embd)] {
             if value > 1 << 20 {
@@ -262,7 +297,8 @@ impl Config {
             ("attention.value_length", head_dim),
             ("attention.value_length_swa", head_dim_local),
         ] {
-            if meta.usize(key).is_some_and(|value| value != width) {
+            // Latent attention has values of their own width, see `Mla`.
+            if arch != "deepseek2" && meta.usize(key).is_some_and(|value| value != width) {
                 return Err(Error::unsupported(
                     "attention with different key and value widths",
                 ));
@@ -318,6 +354,7 @@ impl Config {
             long_context_after: 0,
             yarn: meta.yarn(n_ctx_train),
             routing,
+            mla: None,
             arch: arch.clone(),
         };
 
@@ -480,6 +517,45 @@ impl Config {
                     }
                 }
             }
+            // DeepSeek-MoE: a Llama with experts. llama.cpp weighs them by a
+            // softmax and never normalizes, whatever the file says.
+            "deepseek" => {
+                config.rope = Rope::Pairs;
+                if let Some(routing) = &mut config.routing {
+                    routing.gating = Gating::Softmax;
+                    routing.normalize = false;
+                }
+            }
+            // DeepSeek V2 and V3, and the models converted to their shape:
+            // latent attention, rotated in pairs, and experts.
+            "deepseek2" => {
+                config.rope = Rope::Pairs;
+                let mla = meta.mla(rope_dims)?;
+                let (rotary, score_scale) = meta.deepseek2_scales(
+                    1.0 / rope_scale,
+                    mla.nope_dims + rope_dims,
+                    config.rope_attn_factor,
+                    config.yarn.is_some(),
+                );
+                if let Some(yarn) = &mut config.yarn {
+                    yarn.attn_factor = rotary;
+                }
+                for layer in &mut config.layers {
+                    layer.n_head_kv = 1;
+                    layer.head_dim = rope_dims + mla.kv_rank;
+                    layer.attention_scale = score_scale;
+                }
+                config.mla = Some(mla);
+                // Files without a gating function weigh experts by a
+                // softmax, except GLM 4.7 Lite, which llama.cpp knows by
+                // its shape.
+                let unnamed = matches!(meta.usize("expert_gating_func"), None | Some(0));
+                if unnamed && matches!(n_layer, 47 | 48) && n_vocab == 154880 {
+                    if let Some(routing) = &mut config.routing {
+                        routing.gating = Gating::Sigmoid;
+                    }
+                }
+            }
             _ => unreachable!("architecture was checked above"),
         }
         config.check()?;
@@ -527,6 +603,19 @@ impl Config {
                 return Err(Error::format(format!(
                     "{} of {} experts per token",
                     routing.used, routing.count
+                )));
+            }
+            // The chosen groups must hold enough experts to choose from.
+            let groups = routing.groups;
+            if groups > 1
+                && (routing.count % groups != 0
+                    || routing.groups_used == 0
+                    || routing.groups_used > groups
+                    || routing.used > routing.groups_used * (routing.count / groups))
+            {
+                return Err(Error::format(format!(
+                    "{} experts in {groups} groups, {} of them used, cannot give {} experts",
+                    routing.count, routing.groups_used, routing.used
                 )));
             }
         }
@@ -673,7 +762,10 @@ impl Meta<'_> {
         let normalize = self
             .file
             .get_bool(&self.key("expert_weights_norm"))
-            .unwrap_or(!matches!(self.arch, "qwen2moe" | "olmoe"));
+            .unwrap_or(!matches!(
+                self.arch,
+                "qwen2moe" | "olmoe" | "deepseek" | "deepseek2"
+            ));
         Ok(Some(Routing {
             count,
             used,
@@ -683,7 +775,84 @@ impl Meta<'_> {
                 .f32("expert_weights_scale")
                 .filter(|&scale| scale != 0.0)
                 .unwrap_or(1.0),
+            groups: self.usize("expert_group_count").unwrap_or(0),
+            groups_used: self.usize("expert_group_used_count").unwrap_or(0),
         }))
+    }
+
+    /// The latent attention shape of a DeepSeek V2 model. Older files give
+    /// the widths of a key and a value head as `key_length` and
+    /// `value_length`. Newer ones, which store the up-projection in two
+    /// halves, give the cache's widths there and the heads' widths as
+    /// `key_length_mla` and `value_length_mla`.
+    fn mla(&self, rope_dims: usize) -> Result<Mla> {
+        let kv_rank = self.required("attention.kv_lora_rank")?;
+        let (key, value) = match self.usize("attention.key_length_mla") {
+            Some(key) => (key, self.required("attention.value_length_mla")?),
+            None => (
+                self.required("attention.key_length")?,
+                self.required("attention.value_length")?,
+            ),
+        };
+        let mla = Mla {
+            kv_rank,
+            nope_dims: key.saturating_sub(rope_dims),
+            value_dims: value,
+        };
+        let sizes = [mla.kv_rank, mla.nope_dims, mla.value_dims];
+        if sizes.iter().any(|&size| size == 0 || size > 1 << 16) {
+            return Err(Error::format(format!(
+                "latent attention of rank {kv_rank} with keys of {key} and values of {value}"
+            )));
+        }
+        Ok(mla)
+    }
+
+    /// DeepSeek V2's YaRN corrections, made as llama.cpp makes them.
+    /// Returns YaRN's factor on rotated values and the scale on attention
+    /// scores.
+    ///
+    /// The file's `yarn_log_multiplier` is a tenth of the model's
+    /// `mscale_all_dim`. `llama-context.cpp` picks a rotary factor that
+    /// cancels the magnitude YaRN adds to rotated values, for DeepSeek V2
+    /// and V3 entirely. `deepseek2.cpp` takes that factor back out and puts
+    /// `mscale` on both sides of the query-key product instead, as the
+    /// square in the score scale. `stretch` is the YaRN or linear factor,
+    /// one for none, and `key_width` the width of a key head.
+    fn deepseek2_scales(
+        &self,
+        stretch: f32,
+        key_width: usize,
+        rope_attn_factor: f32,
+        yarn: bool,
+    ) -> (f32, f32) {
+        let log_mul = self
+            .f32("rope.scaling.yarn_log_multiplier")
+            .map_or(0.0, |tenth| tenth / 0.1);
+        // The magnitude YaRN gives to a stretch of `scale`.
+        let magnitude = |scale: f32, mscale: f32| {
+            if scale <= 1.0 {
+                1.0
+            } else {
+                0.1 * mscale * scale.ln() + 1.0
+            }
+        };
+        let rotary = if yarn {
+            let ratio = if log_mul != 0.0 {
+                // llama.cpp reads DeepSeek V2's `mscale` as equal to its
+                // `mscale_all_dim`, unless that is one.
+                let mscale = if log_mul != 1.0 { log_mul } else { 1.0 };
+                magnitude(stretch, mscale) / magnitude(stretch, log_mul)
+            } else {
+                magnitude(stretch, 1.0)
+            };
+            ratio * (1.0 / (1.0 + 0.1 * stretch.ln()))
+        } else {
+            1.0
+        };
+        let original = rotary * rope_attn_factor * (1.0 + 0.1 * stretch.ln());
+        let mscale = original * (1.0 + 0.1 * log_mul * stretch.ln());
+        (rotary, mscale * mscale / (key_width as f32).sqrt())
     }
 
     /// The linear position scaling, as a multiplier on rotary angles. Other
@@ -914,6 +1083,133 @@ mod tests {
         builder.f32("llama.rope.scaling.factor", 4.0);
         assert_eq!(config(&builder).unwrap().layers[0].rope_scale, 0.25);
         assert_eq!(config(&builder).unwrap().yarn, None);
+    }
+
+    /// DeepSeek V2 Lite's metadata. `newer` states the widths as files with
+    /// a split up-projection do, and `yarn` adds the model's YaRN.
+    fn deepseek2_lite(newer: bool, yarn: bool) -> Builder {
+        let mut builder = Builder::new();
+        builder
+            .string("general.architecture", "deepseek2")
+            .u32("deepseek2.context_length", 163840)
+            .u32("deepseek2.embedding_length", 2048)
+            .u32("deepseek2.block_count", 27)
+            .u32("deepseek2.feed_forward_length", 10944)
+            .u32("deepseek2.attention.head_count", 16)
+            .u32("deepseek2.attention.kv_lora_rank", 512)
+            .u32("deepseek2.rope.dimension_count", 64)
+            .u32("deepseek2.expert_count", 64)
+            .u32("deepseek2.expert_used_count", 6);
+        if newer {
+            builder
+                .u32("deepseek2.attention.head_count_kv", 1)
+                .u32("deepseek2.attention.key_length", 576)
+                .u32("deepseek2.attention.value_length", 512)
+                .u32("deepseek2.attention.key_length_mla", 192)
+                .u32("deepseek2.attention.value_length_mla", 192);
+        } else {
+            builder
+                .u32("deepseek2.attention.head_count_kv", 16)
+                .u32("deepseek2.attention.key_length", 192)
+                .u32("deepseek2.attention.value_length", 128);
+        }
+        if yarn {
+            builder
+                .string("deepseek2.rope.scaling.type", "yarn")
+                .f32("deepseek2.rope.scaling.factor", 40.0)
+                .u32("deepseek2.rope.scaling.original_context_length", 4096)
+                .f32("deepseek2.rope.scaling.yarn_log_multiplier", 0.0707);
+        }
+        builder
+    }
+
+    #[test]
+    fn deepseek2_attends_through_a_latent() {
+        let c = config(&deepseek2_lite(false, true)).unwrap();
+        let mla = c.mla.unwrap();
+        assert_eq!(
+            (mla.kv_rank, mla.nope_dims, mla.value_dims),
+            (512, 128, 128)
+        );
+        let layer = &c.layers[0];
+        assert_eq!(
+            (layer.n_head, layer.n_head_kv, layer.head_dim),
+            (16, 1, 576)
+        );
+        assert_eq!((layer.rope_dims, c.rope), (64, Rope::Pairs));
+        // llama.cpp's numbers for this model: YaRN's magnitude on rotated
+        // values is canceled, and the scores take mscale twice.
+        let stretch = 40f64.ln();
+        let mscale = 1.0 + 0.1 * 0.707 * stretch;
+        let expected = mscale * mscale / 192f64.sqrt();
+        assert!((layer.attention_scale as f64 - expected).abs() < 1e-6);
+        let rotary = c.yarn.unwrap().attn_factor as f64;
+        assert!((rotary * (1.0 + 0.1 * stretch) - 1.0).abs() < 1e-6);
+        // Experts are weighed by a softmax and not normalized by default.
+        let routing = c.routing.unwrap();
+        assert_eq!(
+            (routing.gating, routing.normalize, routing.groups),
+            (Gating::Softmax, false, 0)
+        );
+    }
+
+    #[test]
+    fn newer_deepseek2_files_give_the_cache_widths() {
+        // The split up-projection's files, V3's routing and no YaRN.
+        let groups = |count: u32, used: u32| {
+            let mut builder = deepseek2_lite(true, false);
+            builder
+                .u32("deepseek2.expert_gating_func", 2)
+                .bool("deepseek2.expert_weights_norm", true)
+                .u32("deepseek2.expert_group_count", count)
+                .u32("deepseek2.expert_group_used_count", used);
+            config(&builder)
+        };
+        let c = groups(8, 3).unwrap();
+        let mla = c.mla.unwrap();
+        assert_eq!(
+            (mla.kv_rank, mla.nope_dims, mla.value_dims),
+            (512, 128, 192)
+        );
+        assert_eq!(c.layers[0].head_dim, 576);
+        assert!((c.layers[0].attention_scale - 1.0 / 192f32.sqrt()).abs() < 1e-7);
+        let routing = c.routing.unwrap();
+        assert_eq!((routing.gating, routing.normalize), (Gating::Sigmoid, true));
+        assert_eq!((routing.groups, routing.groups_used), (8, 3));
+
+        // Groups must divide the experts and hold enough of them.
+        assert!(groups(5, 3).is_err());
+        assert!(groups(8, 0).is_err());
+        assert!(groups(32, 1).is_err(), "two experts cannot give six");
+        assert!(groups(32, 3).is_ok());
+    }
+
+    #[test]
+    fn prediction_blocks_are_not_layers() {
+        let with = |blocks: u32| {
+            let mut builder = deepseek2_lite(false, true);
+            builder.u32("deepseek2.nextn_predict_layers", blocks);
+            config(&builder)
+        };
+        assert_eq!(with(1).unwrap().n_layer, 26);
+        assert!(with(27).is_err());
+    }
+
+    #[test]
+    fn deepseek_moe_neither_normalizes_nor_uses_a_sigmoid() {
+        let mut builder = base("deepseek");
+        builder
+            .u32("deepseek.expert_count", 8)
+            .u32("deepseek.expert_used_count", 2)
+            .u32("deepseek.expert_gating_func", 2)
+            .bool("deepseek.expert_weights_norm", true);
+        let c = config(&builder).unwrap();
+        let routing = c.routing.unwrap();
+        assert_eq!(
+            (routing.gating, routing.normalize),
+            (Gating::Softmax, false)
+        );
+        assert_eq!((c.rope, c.mla), (Rope::Pairs, None));
     }
 
     #[test]

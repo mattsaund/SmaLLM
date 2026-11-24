@@ -253,8 +253,26 @@ fn phi_4_mini_q4_k_m() {
 }
 
 #[test]
+fn deepseek_coder_v2_lite_q4_k_m() {
+    check("DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M");
+}
+
+#[test]
+fn moonlight_16b_a3b_q4_k_m() {
+    check("Moonlight-16B-A3B-Instruct-Q4_K_M");
+}
+
+#[test]
+fn deepseek_moe_16b_q4_k_m() {
+    check("deepseek-moe-16b-chat.Q4_K_M");
+}
+
+#[test]
 fn every_golden_file_has_a_test() {
     let tested = [
+        "DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M",
+        "Moonlight-16B-A3B-Instruct-Q4_K_M",
+        "deepseek-moe-16b-chat.Q4_K_M",
         "gemma-2-2b-it-Q4_K_M",
         "microsoft_Phi-4-mini-instruct-Q4_K_M",
         "LFM2-8B-A1B-Q4_K_M",
