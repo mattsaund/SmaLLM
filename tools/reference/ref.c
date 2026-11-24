@@ -1,0 +1,179 @@
+// Reference harness: drives the llama.cpp library that is already installed
+// on this machine, to produce ground truth for SmaLLM tests and benchmarks.
+//
+//   ref tok    MODEL TEXTFILE [special]        token ids of the text
+//   ref gen    MODEL TEXTFILE N [threads]      greedy generation: ids and text
+//   ref logits MODEL TEXTFILE OUTFILE          raw f32 logits after the prompt
+//   ref ids    MODEL IDSFILE OUTFILE           raw f32 logits after the token
+//                                              ids listed in IDSFILE
+//   ref bench  MODEL N_PROMPT N_GEN THREADS    prompt and generation speed
+#include "llama.h"
+#include "ggml-backend.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+static void quiet_log(enum ggml_log_level level, const char * text, void * user) {
+    (void) user;
+    if (level >= GGML_LOG_LEVEL_ERROR) fputs(text, stderr);
+}
+
+static double now_s(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+static char * read_file(const char * path, size_t * len) {
+    FILE * f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "cannot open %s\n", path); exit(1); }
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char * buf = malloc(n + 1);
+    if (fread(buf, 1, n, f) != (size_t) n) { fprintf(stderr, "short read\n"); exit(1); }
+    buf[n] = 0;
+    fclose(f);
+    *len = (size_t) n;
+    return buf;
+}
+
+static int argmax(const float * v, int n) {
+    int best = 0;
+    for (int i = 1; i < n; i++) if (v[i] > v[best]) best = i;
+    return best;
+}
+
+int main(int argc, char ** argv) {
+    if (argc < 4) { fprintf(stderr, "usage: see the top of ref.c\n"); return 2; }
+    const char * mode = argv[1];
+    const char * model_path = argv[2];
+
+    llama_log_set(quiet_log, NULL);
+    const char * cpu = getenv("REF_CPU_BACKEND");
+    if (!cpu) { fprintf(stderr, "set REF_CPU_BACKEND to a libggml-cpu-*.so\n"); return 2; }
+    if (!ggml_backend_load(cpu)) { fprintf(stderr, "cannot load backend %s\n", cpu); return 1; }
+    llama_backend_init();
+
+    struct llama_model_params mp = llama_model_default_params();
+    mp.n_gpu_layers = 0;
+    struct llama_model * model = llama_model_load_from_file(model_path, mp);
+    if (!model) { fprintf(stderr, "cannot load model\n"); return 1; }
+    const struct llama_vocab * vocab = llama_model_get_vocab(model);
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+
+    if (strcmp(mode, "bench") == 0) {
+        if (argc < 6) { fprintf(stderr, "bench MODEL N_PROMPT N_GEN THREADS\n"); return 2; }
+        int n_prompt = atoi(argv[3]), n_gen = atoi(argv[4]), threads = atoi(argv[5]);
+        struct llama_context_params cp = llama_context_default_params();
+        cp.n_ctx = n_prompt + n_gen + 8;
+        cp.n_batch = n_prompt > 512 ? n_prompt : 512;
+        cp.n_threads = threads;
+        cp.n_threads_batch = threads;
+        cp.no_perf = true;
+        struct llama_context * ctx = llama_init_from_model(model, cp);
+        if (!ctx) { fprintf(stderr, "cannot make context\n"); return 1; }
+        llama_token * toks = malloc(sizeof(llama_token) * (n_prompt + 1));
+        // The same synthetic prompt SmaLLM's bench uses: token ids cycling
+        // through the low part of the vocabulary.
+        for (int i = 0; i < n_prompt; i++) toks[i] = 1 + (i * 7919) % (n_vocab > 1000 ? 1000 : n_vocab - 1);
+        // Warm up: page the weights in and start the threads.
+        llama_decode(ctx, llama_batch_get_one(toks, n_prompt < 8 ? n_prompt : 8));
+        llama_memory_clear(llama_get_memory(ctx), true);
+
+        double t0 = now_s();
+        if (llama_decode(ctx, llama_batch_get_one(toks, n_prompt))) { fprintf(stderr, "decode failed\n"); return 1; }
+        double t1 = now_s();
+        llama_token next = argmax(llama_get_logits_ith(ctx, -1), n_vocab);
+        for (int i = 0; i < n_gen; i++) {
+            if (llama_decode(ctx, llama_batch_get_one(&next, 1))) { fprintf(stderr, "decode failed\n"); return 1; }
+            next = argmax(llama_get_logits_ith(ctx, -1), n_vocab);
+        }
+        double t2 = now_s();
+        printf("threads %d  prompt %d tok %.2f tok/s  gen %d tok %.2f tok/s\n",
+               threads, n_prompt, n_prompt / (t1 - t0), n_gen, n_gen / (t2 - t1));
+        return 0;
+    }
+
+    if (strcmp(mode, "ids") == 0) {
+        if (argc < 5) { fprintf(stderr, "ids MODEL IDSFILE OUTFILE\n"); return 2; }
+        size_t len;
+        char * list = read_file(argv[3], &len);
+        llama_token * toks = malloc(sizeof(llama_token) * (len + 1));
+        int n = 0;
+        for (char * word = strtok(list, " \n"); word; word = strtok(NULL, " \n")) toks[n++] = atoi(word);
+        struct llama_context_params cp = llama_context_default_params();
+        cp.n_ctx = n + 8;
+        cp.n_batch = n > 512 ? n : 512;
+        cp.n_threads = 4;
+        cp.n_threads_batch = 4;
+        cp.no_perf = true;
+        struct llama_context * ctx = llama_init_from_model(model, cp);
+        if (!ctx) { fprintf(stderr, "cannot make context\n"); return 1; }
+        if (llama_decode(ctx, llama_batch_get_one(toks, n))) { fprintf(stderr, "decode failed\n"); return 1; }
+        FILE * out = fopen(argv[4], "wb");
+        fwrite(llama_get_logits_ith(ctx, -1), sizeof(float), n_vocab, out);
+        fclose(out);
+        printf("%d tokens, %d logits\n", n, n_vocab);
+        return 0;
+    }
+
+    size_t text_len;
+    char * text = read_file(argv[3], &text_len);
+    const int special = (argc > 4 && strcmp(argv[4], "special") == 0) || strcmp(mode, "tok") != 0;
+
+    int cap = (int) text_len + 16;
+    llama_token * toks = malloc(sizeof(llama_token) * cap);
+    int n = llama_tokenize(vocab, text, (int) text_len, toks, cap, true, special);
+    if (n < 0) { fprintf(stderr, "tokenize failed\n"); return 1; }
+
+    if (strcmp(mode, "tok") == 0) {
+        for (int i = 0; i < n; i++) printf("%d%c", toks[i], i + 1 < n ? ' ' : '\n');
+        return 0;
+    }
+
+    int n_gen = (strcmp(mode, "gen") == 0 && argc > 4) ? atoi(argv[4]) : 0;
+    int threads = (strcmp(mode, "gen") == 0 && argc > 5) ? atoi(argv[5]) : 4;
+    struct llama_context_params cp = llama_context_default_params();
+    cp.n_ctx = n + n_gen + 8;
+    cp.n_batch = n > 512 ? n : 512;
+    cp.n_threads = threads;
+    cp.n_threads_batch = threads;
+    cp.no_perf = true;
+    struct llama_context * ctx = llama_init_from_model(model, cp);
+    if (!ctx) { fprintf(stderr, "cannot make context\n"); return 1; }
+
+    if (llama_decode(ctx, llama_batch_get_one(toks, n))) { fprintf(stderr, "decode failed\n"); return 1; }
+    const float * logits = llama_get_logits_ith(ctx, -1);
+
+    if (strcmp(mode, "logits") == 0) {
+        FILE * out = fopen(argv[4], "wb");
+        fwrite(logits, sizeof(float), n_vocab, out);
+        fclose(out);
+        printf("prompt:");
+        for (int i = 0; i < n; i++) printf(" %d", toks[i]);
+        printf("\nargmax %d\n", argmax(logits, n_vocab));
+        return 0;
+    }
+
+    printf("prompt:");
+    for (int i = 0; i < n; i++) printf(" %d", toks[i]);
+    printf("\ngenerated:");
+    char piece[256];
+    char * out_text = malloc(n_gen * 64 + 1);
+    size_t out_len = 0;
+    for (int i = 0; i < n_gen; i++) {
+        llama_token next = argmax(logits, n_vocab);
+        printf(" %d", next);
+        if (llama_vocab_is_eog(vocab, next)) break;
+        int k = llama_token_to_piece(vocab, next, piece, sizeof(piece), 0, true);
+        if (k > 0) { memcpy(out_text + out_len, piece, k); out_len += k; }
+        if (llama_decode(ctx, llama_batch_get_one(&next, 1))) { fprintf(stderr, "decode failed\n"); return 1; }
+        logits = llama_get_logits_ith(ctx, -1);
+    }
+    out_text[out_len] = 0;
+    printf("\ntext: %s\n", out_text);
+    return 0;
+}

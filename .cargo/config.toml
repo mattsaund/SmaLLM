@@ -1,0 +1,9 @@
+# A Windows smallm.exe runs on a machine with nothing else installed. The C
+# runtime is linked into it instead of expected to be there already as the
+# Visual C++ Redistributable, which a fresh Windows does not have.
+# The same goes for smallm.dll.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

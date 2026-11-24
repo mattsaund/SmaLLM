@@ -1,0 +1,13 @@
+Hello, world! It's 2024 and we'll test 3.14159 things: don't, I'm, they've, you'd, he's.
+
+  Indented   line	with	tabs and trailing spaces   
+Numbers 1 22 333 4444 55555 1,000,000 and 0x1F.
+Symbols: +-*/=<>!@#$%^&*()[]{}|\;:'",.?~`
+Café naïve über straße ¿qué? 日本語のテキスト 中文 한국어 русский العربية हिन्दी
+Emoji 😀👍 and é combining.
+<s> </s> <|im_start|>user <|im_end|> <|endoftext|> <|eot_id|> <start_of_turn> <unk>
+The quick brown fox jumps over the lazy dog. THE QUICK BROWN FOX. tHe QuIcK.
+
+
+
+end

@@ -1,0 +1,46 @@
+[package]
+name = "smallm"
+version = "0.1.0"
+edition = "2024"
+# Edition 2024 needs 1.85, the Rust that Debian 13 and Raspberry Pi OS ship.
+rust-version = "1.85"
+description = "A small, fast LLM inference engine for GGUF models on low-power hardware"
+repository = "https://github.com/mattsaund/SmaLLM"
+license = "MIT"
+readme = "README.md"
+keywords = ["llm", "inference", "gguf", "embedded", "quantization"]
+categories = ["science", "command-line-utilities"]
+exclude = ["/.github", "/docs", "/tests/golden"]
+
+# The engine. No dependencies: everything is in this repository.
+[lib]
+name = "smallm"
+path = "src/lib.rs"
+
+# The command line program, built on the engine.
+[[bin]]
+name = "smallm"
+path = "src/bin/smallm/main.rs"
+doc = false
+
+# The C API is a crate of its own, so the engine and the program never pay
+# for it. Build it with: cargo build --release -p smallm-capi
+[workspace]
+members = ["capi"]
+
+# Release is what people install. The whole program is optimized as one unit,
+# which lets the compiler inline the kernels across module boundaries.
+# No unwinding: a panic is a bug with nothing to recover to, and dropping the
+# unwind tables makes the binary smaller. Tests use the dev profile and still
+# unwind.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Tests run the real kernels on real matrices, so they need optimization to
+# finish quickly. Overflow and debug assertions stay on.
+[profile.test]
+opt-level = 2

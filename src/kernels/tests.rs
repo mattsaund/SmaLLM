@@ -1,0 +1,439 @@
+//! Checks the scalar kernels against the plain definition of each operation,
+//! and every other backend against the scalar kernels.
+
+use super::*;
+use crate::tensor::f16::{bf16_to_f32, f16_to_f32, f32_to_f16};
+use crate::tensor::quant::dequantize_row;
+use crate::testing::{Rng, random_weights, set_scales};
+
+const QUANT_TYPES: [TensorType; 11] = [
+    TensorType::Q4_0,
+    TensorType::Q4_1,
+    TensorType::Q5_0,
+    TensorType::Q5_1,
+    TensorType::Q8_0,
+    TensorType::Iq4Nl,
+    TensorType::Q2K,
+    TensorType::Q3K,
+    TensorType::Q4K,
+    TensorType::Q5K,
+    TensorType::Q6K,
+];
+
+/// An activation vector quantized by one backend.
+struct Acts {
+    q: Vec<i8>,
+    scale: Vec<f32>,
+    sums: Vec<i16>,
+    wsum: Vec<f32>,
+    group: usize,
+}
+
+impl Acts {
+    fn new(kernels: &Kernels, x: &[f32], group: usize) -> Acts {
+        let n = x.len();
+        let mut acts = Acts {
+            q: vec![0; n],
+            scale: vec![0.0; n / group],
+            sums: vec![0; n / 16],
+            wsum: vec![0.0; n / group],
+            group,
+        };
+        kernels.quantize(
+            x,
+            group,
+            &mut acts.q,
+            &mut acts.scale,
+            &mut acts.sums,
+            &mut acts.wsum,
+        );
+        acts
+    }
+
+    fn as_ref(&self) -> ActRef {
+        ActRef {
+            q: self.q.as_ptr(),
+            scale: self.scale.as_ptr(),
+            sums: self.sums.as_ptr(),
+            wsum: self.wsum.as_ptr(),
+        }
+    }
+
+    /// The floats the quantized values stand for.
+    fn reconstruct(&self) -> Vec<f32> {
+        self.q
+            .iter()
+            .enumerate()
+            .map(|(i, &q)| self.scale[i / self.group] * q as f32)
+            .collect()
+    }
+}
+
+fn group_of(ty: TensorType) -> usize {
+    ty.block_len()
+}
+
+/// Runs a backend's row kernel for a quantized type.
+fn row_dot(kernels: &Kernels, ty: TensorType, row: &[u8], n: usize, acts: &Acts) -> f32 {
+    match kernels.row_dot(ty) {
+        // SAFETY: `row` holds `n` weights and `acts` holds `n` activations.
+        RowDot::Quant(dot) => unsafe { dot(row.as_ptr(), n, acts.as_ref()) },
+        RowDot::Float(_) => panic!("{} is not a quantized type", ty.name()),
+    }
+}
+
+/// The dot product by definition: expand both sides to floats and multiply.
+/// Returns the result and the sum of the magnitudes of its terms.
+fn reference_dot(ty: TensorType, row: &[u8], x: &[f32]) -> (f64, f64) {
+    let mut weights = vec![0.0f32; x.len()];
+    dequantize_row(ty, row, &mut weights);
+    let mut sum = 0.0f64;
+    let mut magnitude = 0.0f64;
+    for (w, v) in weights.iter().zip(x) {
+        sum += *w as f64 * *v as f64;
+        magnitude += (*w as f64 * *v as f64).abs();
+    }
+    (sum, magnitude)
+}
+
+fn assert_close(got: f32, expected: f64, magnitude: f64, what: &str) {
+    let tolerance = 2e-5 * magnitude + 1e-6;
+    assert!(
+        (got as f64 - expected).abs() <= tolerance,
+        "{what}: got {got}, expected {expected}, tolerance {tolerance}"
+    );
+}
+
+#[test]
+fn a_backend_is_selected() {
+    let all = available();
+    assert_eq!(all[0].name, "scalar");
+    assert!(all.iter().any(|k| k.name == best().name));
+}
+
+#[test]
+fn exp_is_accurate_across_its_range() {
+    let mut worst = 0.0f64;
+    let mut x = -87.0f32;
+    while x < 88.0 {
+        let got = scalar::exp_approx(x) as f64;
+        let expected = (x as f64).exp();
+        worst = worst.max(((got - expected) / expected).abs());
+        x += 0.0137;
+    }
+    assert!(worst < 4e-7, "worst relative error {worst}");
+    // Out of range inputs clamp instead of overflowing.
+    assert!(scalar::exp_approx(1000.0).is_finite());
+    assert!(scalar::exp_approx(-1000.0) > 0.0);
+}
+
+#[test]
+fn float_kernels_match_the_definition() {
+    let mut rng = Rng(11);
+    for kernels in available() {
+        for n in 0..70 {
+            let a = rng.floats(n, -2.0, 2.0);
+            let b = rng.floats(n, -2.0, 2.0);
+            let expected: f64 = a.iter().zip(&b).map(|(x, y)| *x as f64 * *y as f64).sum();
+            assert_close(kernels.dot(&a, &b), expected, n as f64, kernels.name);
+
+            let squares: f64 = a.iter().map(|x| *x as f64 * *x as f64).sum();
+            assert_close(kernels.sum_squares(&a), squares, n as f64, kernels.name);
+
+            let mut y = b.clone();
+            kernels.axpy(0.75, &a, &mut y);
+            for i in 0..n {
+                assert_close(y[i], b[i] as f64 + 0.75 * a[i] as f64, 1.0, kernels.name);
+            }
+        }
+    }
+}
+
+#[test]
+fn attention_kernels_match_the_definition() {
+    let mut rng = Rng(21);
+    for kernels in available() {
+        // Lengths with and without a tail, and every query group size.
+        for len in [1, 7, 8, 9, 24, 32, 40, 64, 71] {
+            for n_queries in 1..=6 {
+                for n in [0, 1, 2, 5, 33] {
+                    let queries = rng.floats(n_queries * len, -2.0, 2.0);
+                    let rows = rng.floats(n * len, -2.0, 2.0);
+                    let stride = n + 3;
+                    let what = format!("{} len {len} queries {n_queries} rows {n}", kernels.name);
+
+                    // Scores land at their slots and nowhere else.
+                    let mut scores = vec![-7.0f32; n_queries * stride];
+                    kernels.dot_rows(&queries, &rows, len, &mut scores, stride);
+                    for h in 0..n_queries {
+                        for j in 0..stride {
+                            let got = scores[h * stride + j];
+                            if j >= n {
+                                assert_eq!(got, -7.0, "{what}: wrote past the rows");
+                                continue;
+                            }
+                            let expected: f64 = (0..len)
+                                .map(|i| queries[h * len + i] as f64 * rows[j * len + i] as f64)
+                                .sum();
+                            assert_close(got, expected, len as f64, &what);
+                        }
+                    }
+
+                    let weights = rng.floats(n_queries * stride, -1.0, 1.0);
+                    let start = rng.floats(n_queries * len, -1.0, 1.0);
+                    let mut outs = start.clone();
+                    kernels.mix_rows(&weights, &rows, len, &mut outs, stride);
+                    for h in 0..n_queries {
+                        for i in 0..len {
+                            let mixed: f64 = (0..n)
+                                .map(|j| weights[h * stride + j] as f64 * rows[j * len + i] as f64)
+                                .sum();
+                            assert_close(
+                                outs[h * len + i],
+                                start[h * len + i] as f64 + mixed,
+                                n as f64 + 1.0,
+                                &what,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn gates_match_the_definition() {
+    let mut rng = Rng(12);
+    for kernels in available() {
+        for n in [0, 1, 7, 8, 9, 33, 100] {
+            let gate = rng.floats(n, -9.0, 9.0);
+            let up = rng.floats(n, -2.0, 2.0);
+
+            let mut silu = gate.clone();
+            kernels.silu_mul(&mut silu, &up);
+            let mut gelu = gate.clone();
+            kernels.gelu_mul(&mut gelu, &up);
+            for i in 0..n {
+                let x = gate[i] as f64;
+                let expected_silu = x / (1.0 + (-x).exp()) * up[i] as f64;
+                assert_close(silu[i], expected_silu, 1.0, kernels.name);
+                let z = (2.0 / std::f64::consts::PI).sqrt() * x * (1.0 + 0.044715 * x * x);
+                let expected_gelu = 0.5 * x * (1.0 + z.tanh()) * up[i] as f64;
+                assert_close(gelu[i], expected_gelu, 1.0, kernels.name);
+            }
+        }
+    }
+}
+
+#[test]
+fn softmax_matches_the_definition() {
+    let mut rng = Rng(13);
+    for kernels in available() {
+        for n in [1, 2, 7, 8, 9, 31, 200] {
+            let logits = rng.floats(n, -12.0, 12.0);
+            let mut out = logits.clone();
+            kernels.softmax(&mut out);
+            let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
+            let total: f64 = logits.iter().map(|v| (*v as f64 - max).exp()).sum();
+            let mut sum = 0.0f64;
+            for i in 0..n {
+                let expected = (logits[i] as f64 - max).exp() / total;
+                assert_close(out[i], expected, 1.0, kernels.name);
+                sum += out[i] as f64;
+            }
+            assert!((sum - 1.0).abs() < 1e-5, "{}: sums to {sum}", kernels.name);
+        }
+        kernels.softmax(&mut []);
+    }
+}
+
+#[test]
+fn quantized_activations_reconstruct_their_input() {
+    let mut rng = Rng(14);
+    for group in [32, 256] {
+        let mut x = rng.floats(group * 4, -3.0, 3.0);
+        // One group of zeros, and one dominated by a single large value.
+        x[group..group * 2].fill(0.0);
+        x[group * 2 + 5] = 400.0;
+        let reference = Acts::new(scalar(), &x, group);
+
+        for g in 0..4 {
+            let q = &reference.q[g * group..(g + 1) * group];
+            let largest = q.iter().map(|v| v.unsigned_abs()).max().unwrap();
+            assert_eq!(largest, if g == 1 { 0 } else { 127 });
+            let total: i32 = q.iter().map(|&v| v as i32).sum();
+            assert!((reference.wsum[g] - reference.scale[g] * total as f32).abs() < 1e-4);
+        }
+        for (i, restored) in reference.reconstruct().iter().enumerate() {
+            let step = reference.scale[i / group];
+            assert!((restored - x[i]).abs() <= step * 0.5001, "element {i}");
+        }
+        for (i, sum) in reference.sums.iter().enumerate() {
+            let expected: i32 = reference.q[i * 16..(i + 1) * 16]
+                .iter()
+                .map(|&v| v as i32)
+                .sum();
+            assert_eq!(*sum as i32, expected);
+        }
+
+        for kernels in available() {
+            let acts = Acts::new(kernels, &x, group);
+            assert_eq!(acts.q, reference.q, "{}", kernels.name);
+            assert_eq!(acts.sums, reference.sums, "{}", kernels.name);
+            assert_eq!(acts.scale, reference.scale, "{}", kernels.name);
+        }
+    }
+}
+
+#[test]
+fn scalar_rows_match_the_definition() {
+    let mut rng = Rng(15);
+    for ty in QUANT_TYPES {
+        let n = 512;
+        let row = random_weights(&mut rng, ty, n, 3.2);
+        let x = rng.floats(n, -3.0, 3.0);
+        let acts = Acts::new(scalar(), &x, group_of(ty));
+        // The kernel sees the quantized activations, so compare against the
+        // floats those stand for.
+        let (expected, magnitude) = reference_dot(ty, &row, &acts.reconstruct());
+        assert_close(
+            row_dot(scalar(), ty, &row, n, &acts),
+            expected,
+            magnitude,
+            ty.name(),
+        );
+    }
+}
+
+#[test]
+fn every_backend_matches_scalar_rows() {
+    let mut rng = Rng(16);
+    for kernels in available() {
+        for ty in QUANT_TYPES {
+            // One, two, three and five blocks: odd counts exercise the tail
+            // of kernels that work on two blocks at a time.
+            for blocks in [1, 2, 3, 5] {
+                let n = blocks * ty.block_len();
+                let row = random_weights(&mut rng, ty, n, 3.2);
+                let x = rng.floats(n, -3.0, 3.0);
+                let acts = Acts::new(scalar(), &x, group_of(ty));
+                let (expected, magnitude) = reference_dot(ty, &row, &acts.reconstruct());
+                let got = row_dot(kernels, ty, &row, n, &acts);
+                assert_close(
+                    got,
+                    expected,
+                    magnitude,
+                    &format!("{} {} n={n}", kernels.name, ty.name()),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn extreme_weights_and_activations_do_not_saturate() {
+    let mut rng = Rng(17);
+    for kernels in available() {
+        for ty in QUANT_TYPES {
+            let n = 2 * ty.block_len().max(32);
+            for fill in [0x00u8, 0x7f, 0x80, 0xff] {
+                let mut row = vec![fill; ty.row_bytes(n).unwrap()];
+                set_scales(&mut rng, ty, &mut row, 0.05);
+                // Constant activations quantize to +127 or -127 everywhere.
+                for value in [2.5f32, -2.5] {
+                    let x = vec![value; n];
+                    let acts = Acts::new(scalar(), &x, group_of(ty));
+                    assert!(acts.q.iter().all(|q| q.unsigned_abs() == 127));
+                    let (expected, magnitude) = reference_dot(ty, &row, &acts.reconstruct());
+                    let got = row_dot(kernels, ty, &row, n, &acts);
+                    let what = format!("{} {} fill {fill:#04x} x {value}", kernels.name, ty.name());
+                    assert_close(got, expected, magnitude, &what);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn float_rows_match_the_definition() {
+    let mut rng = Rng(18);
+    for kernels in available() {
+        for n in 0..45 {
+            let weights = rng.floats(n, -2.0, 2.0);
+            let x = rng.floats(n, -2.0, 2.0);
+
+            let f32_row: Vec<u8> = weights.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let halves: Vec<u16> = weights.iter().map(|w| f32_to_f16(*w)).collect();
+            let f16_row: Vec<u8> = halves.iter().flat_map(|h| h.to_le_bytes()).collect();
+            let brains: Vec<u16> = weights.iter().map(|w| (w.to_bits() >> 16) as u16).collect();
+            let bf16_row: Vec<u8> = brains.iter().flat_map(|h| h.to_le_bytes()).collect();
+
+            let cases: [(TensorType, &[u8], Vec<f32>); 3] = [
+                (TensorType::F32, &f32_row, weights.clone()),
+                (
+                    TensorType::F16,
+                    &f16_row,
+                    halves.iter().map(|h| f16_to_f32(*h)).collect(),
+                ),
+                (
+                    TensorType::BF16,
+                    &bf16_row,
+                    brains.iter().map(|h| bf16_to_f32(*h)).collect(),
+                ),
+            ];
+            for (ty, row, stored) in cases {
+                let expected: f64 = stored
+                    .iter()
+                    .zip(&x)
+                    .map(|(w, v)| *w as f64 * *v as f64)
+                    .sum();
+                let got = match kernels.row_dot(ty) {
+                    // SAFETY: `row` holds `n` weights and `x` holds `n` floats.
+                    RowDot::Float(dot) => unsafe { dot(row.as_ptr(), x.as_ptr(), n) },
+                    RowDot::Quant(_) => panic!("{} is a float type", ty.name()),
+                };
+                assert_close(
+                    got,
+                    expected,
+                    n as f64,
+                    &format!("{} {} n={n}", kernels.name, ty.name()),
+                );
+            }
+        }
+    }
+}
+
+/// A microbenchmark, not a check. Run it with:
+/// `cargo test --release --lib kernel_speed -- --ignored --nocapture`
+///
+/// Prints the time per weight of every row kernel on a matrix small enough
+/// to stay in the CPU cache, so the number reflects the kernel alone.
+#[test]
+#[ignore = "a benchmark, run on request"]
+fn kernel_speed() {
+    let mut rng = Rng(19);
+    let (rows, cols) = (32, 1024);
+    let x = rng.floats(cols, -3.0, 3.0);
+    println!("picoseconds per weight, {rows} rows of {cols}:");
+    for ty in QUANT_TYPES {
+        let matrix = random_weights(&mut rng, ty, rows * cols, 3.2);
+        let row_bytes = ty.row_bytes(cols).unwrap();
+        let acts = Acts::new(scalar(), &x, group_of(ty));
+        let mut line = format!("  {:<7}", ty.name());
+        for kernels in available() {
+            let mut sink = 0.0f32;
+            let rounds = 2000;
+            let start = std::time::Instant::now();
+            for _ in 0..rounds {
+                for row in matrix.chunks_exact(row_bytes) {
+                    sink += row_dot(kernels, ty, row, cols, &acts);
+                }
+            }
+            let picos = start.elapsed().as_secs_f64() * 1e12 / (rounds * rows * cols) as f64;
+            std::hint::black_box(sink);
+            line.push_str(&format!("  {} {picos:>6.1}", kernels.name));
+        }
+        println!("{line}");
+    }
+}

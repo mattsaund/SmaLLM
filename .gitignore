@@ -1,0 +1,57 @@
+# Build output
+/target/
+/capi/target/
+**/*.rs.bk
+*.pdb
+
+# C API example builds
+/capi/examples/chat
+/capi/examples/*.o
+/capi/examples/*.exe
+
+# Models are large and personal. Keep them out of the repo.
+*.gguf
+/models/
+
+# Packaging output
+/dist/
+*.tar.gz
+*.zip
+SHA256SUMS
+
+# Claude Code settings and working folders
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Temporary files, logs and profiling output
+*.tmp
+*.log
+/tmp/
+perf.data
+perf.data.old
+flamegraph.svg
+/core
+/core.[0-9]*
+vgcore.*
+
+# Python, for the scripts in tools/
+__pycache__/
+*.pyc
+.venv/
+
+# Merge and patch leftovers
+*.orig
+*.rej
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini

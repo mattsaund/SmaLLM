@@ -1,0 +1,254 @@
+# Ready-made binaries and libraries: built on every push to main, published
+# when a version is tagged.
+#
+# This is what makes SmaLLM installable on a machine with no compiler, which
+# is most single-board computers. The installers download one of these, and
+# only fall back to building when there is none for the machine.
+#
+# Every push to main runs all of it except the publishing, so by the time a
+# version is tagged its exact build has already passed here. To release:
+#
+#   1. Set `version` in Cargo.toml and capi/Cargo.toml, and give the version
+#      a section in CHANGELOG.md.
+#   2. Push to main, and wait for this and `ci` to pass.
+#   3. git tag v0.1.0 && git push origin v0.1.0
+#
+# The tag has to match Cargo.toml, and the changelog has to have the version
+# in it. The `version` job stops the release before anything is built
+# otherwise.
+name: release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  # Runs the builds by hand, to check the packaging without publishing. Only
+  # a tag publishes. See the condition on the `publish` job.
+  workflow_dispatch:
+
+# Building needs nothing more. The one job that writes asks for it itself.
+permissions:
+  contents: read
+
+# A dry run on main is made moot by the next push. A release is never cut
+# short half way through.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type == 'branch' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: check the version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Read the version, and hold the tag and the changelog to it
+        id: read
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          echo "Cargo.toml says $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          library=$(grep -m1 '^version' capi/Cargo.toml | cut -d'"' -f2)
+          if [ "$library" != "$version" ]; then
+            echo "::error::capi/Cargo.toml says $library but Cargo.toml says $version"
+            exit 1
+          fi
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::the tag is $GITHUB_REF_NAME but Cargo.toml says $version"
+            exit 1
+          fi
+          if ! grep -q "^## $version " CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no section for $version"
+            exit 1
+          fi
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux programs are linked against musl, statically. One file runs
+          # on every distribution, whatever C library it has, or none.
+          # The library is linked against glibc instead, because a shared
+          # library has to use the C library of the program that loads it.
+          # It is built on the oldest Ubuntu GitHub still runs: a library
+          # works with the glibc it was linked against or any newer one.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            library: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-musl
+            library: aarch64-unknown-linux-gnu
+          # 32-bit ARM and RISC-V are cross-built with the linker Rust
+          # ships, and run under emulation before they are packaged.
+          - os: ubuntu-22.04
+            target: armv7-unknown-linux-musleabihf
+            env_name: ARMV7_UNKNOWN_LINUX_MUSLEABIHF
+            qemu: qemu-arm-static
+          - os: ubuntu-22.04
+            target: riscv64gc-unknown-linux-musl
+            env_name: RISCV64GC_UNKNOWN_LINUX_MUSL
+            qemu: qemu-riscv64-static
+          # Apple silicon natively, and Intel cross-built on the same runner.
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            library: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            library: x86_64-apple-darwin
+            cross: true
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            library: x86_64-pc-windows-msvc
+          # Built on Arm instead of cross-built, so it is run before it
+          # ships like the others are.
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            library: aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}${{ matrix.library && format(',{0}', matrix.library) || '' }}
+
+      - name: Install QEMU
+        if: matrix.qemu
+        run: sudo apt-get update && sudo apt-get install -y qemu-user-static
+
+      - name: Build the program
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.env_name }}" ]; then
+            export CARGO_TARGET_${{ matrix.env_name }}_LINKER=rust-lld
+            # RISC-V links musl dynamically unless told otherwise.
+            export CARGO_TARGET_${{ matrix.env_name }}_RUSTFLAGS="-C target-feature=+crt-static"
+          fi
+          cargo build --release --locked --target ${{ matrix.target }} --bin smallm
+
+      - name: Build the library
+        if: matrix.library
+        run: cargo build --release --locked --target ${{ matrix.library }} -p smallm-capi
+
+      # A binary that does not start, or calls itself a different version,
+      # is caught here instead of on someone's machine.
+      - name: Run it
+        if: ${{ !matrix.cross }}
+        shell: bash
+        run: |
+          got=$(${{ matrix.qemu }} "target/${{ matrix.target }}/release/smallm" version)
+          echo "$got"
+          [ "$got" = "smallm ${{ needs.version.outputs.version }}" ]
+
+      - name: Check it is built for Intel
+        if: ${{ matrix.cross }}
+        run: lipo -info "target/${{ matrix.target }}/release/smallm" | grep x86_64
+
+      - name: Check the Linux program is static
+        if: runner.os == 'Linux'
+        run: |
+          file "target/${{ matrix.target }}/release/smallm"
+          file "target/${{ matrix.target }}/release/smallm" | grep -Eq 'statically linked|static-pie linked'
+
+      # The names here are what the installers ask for: `smallm-<target>.zip`
+      # on Windows and `smallm-<target>.tar.gz` everywhere else. Change them
+      # in both places or neither.
+      - name: Package the program for Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "target/${{ matrix.target }}/release/smallm.exe", README.md, LICENSE `
+            -DestinationPath "smallm-${{ matrix.target }}.zip"
+
+      - name: Package the program for macOS and Linux
+        if: runner.os != 'Windows'
+        run: |
+          tar -czf "smallm-${{ matrix.target }}.tar.gz" \
+            -C "target/${{ matrix.target }}/release" smallm \
+            -C "$GITHUB_WORKSPACE" README.md LICENSE
+
+      # The library package: the shared and the static library, the C
+      # header, and the Python binding that loads the shared one.
+      - name: Package the library for Windows
+        if: matrix.library && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $out = "target/${{ matrix.library }}/release"
+          Compress-Archive -Path "$out/smallm.dll", "$out/smallm.dll.lib", "$out/smallm.lib", `
+            capi/include/smallm.h, bindings/python/smallm.py, capi/README.md, LICENSE `
+            -DestinationPath "libsmallm-${{ matrix.library }}.zip"
+
+      - name: Package the library for macOS and Linux
+        if: matrix.library && runner.os != 'Windows'
+        run: |
+          out="target/${{ matrix.library }}/release"
+          stage="$RUNNER_TEMP/libsmallm"
+          mkdir -p "$stage/lib" "$stage/include" "$stage/python"
+          if [ "$RUNNER_OS" = macOS ]; then
+            cp "$out/libsmallm.dylib" "$stage/lib/"
+            # Found through the run path of whatever links it, not at the
+            # place it was built.
+            install_name_tool -id @rpath/libsmallm.dylib "$stage/lib/libsmallm.dylib"
+          else
+            cp "$out/libsmallm.so" "$stage/lib/"
+          fi
+          cp "$out/libsmallm.a" "$stage/lib/"
+          cp capi/include/smallm.h "$stage/include/"
+          cp bindings/python/smallm.py "$stage/python/"
+          cp capi/README.md LICENSE "$stage/"
+          tar -czf "libsmallm-${{ matrix.library }}.tar.gz" -C "$stage" lib include python README.md LICENSE
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: smallm-${{ matrix.target }}
+          path: |
+            smallm-${{ matrix.target }}.*
+            libsmallm-*
+
+  publish:
+    name: publish the release
+    needs: [version, build]
+    # A push to main or a hand-run build has no tag to hang a release on. It
+    # stops here with the packages downloadable from the run page.
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * | tee SHA256SUMS
+
+      # The release notes are the version's own section of the changelog, so
+      # the two can never say different things.
+      - name: Release notes
+        run: |
+          awk -v v="${{ needs.version.outputs.version }}" '
+            index($0, "## " v " ") == 1 { inside = 1; next }
+            inside && /^## / { exit }
+            inside { print }
+          ' CHANGELOG.md > notes.md
+          cat notes.md
+          [ -s notes.md ]
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          name: SmaLLM ${{ needs.version.outputs.version }}
+          body_path: notes.md
+          files: dist/*
