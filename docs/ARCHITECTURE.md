@@ -2,7 +2,7 @@
 
 This page follows a prompt through the engine, from the model file to the
 next token, and says why each part is built the way it is.
-[CONTRIBUTING.md](../CONTRIBUTING.md) has the map of the files.
+[CONTRIBUTING.md](CONTRIBUTING.md) has the map of the files.
 
 ## The layers
 

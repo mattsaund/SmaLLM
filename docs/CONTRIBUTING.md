@@ -1,7 +1,10 @@
 # Contributing to SmaLLM
 
 Issues and pull requests are welcome. This page covers the AI policy, how to
-build and test, where things live, and the rules every change is held to.
+build and test, how to work, where things live, and the rules every change
+is held to. [DEVELOPMENT.md](DEVELOPMENT.md) is about running and measuring
+SmaLLM on single-board computers, and [ARCHITECTURE.md](ARCHITECTURE.md)
+explains how the engine works.
 
 ## AI policy
 
@@ -42,7 +45,7 @@ SMALLM_TEST_MODELS=~/models cargo test --release --test golden
 `tests/golden.rs` lists the models. CI downloads the three smallest ones.
 The C API and the Python binding have tests of their own that use the same
 folder.
-[tools/reference](tools/reference/README.md) explains how the golden files
+[tools/reference](../tools/reference/README.md) explains how the golden files
 are made.
 
 ### Measuring speed
@@ -55,6 +58,11 @@ cargo test --release --lib kernel_speed -- --ignored --nocapture
 
 The last command times each row kernel on a matrix that stays in the CPU
 cache. Use it when you change a kernel.
+
+Measure before and after a change to a hot path, on a quiet machine, and
+take the best of several runs: a busy machine only makes a run slower.
+[DEVELOPMENT.md](DEVELOPMENT.md) has the recipes used for the published
+numbers, including the comparison with llama.cpp.
 
 ## Project map
 
@@ -147,13 +155,16 @@ SmaLLM/
 │       ├── ref.c            the llama.cpp side of the golden tests
 │       ├── golden.sh        runs ref over the models
 │       └── quant.c          the vectors in tests/golden/quant
-├── docs/ARCHITECTURE.md     how the engine works and why
+├── docs/
+│   ├── ARCHITECTURE.md      how the engine works and why
+│   ├── CONTRIBUTING.md      this page
+│   └── DEVELOPMENT.md       running and measuring on single-board computers
 ├── install.sh, install.ps1  the one-line installers
 ├── .cargo/config.toml       static C runtime for Windows builds
 └── .github/workflows/       CI and releases
 ```
 
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) follows one token through the
+[ARCHITECTURE.md](ARCHITECTURE.md) follows one token through the
 engine and explains the design choices.
 
 ## Common changes
@@ -190,6 +201,9 @@ engine and explains the design choices.
 9. **Keep the map true.** A new file gets a line in the project map above.
 10. **No AI attribution in git.** Commit messages and pull requests carry no
     `Co-Authored-By` trailer or "generated with" line for an AI tool.
+11. **Rust 1.85 builds it without warnings.** That is the Rust that Debian 13
+    and Raspberry Pi OS ship. An intrinsic newer than that goes through
+    inline assembly. CI checks this.
 
 ## Commits and pull requests
 
@@ -198,6 +212,12 @@ engine and explains the design choices.
   "Add the Q4_1 kernel for NEON". Add a body when the reason is not obvious.
 - CI must pass. A change to a kernel or the forward pass needs a test that
   fails without it.
+- Every kernel is tested against the portable one in `src/kernels/tests.rs`.
+  A new kernel is covered by adding it to its backend's table.
+- A change to the forward pass keeps `tests/golden.rs` passing on real
+  models. A new architecture is checked with `tests/compare.rs` first.
+- `gh workflow run ci --ref <branch>` runs CI on a branch before a pull
+  request.
 
 ## Releases
 

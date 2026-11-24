@@ -19,10 +19,20 @@
 *.zip
 SHA256SUMS
 
-# Claude Code settings and working folders
+# Claude Code settings and working folders. These stay on each machine:
+# the notes for contributors are in docs/.
 .claude/
 CLAUDE.md
 CLAUDE.local.md
+
+# Secrets: keys, tokens and environment files never belong in the repo.
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+.netrc
 
 # Editors
 .vscode/

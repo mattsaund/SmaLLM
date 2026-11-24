@@ -32,6 +32,9 @@ Each version is a `v` tag, with ready-made binaries and libraries on its
   `cache-type` setting, and `cache_type` in the C API) keeps 32-bit floats.
 - **YaRN** position scaling, which gpt-oss and DeepSeek use and some Qwen
   files ask for.
+- **Docs.** The contributor guide moved to `docs/CONTRIBUTING.md`, next to
+  a new `docs/DEVELOPMENT.md` on running and measuring SmaLLM on
+  single-board computers. `.gitignore` covers key and environment files.
 - **Reasoning.** What thinking models write before their answer (between
   `<think>` tags, or on Harmony's analysis channel) is shown faint in a
   chat and kept out of the conversation. The server returns it as

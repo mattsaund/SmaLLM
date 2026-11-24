@@ -351,8 +351,10 @@ to follow specific guidelines:
 
 **Tests.** `cargo test`, `cargo clippy` and `cargo fmt`. CI runs all three on
 Linux, macOS and Windows, on x86-64 and ARM, and compares the engine's output
-with llama.cpp's on real models. [CONTRIBUTING.md](CONTRIBUTING.md) has the
-project map and the rules. A version is released by tagging it. See
+with llama.cpp's on real models. [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md)
+has the project map and the rules, and
+[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) what to measure on a
+single-board computer. A version is released by tagging it. See
 `.github/workflows/release.yml`.
 
 ## License and credits
