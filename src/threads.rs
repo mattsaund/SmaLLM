@@ -569,7 +569,10 @@ mod tests {
                 assert_eq!(*owner.get_or_insert(me), me, "slot {slot} is shared");
             });
         }
-        assert_eq!(*owners[0].lock().unwrap(), Some(thread::current().id()));
+        // Slot 0 is the caller's. The workers can take every chunk before
+        // the caller gets to one, so the slot may also have gone unused.
+        let first = *owners[0].lock().unwrap();
+        assert!(first.is_none() || first == Some(thread::current().id()));
     }
 
     #[test]
