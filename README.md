@@ -7,7 +7,9 @@ One program of about a megabyte. No dependencies, nothing to configure.
 
 **Full installation size:**\
 1.03 MB Linux (x86_64), 0.89 MB Linux (arm64)\
-0.86 MB Linux (armv7), 0.85 MB Linux (riscv64)
+0.86 MB Linux (armv7), 0.85 MB Linux (riscv64)\
+0.80 MB macOS (Intel), 0.75 MB macOS (Apple silicon)\
+0.84 MB Windows (x86_64), 0.75 MB Windows (arm64)
 
 ## Install
 
