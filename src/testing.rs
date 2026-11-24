@@ -155,6 +155,9 @@ pub(crate) struct TinyModel {
     /// Phi-3's LongRoPE: short and long rotary divisors, a short original
     /// context, and a rotary attention factor.
     pub longrope: bool,
+    /// YaRN position scaling, with a short original context so that its
+    /// ramp falls inside the small heads.
+    pub yarn: bool,
     pub seed: u64,
 }
 
@@ -200,6 +203,7 @@ impl TinyModel {
             wide_qk_norm: arch == "olmoe",
             granite_scales: matches!(arch, "granite" | "granitemoe"),
             longrope: arch == "phi3",
+            yarn: arch == "qwen3",
             seed: 1,
         };
         if matches!(
@@ -418,6 +422,12 @@ impl TinyModel {
             builder
                 .u32(&format!("{arch}.rope.scaling.original_context_length"), 256)
                 .f32(&format!("{arch}.rope.scaling.attn_factor"), 1.1);
+        }
+        if self.yarn {
+            builder
+                .string(&format!("{arch}.rope.scaling.type"), "yarn")
+                .f32(&format!("{arch}.rope.scaling.factor"), 4.0)
+                .u32(&format!("{arch}.rope.scaling.original_context_length"), 64);
         }
         if self.granite_scales {
             builder

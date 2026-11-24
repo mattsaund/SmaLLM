@@ -28,7 +28,9 @@ use crate::error::Result;
 use crate::gguf::Gguf;
 use crate::tokenizer::Tokenizer;
 
-pub use config::{ARCHITECTURES, Activation, Config, Gating, LayerSpec, Mixer, Rope, Routing};
+pub use config::{
+    ARCHITECTURES, Activation, Config, Gating, LayerSpec, Mixer, Rope, Routing, Yarn,
+};
 pub use encoder::{ENCODERS, Embedder, Pooling, normalize};
 pub use forward::{Phase, Profile, Session, SessionConfig};
 pub use weights::{

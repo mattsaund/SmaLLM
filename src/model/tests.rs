@@ -149,11 +149,37 @@ mod oracle {
         factors: Option<&[f32]>,
     ) {
         let n = spec.rope_dims;
-        let scale = config.rope_attn_factor as f64;
+        let mut scale = config.rope_attn_factor as f64;
+        // YaRN as Hugging Face's transformers writes it: the correction
+        // range, then a linear ramp between interpolated and extrapolated
+        // frequencies.
+        let ramp = config.yarn.map(|yarn| {
+            let correction_dim = |rotations: f32| {
+                let context = yarn.original_context as f64;
+                n as f64 * (context / (rotations as f64 * 2.0 * std::f64::consts::PI)).ln()
+                    / (2.0 * (spec.rope_base as f64).ln())
+            };
+            let factor = 1.0 / spec.rope_scale as f64;
+            scale *= yarn.attn_factor as f64 * (0.1 * factor.ln() + 1.0);
+            let low = correction_dim(yarn.beta_fast).floor().max(0.0);
+            let high = correction_dim(yarn.beta_slow).ceil().min(n as f64 - 1.0);
+            (low, if low == high { high + 0.001 } else { high })
+        });
         for i in 0..n / 2 {
             let frequency = (spec.rope_base as f64).powf(-2.0 * i as f64 / n as f64);
             let divisor = factors.map_or(1.0, |f| f[i] as f64);
-            let angle = position as f64 * frequency * spec.rope_scale as f64 / divisor;
+            let extrapolation = frequency / divisor;
+            let interpolation = extrapolation * spec.rope_scale as f64;
+            let inv_freq = match ramp {
+                Some((low, high)) => {
+                    let linear = ((i as f64 - low) / (high - low)).clamp(0.0, 1.0);
+                    let extrapolation_factor = 1.0 - linear;
+                    interpolation * (1.0 - extrapolation_factor)
+                        + extrapolation * extrapolation_factor
+                }
+                None => interpolation,
+            };
+            let angle = position as f64 * inv_freq;
             let (a, b) = match config.rope {
                 Rope::Pairs => (2 * i, 2 * i + 1),
                 Rope::Halves => (i, i + n / 2),

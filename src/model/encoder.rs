@@ -290,6 +290,7 @@ impl Encoder {
             attention_softcap: 0.0,
             rope_attn_factor: 1.0,
             long_context_after: 0,
+            yarn: None,
             routing: None,
         };
         Ok((config, encoder))

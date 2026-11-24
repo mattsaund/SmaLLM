@@ -72,6 +72,23 @@ pub struct Routing {
     pub scale: f32,
 }
 
+/// YaRN, a way to stretch rotary positions over a longer context than the
+/// model was trained with. Low frequencies are scaled down to fit the
+/// longer context, high ones are kept as they are, and a ramp blends the
+/// two in between. Rotated values are also scaled up a little.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Yarn {
+    /// The context length the model was trained with before stretching.
+    pub original_context: usize,
+    /// Rotations over the original context below which a pair is kept as
+    /// it is. Pairs that turn fewer times than `beta_slow` are scaled.
+    pub beta_fast: f32,
+    pub beta_slow: f32,
+    /// Multiplier on rotated values, before the part each layer's scaling
+    /// adds. One for most models: see `RopeTables::new`.
+    pub attn_factor: f32,
+}
+
 /// How a block mixes information across positions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mixer {
@@ -187,6 +204,8 @@ pub struct Config {
     /// context was extended. Longer sessions use its long rotary divisors.
     /// Zero for models without them.
     pub long_context_after: usize,
+    /// YaRN's settings, for models that stretch their positions that way.
+    pub yarn: Option<Yarn>,
     /// The expert settings, for models with mixture-of-experts layers.
     pub routing: Option<Routing>,
 }
@@ -297,6 +316,7 @@ impl Config {
             attention_softcap: 0.0,
             rope_attn_factor: meta.f32("rope.scaling.attn_factor").unwrap_or(1.0),
             long_context_after: 0,
+            yarn: meta.yarn(n_ctx_train),
             routing,
             arch: arch.clone(),
         };
@@ -668,13 +688,29 @@ impl Meta<'_> {
 
     /// The linear position scaling, as a multiplier on rotary angles. Other
     /// kinds of scaling change the rotary formula, which is not done here.
-    fn rope_scale(&self) -> Result<f32> {
-        match self
-            .file
+    /// The rotary scaling type the file names, linear by default.
+    fn rope_scaling(&self) -> &str {
+        self.file
             .get_str(&self.key("rope.scaling.type"))
             .unwrap_or("linear")
-        {
-            "none" | "linear" => {
+    }
+
+    /// YaRN's settings, when the file asks for it. `n_ctx_train` is the
+    /// original context when the file does not give one.
+    fn yarn(&self, n_ctx_train: usize) -> Option<Yarn> {
+        (self.rope_scaling() == "yarn").then(|| Yarn {
+            original_context: self
+                .usize("rope.scaling.original_context_length")
+                .unwrap_or(n_ctx_train),
+            beta_fast: self.f32("rope.scaling.yarn_beta_fast").unwrap_or(32.0),
+            beta_slow: self.f32("rope.scaling.yarn_beta_slow").unwrap_or(1.0),
+            attn_factor: 1.0,
+        })
+    }
+
+    fn rope_scale(&self) -> Result<f32> {
+        match self.rope_scaling() {
+            "none" | "linear" | "yarn" => {
                 let factor = self
                     .f32("rope.scaling.factor")
                     .or_else(|| self.f32("rope.scale_linear"))
@@ -849,7 +885,7 @@ mod tests {
         assert!(config(&builder).is_err(), "more used than there are");
 
         let mut builder = base("llama");
-        builder.string("llama.rope.scaling.type", "yarn");
+        builder.string("llama.rope.scaling.type", "dynamic");
         assert!(config(&builder).is_err());
     }
 
@@ -877,5 +913,22 @@ mod tests {
         let mut builder = base("llama");
         builder.f32("llama.rope.scaling.factor", 4.0);
         assert_eq!(config(&builder).unwrap().layers[0].rope_scale, 0.25);
+        assert_eq!(config(&builder).unwrap().yarn, None);
+    }
+
+    #[test]
+    fn yarn_settings_are_read() {
+        let mut builder = base("llama");
+        builder
+            .string("llama.rope.scaling.type", "yarn")
+            .f32("llama.rope.scaling.factor", 4.0)
+            .f32("llama.rope.scaling.yarn_beta_fast", 16.0);
+        let c = config(&builder).unwrap();
+        assert_eq!(c.layers[0].rope_scale, 0.25);
+        let yarn = c.yarn.unwrap();
+        assert_eq!(yarn.original_context, c.n_ctx_train);
+        assert_eq!((yarn.beta_fast, yarn.beta_slow), (16.0, 1.0));
+        builder.u32("llama.rope.scaling.original_context_length", 64);
+        assert_eq!(config(&builder).unwrap().yarn.unwrap().original_context, 64);
     }
 }

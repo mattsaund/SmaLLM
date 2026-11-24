@@ -47,7 +47,7 @@ use crate::tensor::quant::dequantize_row;
 use crate::threads::{ThreadPool, default_batch_threads, default_threads};
 
 use super::Model;
-use super::config::{Activation, Config, Gating, LayerSpec, Mixer, Rope, Routing};
+use super::config::{Activation, Config, Gating, LayerSpec, Mixer, Rope, Routing, Yarn};
 use super::conv::ConvState;
 use super::kv::KvCache;
 use super::matmul::{ActScratch, Engine, Target};
@@ -192,7 +192,7 @@ struct RopeKind {
     /// Angle per position of each rotated pair.
     freqs: Vec<f64>,
     /// What every rotated value is multiplied by: the model's rotary
-    /// attention factor.
+    /// attention factor, and YaRN's.
     scale: f32,
     /// `(cos, sin)` of every pair, for each token of the batch.
     table: Vec<f32>,
@@ -208,7 +208,6 @@ struct RopeTables {
 
 impl RopeTables {
     fn new(config: &Config, factors: Option<&[f32]>) -> RopeTables {
-        let scale = config.rope_attn_factor;
         let mut kinds = Vec::new();
         let mut settings = Vec::new();
         let mut of_layer = Vec::with_capacity(config.n_layer);
@@ -228,10 +227,20 @@ impl RopeTables {
                 Some(index) => index,
                 None => {
                     settings.push(key);
+                    // YaRN scales rotated values up by a tenth of the log of
+                    // how far the layer stretches positions, as llama.cpp
+                    // does.
+                    let scale = match &config.yarn {
+                        Some(yarn) => {
+                            let stretch = 1.0 / layer.rope_scale;
+                            yarn.attn_factor * (1.0 + 0.1 * stretch.ln())
+                        }
+                        None => 1.0,
+                    };
                     kinds.push(RopeKind {
                         dims: layer.rope_dims,
-                        freqs: frequencies(layer, factors),
-                        scale,
+                        freqs: frequencies(layer, factors, config.yarn.as_ref()),
+                        scale: scale * config.rope_attn_factor,
                         table: Vec::new(),
                     });
                     kinds.len() - 1
@@ -296,13 +305,43 @@ fn rope_factors(model: &Model, n_ctx: usize) -> Option<&[f32]> {
 }
 
 /// The angle per position of each rotated pair of a layer's heads.
-fn frequencies(layer: &LayerSpec, factors: Option<&[f32]>) -> Vec<f64> {
-    (0..layer.rope_dims / 2)
+///
+/// Under YaRN, the pairs that turn many times over the original context
+/// keep their frequency, the ones that turn few times are scaled like the
+/// rest, and a linear ramp blends the two in between. The ramp's ends are
+/// computed as in ggml, from the pairs that make `beta_fast` and
+/// `beta_slow` turns.
+fn frequencies(layer: &LayerSpec, factors: Option<&[f32]>, yarn: Option<&Yarn>) -> Vec<f64> {
+    let dims = layer.rope_dims;
+    let base = layer.rope_base as f64;
+    let scale = layer.rope_scale as f64;
+    // The pairs at which the ramp starts and ends.
+    let ramp = yarn.map(|yarn| {
+        let pair = |turns: f32| {
+            let context = yarn.original_context as f64;
+            dims as f64 * (context / (turns as f64 * 2.0 * std::f64::consts::PI)).ln()
+                / (2.0 * base.ln())
+        };
+        let low = pair(yarn.beta_fast).floor().max(0.0);
+        let high = pair(yarn.beta_slow).ceil().min(dims as f64 - 1.0);
+        (low, high)
+    });
+    (0..dims / 2)
         .map(|i| {
-            let exponent = -2.0 * i as f64 / layer.rope_dims as f64;
-            let frequency = (layer.rope_base as f64).powf(exponent);
+            let exponent = -2.0 * i as f64 / dims as f64;
             let divisor = factors.map_or(1.0, |f| f[i] as f64);
-            frequency * layer.rope_scale as f64 / divisor
+            let kept = base.powf(exponent) / divisor;
+            let scaled = kept * scale;
+            match ramp {
+                // How much of the kept frequency to use: all of it below
+                // the ramp, none above.
+                Some((low, high)) => {
+                    let along = (i as f64 - low) / (high - low).max(0.001);
+                    let keep = 1.0 - along.clamp(0.0, 1.0);
+                    scaled * (1.0 - keep) + kept * keep
+                }
+                None => scaled,
+            }
         })
         .collect()
 }
