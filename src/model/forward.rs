@@ -51,6 +51,7 @@ use super::config::{Activation, Config, Gating, LayerSpec, Mixer, Rope, Routing}
 use super::conv::ConvState;
 use super::kv::KvCache;
 use super::matmul::{ActScratch, Engine, Target};
+use super::recurrent::{self, RecurrentState};
 use super::weights::{
     AttentionWeights, ConvWeights, Dense, Experts, FeedForward, Linear, Matrix, MixerWeights,
     PerLayerInputs, PerLayerWeights,
@@ -471,11 +472,14 @@ pub struct Session {
     batch_pool: Option<ThreadPool>,
     kv: KvCache,
     conv: ConvState,
+    /// The states of recurrent blocks (Mamba, RWKV).
+    recurrent: RecurrentState,
     n_ctx: usize,
     batch: usize,
     /// One past the last block that keeps something for later tokens: a
-    /// key/value cache or a convolution state. From that block on, only the
-    /// rows whose logits are wanted are computed in full.
+    /// key/value cache, a convolution state or a recurrent state. From that
+    /// block on, only the rows whose logits are wanted are computed in
+    /// full.
     state_end: usize,
     scratch: Scratch,
     /// Logits for the token after the last evaluated one.
@@ -618,10 +622,13 @@ impl Session {
                 }
             })
             .collect();
-        let state_end = c
-            .layers
-            .iter()
-            .rposition(|layer| layer.owns_kv() || layer.mixer == Mixer::ShortConv)
+        let recurrent = RecurrentState::new(&recurrent::state_sizes(c));
+        let state_end = (0..c.n_layer)
+            .rev()
+            .find(|&index| {
+                let layer = &c.layers[index];
+                layer.owns_kv() || layer.mixer == Mixer::ShortConv || recurrent.has(index)
+            })
             .map_or(0, |index| index + 1);
         let logits = vec![0.0; c.n_vocab];
         Ok(Session {
@@ -631,6 +638,7 @@ impl Session {
             batch_pool,
             kv: KvCache::new(&shapes),
             conv,
+            recurrent,
             n_ctx,
             batch,
             state_end,
@@ -674,7 +682,7 @@ impl Session {
     /// Bytes of memory held for the context: the key/value cache and the
     /// convolution state.
     pub fn cache_bytes(&self) -> usize {
-        self.kv.allocated_bytes() + self.conv.bytes()
+        self.kv.allocated_bytes() + self.conv.bytes() + self.recurrent.bytes()
     }
 
     /// Starts or stops timing the stages of every forward pass. Starting
@@ -701,13 +709,23 @@ impl Session {
     /// Removes every token from position `len` on. The logits are stale
     /// until the next [`eval`](Self::eval).
     ///
-    /// A model with convolution blocks may have to read a few hundred
-    /// tokens before `len` again to rebuild their state (see `conv.rs`).
+    /// A model with convolution or recurrent blocks may have to read tokens
+    /// before `len` again to rebuild their state (see `conv.rs` and
+    /// `recurrent.rs`).
     pub fn truncate(&mut self, len: usize) {
         if len >= self.tokens.len() {
             return;
         }
-        let resume = self.conv.rewind(len);
+        // Both kinds of state must stand at the same position. Each one
+        // stays where it is when asked for its own position, so this ends.
+        let mut resume = len;
+        loop {
+            let next = self.recurrent.rewind(self.conv.rewind(resume));
+            if next == resume {
+                break;
+            }
+            resume = next;
+        }
         self.kv.truncate(resume);
         let replay = self.tokens[resume..len].to_vec();
         self.tokens.truncate(resume);
@@ -741,6 +759,7 @@ impl Session {
             rotate(&mut key[..dims], &back[rope.of_layer[layer]], config.rope);
         });
         self.conv.shift(keep, discard);
+        self.recurrent.shift(keep, discard);
         self.tokens.drain(keep..keep + discard);
     }
 
@@ -779,6 +798,11 @@ impl Session {
         while let Some(batch) = batches.next() {
             self.forward(batch, want_logits && batches.peek().is_none());
         }
+        // The end of a prompt is where a later one is likely to go back
+        // to. Single generated tokens are not worth a copy of the state.
+        if tokens.len() > 1 {
+            self.recurrent.save();
+        }
     }
 
     /// Runs one batch through the model.
@@ -790,6 +814,7 @@ impl Session {
             batch_pool,
             kv,
             conv,
+            recurrent,
             state_end,
             scratch,
             logits,
@@ -843,6 +868,7 @@ impl Session {
             rope,
             kv,
             conv,
+            recurrent,
             acts,
             profile,
             count,
@@ -865,7 +891,8 @@ impl Session {
             } else {
                 count..count
             };
-            let keeps_state = spec.owns_kv() || spec.mixer == Mixer::ShortConv;
+            let keeps_state =
+                spec.owns_kv() || spec.mixer == Mixer::ShortConv || pass.recurrent.has(index);
             let inputs = if keeps_state {
                 0..count
             } else {
@@ -938,6 +965,7 @@ impl Session {
         }
         pass.kv.set_len(first_position + count);
         pass.conv.advance(first_position + count);
+        pass.recurrent.advance(first_position + count);
         history.extend_from_slice(tokens);
 
         if want_logits {
@@ -971,6 +999,7 @@ struct Pass<'a> {
     rope: &'a RopeTables,
     kv: &'a mut KvCache,
     conv: &'a mut ConvState,
+    recurrent: &'a mut RecurrentState,
     acts: &'a mut ActScratch,
     profile: &'a mut Option<Profile>,
     /// Tokens in the batch.

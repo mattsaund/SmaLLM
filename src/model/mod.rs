@@ -16,6 +16,7 @@ mod encoder;
 mod forward;
 mod kv;
 mod matmul;
+mod recurrent;
 mod weights;
 
 #[cfg(test)]
