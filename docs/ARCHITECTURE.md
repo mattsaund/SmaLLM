@@ -143,8 +143,9 @@ every row length.
 |---|---|---|
 | `scalar` | Everything. The reference for the others. | Plain loops the compiler vectorizes. |
 | `avx2` | x86-64 with AVX2, FMA and F16C | `vpmaddubsw`, `vpmaddwd` |
+| `avx2+vnni` | x86-64 with AVX-VNNI as well: Intel since the 12th generation and the N100, AMD since Zen 5 | `vpdpbusd` for tiles |
 | `neon` | Every ARM64 CPU | `smull` and pairwise adds |
-| `neon+dotprod` | ARM64 with the dot product extension, such as the Raspberry Pi 5 | `sdot` |
+| `neon+dotprod` | ARM64 with the dot product extension, such as the Raspberry Pi 5 and the RK3588 | `sdot` |
 | `exact` | Everything. For measuring accuracy. | None: weights are expanded to floats. |
 
 The backend is chosen once, when the process starts, from what the CPU
@@ -154,6 +155,46 @@ choice.
 A backend is a table of function pointers, `kernels::Kernels`. That table is
 the seam for other devices. A session takes its kernels as a parameter, and
 the C API already carries a `device` field for choosing one.
+
+## Reading a prompt: tiles
+
+Generating a token multiplies each weight row by one vector. Reading a
+prompt multiplies it by a batch of them, 32 by default, and that changes
+what is worth doing.
+
+The kernels above unpack a row's blocks while they multiply. For a batch
+that would unpack every row 32 times. So a batch of 8 or more vectors takes
+another route:
+
+1. A few rows are unpacked once into a **tile**: 8 rows with AVX2, 4 with
+   NEON. Unpacking 6-bit weights costs the same as multiplying them, so
+   paying it once per row instead of once per vector is most of the gain.
+2. The rows of a tile are interleaved. Columns are taken four at a time,
+   and for each run of four the tile holds those weights of its first row,
+   then of its second, and so on. A register loaded from that spot has one
+   32-bit lane per row.
+3. One multiply then serves every row of the tile: the four activation
+   bytes are repeated in every lane, and each lane's sum is one row's
+   result. Nothing is added across lanes at the end, which is what a
+   row-at-a-time kernel spends a third of its time on.
+
+Signed weights are shifted to be zero or more when a tile is filled, and
+the shift moves into the tile's offsets. That lets the byte multiply read
+them without any sign handling.
+
+A tile lives in a few kilobytes of scratch memory per thread, so this route
+costs no memory to speak of. The weights stay in the model file. llama.cpp
+gets its batch speed from a rearranged copy of the weights that it keeps in
+memory, which is why it holds hundreds of megabytes of its own for a model
+that SmaLLM runs in a few.
+
+`tensor/quant.rs` has the portable way to fill a tile, and each backend
+fills the common formats with its own instructions. A test holds those to
+the portable fill bit for bit.
+
+Generation does not use tiles. One vector per row leaves nothing to share
+the unpacking with, and at that point speed is set by how fast memory
+delivers the weights, not by the multiply.
 
 ## Attention and the key/value cache
 
@@ -188,6 +229,9 @@ cost of starting a loop matters more than anything else in the pool:
   evenly without knowing which core is which.
 - Small jobs run on the calling thread. Waking the pool for them would cost
   more than the work.
+- The steps around the matrices run in parallel too once a batch is large:
+  rounding the activations to 8 bits, and the gate of the feed-forward
+  network. Left serial, they were a fifth of the time on eight threads.
 
 The default thread count is one per performance core. Two hardware threads
 on one core do not help these kernels, and on CPUs with fast and slow cores

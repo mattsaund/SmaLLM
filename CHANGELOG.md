@@ -13,8 +13,14 @@ The first version.
   Llama 2 and 3, TinyLlama, SmolLM2, Mistral, Qwen2.5, Qwen3 and Gemma 3.
 - **Weight formats.** F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K,
   Q3_K, Q4_K, Q5_K, Q6_K and IQ4_NL.
-- **Kernels.** AVX2 on x86-64 and NEON on AArch64, with the dot product
-  extension where the CPU has it. A portable fallback runs everywhere else.
+- **Kernels.** AVX2 on x86-64, with AVX-VNNI where the CPU has it, and
+  NEON on AArch64, with the dot product extension where the CPU has it. A
+  portable fallback runs everywhere else.
+- **Prompt reading in tiles.** A batch of tokens multiplies several weight
+  rows at once, unpacked once per batch and interleaved so that one SIMD
+  multiply serves all of them.
+- **Memory.** Weights are never copied out of the model file. With a model
+  loaded and a 4,096-token context, the engine holds 2 to 8 MB of its own.
 - **Tokenizers.** SentencePiece and byte-level BPE, with the Llama 3, Qwen,
   SmolLM and GPT-2 word splitting rules.
 - **Context.** The key/value cache grows in chunks as the context fills, so

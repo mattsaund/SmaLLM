@@ -38,6 +38,19 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Released binaries are built small. Nearly half of a plain build is the
+  # Rust standard library and its machinery for printing panics, which this
+  # program has no use for: it reports errors itself. So the standard
+  # library is compiled again, for size, and a panic simply stops the
+  # program. That takes a third off every binary at the same speed.
+  #
+  # Compiling the standard library needs a nightly compiler. This one is
+  # pinned, so a release never changes because the compiler did. To move
+  # it, pick a newer date and check that this workflow still passes.
+  # Building from source with stable Rust works as it always did.
+  TOOLCHAIN: nightly-2026-11-24
+  SMALL_STD: -Z build-std=std,panic_abort -Z build-std-features=optimize_for_size
+  SMALL_FLAGS: -Zunstable-options -Cpanic=immediate-abort
 
 jobs:
   version:
@@ -117,27 +130,39 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.TOOLCHAIN }}
+          components: rust-src
           targets: ${{ matrix.target }}${{ matrix.library && format(',{0}', matrix.library) || '' }}
 
       - name: Install QEMU
         if: matrix.qemu
         run: sudo apt-get update && sudo apt-get install -y qemu-user
 
-      - name: Build the program
+      # RUSTFLAGS replaces the flags in .cargo/config.toml, so the static C
+      # runtime for Windows is asked for here again. RISC-V and 32-bit ARM
+      # need the same flag to link musl statically.
+      - name: Choose the compiler flags
         shell: bash
         run: |
+          flags="$SMALL_FLAGS"
+          case "${{ matrix.target }}" in
+            *windows*|riscv64*|armv7*) flags="$flags -Ctarget-feature=+crt-static" ;;
+          esac
+          echo "RUSTFLAGS=$flags" >> "$GITHUB_ENV"
           if [ -n "${{ matrix.env_name }}" ]; then
-            export CARGO_TARGET_${{ matrix.env_name }}_LINKER=rust-lld
-            # RISC-V links musl dynamically unless told otherwise.
-            export CARGO_TARGET_${{ matrix.env_name }}_RUSTFLAGS="-C target-feature=+crt-static"
+            echo "CARGO_TARGET_${{ matrix.env_name }}_LINKER=rust-lld" >> "$GITHUB_ENV"
           fi
-          cargo build --release --locked --target ${{ matrix.target }} --bin smallm
+
+      - name: Build the program
+        shell: bash
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin smallm $SMALL_STD
 
       - name: Build the library
         if: matrix.library
-        run: cargo build --release --locked --target ${{ matrix.library }} -p smallm-capi
+        shell: bash
+        run: cargo build --release --locked --target ${{ matrix.library }} -p smallm-capi $SMALL_STD
 
       # A binary that does not start, or calls itself a different version,
       # is caught here instead of on someone's machine.
