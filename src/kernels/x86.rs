@@ -17,12 +17,13 @@
 
 use std::arch::asm;
 use std::arch::x86_64::*;
+use std::slice;
 
 use super::scalar;
 use super::{ActRef, DotQuant, Kernels, TileDot};
 use crate::tensor::TensorType;
 use crate::tensor::f16::f16_to_f32;
-use crate::tensor::quant::Tile;
+use crate::tensor::quant::{self, Decoder, Group, Tile};
 
 /// Kernels for every CPU with AVX2.
 pub static KERNELS: Kernels = kernels("avx2", tile_dot);
@@ -78,8 +79,9 @@ pub fn supported() -> bool {
         && is_x86_feature_detected!("f16c")
 }
 
-/// The row kernel for a quantized type. Formats without an AVX2 kernel fall
-/// back to the scalar one.
+/// The row kernel for a quantized type. Formats without an AVX2 decoder
+/// are decoded by the portable decoders and multiplied with AVX2. A new
+/// format falls back to the scalar kernel until it is listed here.
 fn row_quant(ty: TensorType) -> DotQuant {
     match ty {
         TensorType::Q4_0 => row_q4_0,
@@ -90,6 +92,20 @@ fn row_quant(ty: TensorType) -> DotQuant {
         TensorType::Q4K => row_q4_k,
         TensorType::Q5K => row_q5_k,
         TensorType::Q6K => row_q6_k,
+        TensorType::Iq4Nl => row_iq4_nl,
+        TensorType::Mxfp4 => row_mxfp4,
+        TensorType::Q2K => row_q2_k,
+        TensorType::Q3K => row_q3_k,
+        TensorType::Iq4Xs => row_iq4_xs,
+        TensorType::Iq3S => row_iq3_s,
+        TensorType::Iq3Xxs => row_iq3_xxs,
+        TensorType::Iq2S => row_iq2_s,
+        TensorType::Iq2Xs => row_iq2_xs,
+        TensorType::Iq2Xxs => row_iq2_xxs,
+        TensorType::Iq1M => row_iq1_m,
+        TensorType::Iq1S => row_iq1_s,
+        TensorType::Tq2_0 => row_tq2_0,
+        TensorType::Tq1_0 => row_tq1_0,
         _ => scalar::row_quant(ty),
     }
 }
@@ -1318,9 +1334,48 @@ macro_rules! offset_block_row {
     };
 }
 
+/// A 16-entry table of signed bytes in both halves of a register, for
+/// looking 4-bit indices up with `pshufb`.
+#[target_feature(enable = "avx2,fma,f16c")]
+#[inline]
+unsafe fn levels(table: &[i8; 16]) -> __m256i {
+    // SAFETY: the table is 16 readable bytes.
+    let half = unsafe { _mm_loadu_si128(table.as_ptr() as *const __m128i) };
+    _mm256_broadcastsi128_si256(half)
+}
+
+/// IQ4_NL: `weight = scale * level[nibble]`, with the non-linear levels.
+#[target_feature(enable = "avx2,fma,f16c")]
+#[inline]
+unsafe fn load_iq4_nl(p: *const u8) -> SignedBlock {
+    // SAFETY: the caller guarantees an 18-byte block at `p`.
+    unsafe {
+        SignedBlock {
+            weights: _mm256_shuffle_epi8(levels(&quant::IQ4_NL_LEVELS), nibbles(p.add(2))),
+            scale: half(p),
+        }
+    }
+}
+
+/// MXFP4: `weight = 2^(e - 128) * level[nibble]`, with the doubled FP4
+/// levels.
+#[target_feature(enable = "avx2,fma,f16c")]
+#[inline]
+unsafe fn load_mxfp4(p: *const u8) -> SignedBlock {
+    // SAFETY: the caller guarantees a 17-byte block at `p`.
+    unsafe {
+        SignedBlock {
+            weights: _mm256_shuffle_epi8(levels(&quant::MXFP4_LEVELS), nibbles(p.add(1))),
+            scale: _mm256_set1_ps(quant::e8m0_half(*p)),
+        }
+    }
+}
+
 signed_block_row!(row_q4_0, load_q4_0, 18);
 signed_block_row!(row_q5_0, load_q5_0, 22);
 signed_block_row!(row_q8_0, load_q8_0, 34);
+signed_block_row!(row_iq4_nl, load_iq4_nl, 18);
+signed_block_row!(row_mxfp4, load_mxfp4, 17);
 offset_block_row!(row_q4_1, load_q4_1, 20);
 offset_block_row!(row_q5_1, load_q5_1, 24);
 
@@ -1593,3 +1648,161 @@ unsafe fn row_q6_k(row: *const u8, n: usize, act: ActRef) -> f32 {
         hsum(acc)
     }
 }
+
+/// Row kernel for IQ4_XS: super-blocks of eight runs of 32, each laid out
+/// like an IQ4_NL block, with a 6-bit scale per run.
+/// `weight = d * (scale - 32) * level[nibble]`.
+///
+/// The levels are looked up with `pshufb`. Runs alternate between two
+/// accumulators so consecutive runs do not wait on each other.
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn row_iq4_xs(row: *const u8, n: usize, act: ActRef) -> f32 {
+    let table = levels(&quant::IQ4_NL_LEVELS);
+    let mut acc = [_mm256_setzero_ps(), _mm256_setzero_ps()];
+    // SAFETY: the caller guarantees `row` holds `n / 256` super-blocks of
+    // 136 bytes and `act` describes `n` quantized activations.
+    unsafe {
+        for sb in 0..n / 256 {
+            let p = row.add(sb * 136);
+            let d = _mm256_mul_ps(half(p), broadcast(act.scale.add(sb)));
+            // Two high bits of each scale in a 16-bit word, four low bits
+            // in a nibble of the next four bytes.
+            let high = (p.add(2) as *const u16).read_unaligned() as u32;
+            let low = word(p.add(4));
+            for ib in 0..8 {
+                let bits = ((low >> (4 * ib)) & 0x0f) | (((high >> (2 * ib)) & 3) << 4);
+                let scale = _mm256_mul_ps(d, _mm256_set1_ps(bits as f32 - 32.0));
+                let weights = _mm256_shuffle_epi8(table, nibbles(p.add(8 + 16 * ib)));
+                let acts = _mm256_loadu_si256(act.q.add(sb * 256 + 32 * ib) as *const __m256i);
+                acc[ib % 2] = _mm256_fmadd_ps(scale, dot_signed(weights, acts), acc[ib % 2]);
+            }
+        }
+        hsum(_mm256_add_ps(acc[0], acc[1]))
+    }
+}
+
+/// Row kernel for TQ2_0: 2-bit values of 0, 1 or 2 that stand for -1, 0
+/// and 1, with one scale per 256.
+///
+/// The values are multiplied as they are, unsigned, which needs no sign
+/// handling. The sum of the activations, which their quantizer already
+/// computed as `act.wsum`, then takes the 1 back off every weight.
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn row_tq2_0(row: *const u8, n: usize, act: ActRef) -> f32 {
+    let two_bits = _mm256_set1_epi8(3);
+    let ones = _mm256_set1_epi16(1);
+    let mut acc = _mm256_setzero_ps();
+    let mut correction = 0.0f32;
+    // SAFETY: the caller guarantees `row` holds `n / 256` blocks of 66
+    // bytes and `act` describes `n` quantized activations.
+    unsafe {
+        for sb in 0..n / 256 {
+            let p = row.add(sb * 66);
+            let acts = act.q.add(sb * 256);
+            let mut sum = _mm256_setzero_si256();
+            for half_index in 0..2 {
+                // Byte `m` of each half holds weights `m`, `m + 32`, `m + 64`
+                // and `m + 96` of it, lowest bits first.
+                let bytes = _mm256_loadu_si256(p.add(32 * half_index) as *const __m256i);
+                let parts = [
+                    bytes,
+                    _mm256_srli_epi16::<2>(bytes),
+                    _mm256_srli_epi16::<4>(bytes),
+                    _mm256_srli_epi16::<6>(bytes),
+                ];
+                for (l, part) in parts.into_iter().enumerate() {
+                    let values = _mm256_and_si256(part, two_bits);
+                    let run =
+                        _mm256_loadu_si256(acts.add(128 * half_index + 32 * l) as *const __m256i);
+                    let pairs = _mm256_maddubs_epi16(values, run);
+                    sum = _mm256_add_epi32(sum, _mm256_madd_epi16(pairs, ones));
+                }
+            }
+            let d = f16_to_f32((p.add(64) as *const u16).read_unaligned());
+            let scale = _mm256_set1_ps(d * *act.scale.add(sb));
+            acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sum), scale, acc);
+            correction += d * *act.wsum.add(sb);
+        }
+        hsum(acc) - correction
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Formats without a kernel of their own
+// ---------------------------------------------------------------------------
+
+/// The row kernel of a format that has no AVX2 decoder.
+///
+/// Each block is decoded by its portable decoder in `tensor::quant` into
+/// signed bytes and sub-block scales, and the bytes are multiplied with
+/// AVX2, 32 at a time. The decoders are inlined here, so they are compiled
+/// with AVX2 as well.
+#[target_feature(enable = "avx2,fma,f16c")]
+#[inline]
+unsafe fn dot_decoded(
+    decode: Decoder,
+    block_bytes: usize,
+    group: usize,
+    row: *const u8,
+    n: usize,
+    act: ActRef,
+) -> f32 {
+    let mut decoded = Group::new();
+    let mut acc = _mm256_setzero_ps();
+    let mut offsets = 0.0f32;
+    for g in 0..n / group {
+        // SAFETY: the caller guarantees `row` holds `n / group` blocks and
+        // `act` describes `n` quantized activations. A group holds 256
+        // weights and 16 scales, so every index below is in bounds.
+        unsafe {
+            let block = slice::from_raw_parts(row.add(g * block_bytes), block_bytes);
+            decode(block, &mut decoded);
+            let acts = act.q.add(g * group);
+            let mut sum = _mm256_setzero_ps();
+            for pair in 0..group / 32 {
+                let at = pair * 32;
+                let weights = _mm256_loadu_si256(decoded.q.as_ptr().add(at) as *const __m256i);
+                let run = _mm256_loadu_si256(acts.add(at) as *const __m256i);
+                // The low four lanes are the first sub-block of 16, the
+                // high four the second.
+                let scales = _mm256_set_m128(
+                    _mm_set1_ps(decoded.scale[2 * pair + 1]),
+                    _mm_set1_ps(decoded.scale[2 * pair]),
+                );
+                sum = _mm256_fmadd_ps(dot_signed(weights, run), scales, sum);
+            }
+            acc = _mm256_fmadd_ps(sum, broadcast(act.scale.add(g)), acc);
+            // Formats with offsets add `offset * sum(activations)` for each
+            // sub-block. For the others this adds zeros.
+            let sums = slice::from_raw_parts(act.sums.add(g * group / 16), group / 16);
+            let mut shift = 0.0f32;
+            for (offset, sum) in decoded.offset.iter().zip(sums) {
+                shift += offset * *sum as f32;
+            }
+            offsets += shift * *act.scale.add(g);
+        }
+    }
+    hsum(acc) + offsets
+}
+
+/// Defines the row kernel of one format on top of [`dot_decoded`].
+macro_rules! decoded_row {
+    ($name:ident, $decode:path, $block_bytes:expr, $group:expr) => {
+        #[target_feature(enable = "avx2,fma,f16c")]
+        unsafe fn $name(row: *const u8, n: usize, act: ActRef) -> f32 {
+            // SAFETY: forwarded contract.
+            unsafe { dot_decoded($decode, $block_bytes, $group, row, n, act) }
+        }
+    };
+}
+
+decoded_row!(row_q2_k, quant::decode_q2_k, 84, 256);
+decoded_row!(row_q3_k, quant::decode_q3_k, 110, 256);
+decoded_row!(row_iq3_s, quant::decode_iq3_s, 110, 256);
+decoded_row!(row_iq3_xxs, quant::decode_iq3_xxs, 98, 256);
+decoded_row!(row_iq2_s, quant::decode_iq2_s, 82, 256);
+decoded_row!(row_iq2_xs, quant::decode_iq2_xs, 74, 256);
+decoded_row!(row_iq2_xxs, quant::decode_iq2_xxs, 66, 256);
+decoded_row!(row_iq1_m, quant::decode_iq1_m, 56, 256);
+decoded_row!(row_iq1_s, quant::decode_iq1_s, 50, 256);
+decoded_row!(row_tq1_0, quant::decode_tq1_0, 54, 256);
