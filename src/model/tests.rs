@@ -1323,3 +1323,39 @@ fn broken_models_fail_to_load() {
         Err(Error::Unsupported(_))
     ));
 }
+
+/// A chat goes back into the last reply, and a regenerated answer goes
+/// back to just before the last prompt token. Both find the state saved
+/// there and read nothing before it again.
+#[test]
+fn recurrent_states_are_saved_where_chats_go_back_to() {
+    let model =
+        Arc::new(Model::from_bytes(TinyModel::new("mamba2", TensorType::F32).build()).unwrap());
+    let config = SessionConfig {
+        threads: 1,
+        ..Default::default()
+    };
+    let mut session = Session::new(model, config).unwrap();
+    let prompt: Vec<u32> = (3..13).collect();
+    session.eval(&prompt).unwrap();
+    assert_eq!(session.saved_positions(), [9]);
+    for token in [20, 21, 22] {
+        session.eval(&[token]).unwrap();
+    }
+    assert_eq!(session.saved_positions(), [9]);
+    // Regenerating: the prompt again, its last token read afresh. Had the
+    // session read the prompt again from the start, it would have saved a
+    // new state at 8.
+    session.truncate(9);
+    assert_eq!(session.tokens(), &prompt[..9]);
+    assert_eq!(session.saved_positions(), [9]);
+    session.eval(&prompt[9..]).unwrap();
+    // The next turn: back into the reply, which is read again from the
+    // saved state, then a new prompt saves a new one.
+    session.eval(&[20, 21]).unwrap();
+    let next: Vec<u32> = [&prompt[..], &[20, 21, 30, 31, 32]].concat();
+    session.truncate(11);
+    session.eval(&next[11..]).unwrap();
+    assert_eq!(session.tokens(), &next[..]);
+    assert_eq!(session.saved_positions(), [next.len() - 1]);
+}

@@ -891,15 +891,26 @@ impl Session {
     /// Evaluates `tokens` in batches. Only the last batch computes logits,
     /// and only when `want_logits` is set.
     fn run(&mut self, tokens: &[u32], want_logits: bool) {
-        let mut batches = tokens.chunks(self.batch).peekable();
+        // A recurrent state is saved just before the last token of a
+        // prompt, where a later prompt is likely to go back to (see
+        // `recurrent.rs`). Single generated tokens are not worth a copy.
+        let held = usize::from(tokens.len() > 1 && !self.recurrent.is_empty());
+        let (head, last) = tokens.split_at(tokens.len() - held);
+        let mut batches = head.chunks(self.batch).peekable();
         while let Some(batch) = batches.next() {
-            self.forward(batch, want_logits && batches.peek().is_none());
+            let final_batch = held == 0 && batches.peek().is_none();
+            self.forward(batch, want_logits && final_batch);
         }
-        // The end of a prompt is where a later one is likely to go back
-        // to. Single generated tokens are not worth a copy of the state.
-        if tokens.len() > 1 {
+        if held == 1 {
             self.recurrent.save();
+            self.forward(last, want_logits);
         }
+    }
+
+    /// The positions of the saved recurrent states, for tests.
+    #[cfg(test)]
+    pub(crate) fn saved_positions(&self) -> Vec<usize> {
+        self.recurrent.saved()
     }
 
     /// Runs one batch through the model.

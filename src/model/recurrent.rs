@@ -7,16 +7,19 @@
 //! state and reads the tokens after it again.
 //!
 //! These states are large next to a short convolution's: a block keeps a
-//! matrix per head. So they are saved sparingly, at the end of each prompt,
-//! and only the last [`CHECKPOINTS`] of them are kept. That covers a chat.
-//! The next prompt repeats the conversation up to the end of the reply, so
-//! the state after the last prompt comes back and the reply is read again
-//! as one batch, which is quick.
+//! matrix per head, tens of megabytes for a whole model. So one copy is
+//! kept, saved just before the last token of each prompt. That covers a
+//! chat. The next prompt repeats the conversation up to the end of the
+//! reply, so the saved state comes back and the reply is read again as one
+//! batch, which is quick. A prompt asked again, to regenerate an answer,
+//! reads its last token again for fresh logits, so it goes back to exactly
+//! the saved position.
 
 use super::config::{Config, Mixer};
 
-/// Saved states kept. Older ones are dropped first.
-pub const CHECKPOINTS: usize = 3;
+/// Saved states kept. Older ones are dropped first. Each costs as much
+/// memory as the state itself.
+pub const CHECKPOINTS: usize = 1;
 
 /// The floats of state each block keeps, zero for blocks that are not
 /// recurrent. Each recurrent mixer adds its arm here.
@@ -66,6 +69,17 @@ impl RecurrentState {
         self.slots.get(layer).is_some_and(|&(_, size)| size > 0)
     }
 
+    /// Whether no block keeps one.
+    pub fn is_empty(&self) -> bool {
+        self.state.is_empty()
+    }
+
+    /// The positions of the saved states, oldest first.
+    #[cfg(test)]
+    pub fn saved(&self) -> Vec<usize> {
+        self.checkpoints.iter().map(|(at, _)| *at).collect()
+    }
+
     /// Block `layer`'s state, to read and update in place.
     pub fn block(&mut self, layer: usize) -> &mut [f32] {
         let (start, size) = self.slots[layer];
@@ -79,7 +93,7 @@ impl RecurrentState {
     }
 
     /// Keeps a copy of the current state, for a later cut back to here.
-    /// The session calls this at the end of each prompt.
+    /// The session calls this before the last token of each prompt.
     pub fn save(&mut self) {
         if self.state.is_empty()
             || self
