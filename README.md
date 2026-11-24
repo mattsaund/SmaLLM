@@ -1,20 +1,19 @@
 # SmaLLM
 
-SmaLLM is a small, fast engine that runs language models on your own
-hardware. It reads the same GGUF model files as llama.cpp and Ollama, and it
-is built for the low end: single-board computers, mini PCs and old laptops.
-One program of about a megabyte, which holds a few megabytes of memory
-besides the model. No dependencies, and the defaults need no changes.
+SmaLLM is a CPU inference engine for language models in GGUF format, the
+format llama.cpp and Ollama use. It targets single-board computers, mini PCs
+and old laptops. One binary of about 1 MB, no dependencies, no required
+configuration. Anonymous memory beyond the mapped model file is a few MB.
 
-**Full installation size:**\
+**Binary size, release builds:**\
 1.22 MB Linux (x86_64), 1.01 MB Linux (arm64)\
 0.94 MB Linux (armv7), 0.82 MB Linux (riscv64)\
 1.03 MB macOS (Intel), 0.88 MB macOS (Apple silicon)\
 1.26 MB Windows (x86_64), 1.04 MB Windows (arm64)
 
-**Memory of its own, for Llama 3.2 1B with a 4,096-token context:**\
-7.7 MB, where llama.cpp holds 627 MB. [Memory](#memory) says how SmaLLM
-does it and how it was measured.
+**Anonymous memory, Llama 3.2 1B, 4,096-token context:**\
+7.7 MB. llama.cpp b11846: 627 MB. [Memory](#memory) has the method and the
+trade-offs.
 
 ## Install
 
@@ -31,13 +30,13 @@ irm https://raw.githubusercontent.com/mattsaund/SmaLLM/main/install.ps1 | iex
 ```
 
 Downloads the newest [release](https://github.com/mattsaund/SmaLLM/releases)
-for your machine and checks it against the release's checksums. One file
-lands in `~/.local/bin`. Linux binaries are static, so they run on any
-distribution. Anything else SmaLLM needs is installed too, after asking:
-curl for downloading models, and when there is no release for the machine,
-Rust and a C compiler to build it from source.
+for the machine and verifies it against the release's SHA-256 checksums.
+Installs one binary to `~/.local/bin`. Linux binaries are static and run on
+any distribution. Missing dependencies are installed after a prompt: curl
+for model downloads, plus Rust and a C compiler when no release exists for
+the machine and SmaLLM is built from source.
 
-`smallm uninstall` removes SmaLLM again, with its models and settings.
+`smallm uninstall` removes the binary, downloaded models and settings.
 What changed: [CHANGELOG](CHANGELOG.md).
 
 ## Use
@@ -71,10 +70,10 @@ size, what to do when the context is full, temperature and the other
 sampling settings, stop strings, system message. In a chat, `/clear` starts
 over, `/system` sets a system message and `/exit` leaves.
 
-**Reasoning.** Models that think before they answer (Qwen3, DeepSeek R1,
-gpt-oss) show their reasoning faint in a chat, and it is left out of the
-conversation. An answer sent to a file or a pipe leaves it out entirely.
-The server returns it as `reasoning_content`, as llama.cpp does.
+**Reasoning output.** For models that emit reasoning before the answer
+(Qwen3, DeepSeek R1, gpt-oss), the chat prints it dimmed and keeps it out of
+the conversation history. Piped output omits it. The server returns it as
+`reasoning_content`, the field llama.cpp uses.
 
 **Settings.** Every setting has a line in one file, `smallm.conf`, named like
 its command-line option. `smallm config` shows the settings in effect and
@@ -111,13 +110,13 @@ uses one of these, and on RWKV's.
 
 **Weights.** F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K,
 Q5_K, Q6_K, the i-quants IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS,
-IQ3_S, IQ4_NL and IQ4_XS, the ternary TQ1_0 and TQ2_0, and MXFP4. Every
-format expands to exactly the numbers ggml's does. Weights stay in the
-file's format and are memory mapped, so a model loads in milliseconds and
-costs no memory beyond the file.
+IQ3_S, IQ4_NL and IQ4_XS, the ternary TQ1_0 and TQ2_0, and MXFP4.
+Dequantization is bit-exact with ggml for every format, checked by
+`tests/quant.rs`. Weights stay in the file's format and are memory mapped.
+Loading takes milliseconds and allocates no memory for weights.
 
-**Machines.** Linux, macOS and Windows. x86-64 with AVX2 and ARM64 with NEON
-get hand-written kernels, picked when the program starts. Everything else,
+**Platforms.** Linux, macOS and Windows. x86-64 with AVX2 and ARM64 with
+NEON get hand-written kernels, selected at startup. Everything else,
 including 32-bit ARM and RISC-V, runs portable code.
 
 **Chat formats.** ChatML, Llama 3, Llama 2, Mistral, Gemma, Gemma 4, Granite,
@@ -140,91 +139,92 @@ tokens, the best of three runs, with the engines taking turns.
 
 ## Memory
 
-SmaLLM's rule is simple: never copy what is already in the model file, and
-never reserve memory before it is needed. What the engine holds of its own
-stays in the megabytes. For Llama 3.2 1B:
+Weights are never copied out of the model file, and nothing is allocated
+before it is used. Anonymous memory (RssAnon), Llama 3.2 1B Q4_K_M:
 
-| | Model loaded | With a 4,096-token context | After reading 256 tokens |
+| | Model loaded | Session, 4,096-token context | After 256 tokens |
 |---|---|---|---|
 | SmaLLM | **7.5 MB** | **7.7 MB** | **21 MB** |
 | llama.cpp | 498 MB | 627 MB | 636 MB |
 
-The bigger the model, the bigger the gap. On gpt-oss-20b, llama.cpp's own
-memory is about 10 GB, and SmaLLM's is 33 MB.
+The difference grows with the weights llama.cpp repacks. On gpt-oss-20b
+(MXFP4) it is 33 MB against 9,966 MB.
 
 ### How it works
 
-- **The weights stay in the file.** The model file is mapped into memory,
-  and the matrix kernels read its quantized blocks where they are, in the
-  file's own layout. llama.cpp copies most weights into a rearranged layout
-  that suits its kernels, and that copy is most of the 498 MB above. SmaLLM gets the
-  same speed benefit without the copy: for a prompt it rearranges a few rows
-  at a time into a tile that fits in the CPU's cache, uses it, and moves on.
-  That is how fast matrix libraries have long multiplied large matrices.
-- **The cache grows with the conversation.** llama.cpp reserves the
-  key/value cache for the whole context window when a session starts.
-  SmaLLM adds it in pieces of 256 positions as the conversation grows, in
-  16-bit floats. A short chat costs a few megabytes, whatever the window.
-- **Working memory is small.** Scratch buffers fit a 32-token batch, the
-  vocabulary is read from the file in place, and only the last token's
-  logits are computed.
-- **Each model keeps only what it must.** DeepSeek's latent attention
-  caches one compressed row per position. Mamba and RWKV keep a fixed state
-  instead of a growing cache. Gemma 4's shared layers keep no cache at all.
+- **Weights are read in place.** The GGUF file is memory mapped, and the
+  kernels read its quantized blocks in the file's layout. llama.cpp repacks
+  most weight tensors into an interleaved layout in anonymous memory at
+  load, which is most of its 498 MB. SmaLLM packs a few rows into a
+  cache-sized tile per prompt batch instead, the packing step of BLAS-style
+  matrix multiplication (GotoBLAS, BLIS). Generation reads the file layout
+  directly.
+- **The key/value cache is allocated on demand**, in 256-position chunks of
+  16-bit floats. llama.cpp allocates the whole context window when the
+  session starts. Memory scales with the tokens in the context, not with
+  the configured window.
+- **Small working set.** Scratch buffers are sized for a 32-token batch. The
+  vocabulary is read from the mapped file. Logits are computed for the last
+  token only.
+- **Per-architecture state.** DeepSeek's latent attention caches one
+  compressed row per position and layer. Mamba and RWKV keep a fixed-size
+  recurrent state and one saved copy of it. Gemma 4's shared layers have no
+  cache of their own.
 
-### What it is good for
+### Use cases
 
-- **Small boards.** The engine leaves the memory to the model and to
-  whatever else the board runs.
-- **Models close to the size of RAM**, mixtures of experts above all. A
-  token reads only the experts it is routed to, and the system keeps the
-  busy ones in memory and drops the rest.
-- **Several programs on one model.** The pages of a mapped file are shared,
-  so they share one copy of the weights.
-- **Starting in milliseconds.** Nothing is copied or rearranged when a
-  model loads.
+- **Low-RAM boards.** RAM goes to the model's pages and to other processes.
+- **Models close to RAM size, especially mixtures of experts.** A token
+  reads only its routed experts. The kernel evicts the pages of cold experts
+  and faults them back in when they are needed.
+- **Several processes on one model.** Mapped file pages are shared through
+  the page cache, so every process uses the same copy of the weights.
+- **Millisecond loads.** Nothing is copied or repacked at load.
 
-### The fine print
+### Trade-offs
 
-This is memory the process allocated, which the system cannot take back.
-Both engines also need the model file in memory to run at full speed, and
-the system keeps it there for them. Counting the file too, Llama 3.2 1B
-takes about 0.83 GB with SmaLLM and 1.4 GB with llama.cpp. The system can
-drop file pages and read them again when it runs short, so a tight fit runs
-slower instead of failing. That works best with fast storage, eMMC or NVMe
-rather than an SD card. And since the cache grows as needed, a context too
-large for the machine shows up when the conversation gets there, not when
-the session starts.
+- **Total memory still includes the model.** The figures above leave out
+  file-backed pages, and full speed needs the file resident. The total for
+  Llama 3.2 1B after 256 tokens is 0.83 GB for SmaLLM and 1.4 GB for
+  llama.cpp.
+- **Under memory pressure, speed depends on storage.** The kernel evicts
+  file pages and faults them back in on access. That is workable on NVMe or
+  eMMC and slow on an SD card. llama.cpp's repacked copy is anonymous memory
+  and can only go to swap.
+- **No up-front check.** A context window too large for the machine fails
+  when the conversation reaches it, not when the session starts.
+- **Packing on every prompt batch.** Tiles are packed per batch, not once at
+  load. On x86 the kernels absorb the cost (see [Speed](#speed)). On ARM it
+  has not been measured.
 
-`smallm bench` prints these numbers for any model on Linux. The comparison
-uses llama.cpp b11846 on an Intel Core i7-14700K, with a 4,096-token context.
+Measured with `smallm bench`, which prints these figures on Linux, against
+llama.cpp b11846 on an Intel Core i7-14700K with a 4,096-token context.
 
 ## Size
 
-The whole program, with chat, server and downloader, is 0.82 to 1.26 MB
-depending on the platform. The engine as a shared library is 0.58 to
-0.86 MB. For scale, the CPU-only libraries of llama.cpp b11846 total 7.7 MB
-on the same machine. llama.cpp also does far more, as the to do list below
-shows.
+The program (chat, server, downloader) is 0.82 to 1.26 MB depending on the
+platform. The engine as a shared library is 0.58 to 0.86 MB. llama.cpp
+b11846's CPU-only libraries total 7.7 MB on the same machine. llama.cpp has
+features SmaLLM lacks, listed under [To do](#to-do).
 
-Released binaries are built with a standard library that is compiled for
-size, which takes a fifth off. Building from source with stable Rust gives
-the same program at about 1.5 MB.
+Release builds compile the standard library for size (`-Z build-std` with
+`optimize_for_size`), which saves about 20 percent. A source build with
+stable Rust is about 1.5 MB.
 
 ## Context
 
-The context window has no built-in limit. The memory for it grows in steps
-of 256 tokens as the conversation grows, so a large window costs nothing
-until it is used.
+The context window has no built-in limit. The key/value cache is allocated
+in 256-token chunks as the context fills, so a large window allocates
+nothing up front.
 
 ```sh
 smallm run model.gguf --ctx 262144
 ```
 
-A 262,144-token context has been run end to end. What limits the window in
-practice is memory, 66 KB per token for Llama 3.2 1B. A model also only
-stays coherent as far as it was trained to. The default window is the
-model's own training length, up to 4,096 tokens.
+Tested end to end at 262,144 tokens. The practical limit is memory, 32 KB
+per token for Llama 3.2 1B. Output quality degrades past the model's
+training length. The default window is the model's training length, capped
+at 4,096 tokens.
 
 When the window is full, `--overflow` (or the `overflow` setting) decides:
 
@@ -234,8 +234,8 @@ When the window is full, `--overflow` (or the `overflow` setting) decides:
 | `slide` | Drops the oldest tokens and slides forward |
 | `stop` | Ends the answer |
 
-Either way the kept tokens are not read again: their cached keys are moved
-to their new positions, which takes milliseconds.
+Kept tokens are not evaluated again. Their cached keys are rotated to their
+new positions, which takes milliseconds.
 
 ## Use it from your code
 
@@ -295,13 +295,13 @@ static, with the header and the Python binding.
 - [x] Twenty-five architectures, including mixtures of experts, hybrids, and the state-space and RWKV families
 - [x] Twenty-five weight formats, float, quantized, i-quants, ternary and MXFP4, each expanding exactly as in ggml
 - [x] Kernels for AVX2, AVX-VNNI, NEON and the ARM dot product extension
-- [x] Prompt reading in tiles, up to twice as fast as llama.cpp
-- [x] A few megabytes of memory besides the model file
+- [x] Prompt reading in packed tiles
+- [x] Anonymous memory in megabytes, with weights read in place from the mapped file
 - [x] SentencePiece and byte-level BPE tokenizers for every word splitting family llama.cpp knows, RWKV's, and
       the encoder tokenizers WordPiece and Unigram, matching it token for token on its test texts
 - [x] Fifteen chat formats, recognized from the model file
 - [x] Embedding and reranking models, from the command line and the server
-- [x] Reasoning kept apart from the answer, for models that think first
+- [x] Reasoning output separated from the answer in the chat, in pipes and in the server
 - [x] A context window that slides or keeps its start when it fills, chosen with `--overflow`
 - [x] One settings file for everything, with a reset to the defaults
 - [x] A context window with no built-in limit, tested at 262,144 tokens
@@ -316,16 +316,15 @@ static, with the header and the Python binding.
 
 ## To do
 
-Everything here is something llama.cpp, Ollama or another engine does today
-and SmaLLM does not. The aim is to close the list without giving up the
-size, so the heavy items are meant to be parts of the build that can be
-left out.
+Features llama.cpp, Ollama or other engines have and SmaLLM lacks. Heavy
+items are planned as optional parts of the build, so the default binary
+stays small.
 
 **Hardware**
 
 - [ ] GPUs, through Vulkan compute. It is the one API that reaches AMD, Intel and NVIDIA cards and the ARM GPUs in
       phones and boards, so one backend covers them. The engine runs on the CPU only today.
-- [ ] Apple GPUs through Metal, and NVIDIA through CUDA, where they beat what Vulkan gives.
+- [ ] Apple GPUs through Metal, and NVIDIA through CUDA, where they outperform Vulkan.
 - [ ] NPUs. Every vendor has its own toolkit (Rockchip RKNN, Qualcomm QNN, Intel OpenVINO, Apple Core ML), so each
       one is a backend of its own. None exists yet.
 - [ ] TPUs. Google's Coral Edge TPU cannot hold a language model: it runs small, fully 8-bit TensorFlow Lite graphs
