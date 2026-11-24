@@ -12,6 +12,14 @@ besides the model. No dependencies, nothing to configure.
 0.51 MB macOS (Intel), 0.47 MB macOS (Apple silicon)\
 0.70 MB Windows (x86_64), 0.61 MB Windows (arm64)
 
+**Memory of its own, with a model loaded and a 4,096-token context:**\
+2.2 MB for SmolLM2 135M, where llama.cpp holds 116 MB\
+6.5 MB for Qwen2.5 0.5B, where llama.cpp holds 124 MB\
+7.7 MB for Llama 3.2 1B, where llama.cpp holds 627 MB
+
+That is 19 to 81 times less. [Memory](#memory) has the full table and how it
+was measured.
+
 ## Install
 
 **Linux, macOS**
@@ -163,6 +171,13 @@ the engine holds of its own is small:
 This is memory the process allocated, which the system cannot take back.
 Both engines also have the model file in memory, 105, 491 and 808 MB for
 these three, and the system can drop those pages whenever it needs the room.
+
+With a session ready, SmaLLM holds 19 to 81 times less than llama.cpp. After
+reading 256 tokens it is still about 9 to 23 times less.
+
+These numbers are from an x86-64 desktop running Linux, against llama.cpp
+b11846. They come from how the engine is built and not from the processor,
+so ARM boards should show the same. Those measurements are next.
 
 Two things make the difference. llama.cpp reserves the cache for the whole
 context window when a session starts, and SmaLLM grows it as the
