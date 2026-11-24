@@ -77,6 +77,8 @@ pub enum Template {
     Gemma,
     /// `<|turn>role ... <turn|>` (Gemma 4)
     Gemma4,
+    /// `<|start_of_role|>role<|end_of_role|> ... <|end_of_text|>` (Granite)
+    Granite,
     /// `<|role|> ... <|end|>`
     Phi3,
     /// `<|role|> ... ` then the model's end-of-text token.
@@ -93,13 +95,14 @@ const DEEPSEEK_END: &str = "<\u{ff5c}end\u{2581}of\u{2581}sentence\u{ff5c}>";
 
 impl Template {
     /// Every template, for listings.
-    pub const ALL: [Template; 9] = [
+    pub const ALL: [Template; 10] = [
         Template::ChatMl,
         Template::Llama3,
         Template::Llama2,
         Template::Mistral,
         Template::Gemma,
         Template::Gemma4,
+        Template::Granite,
         Template::Phi3,
         Template::Zephyr,
         Template::DeepSeek,
@@ -116,6 +119,8 @@ impl Template {
             Some(Template::Gemma)
         } else if has("<|turn>") {
             Some(Template::Gemma4)
+        } else if has("<|start_of_role|>") {
+            Some(Template::Granite)
         } else if has(DEEPSEEK_ASSISTANT) {
             Some(Template::DeepSeek)
         } else if has("[INST]") {
@@ -149,6 +154,7 @@ impl Template {
             Template::Mistral => "mistral",
             Template::Gemma => "gemma",
             Template::Gemma4 => "gemma4",
+            Template::Granite => "granite",
             Template::Phi3 => "phi3",
             Template::Zephyr => "zephyr",
             Template::DeepSeek => "deepseek",
@@ -266,6 +272,20 @@ impl Template {
                 }
                 if add_assistant {
                     out.markup("<|turn>model\n");
+                }
+            }
+            Template::Granite => {
+                // As llama.cpp writes it: a newline after each turn.
+                for message in messages {
+                    out.markup(&format!(
+                        "<|start_of_role|>{}<|end_of_role|>",
+                        message.role.name()
+                    ));
+                    out.content(&message.content);
+                    out.markup("<|end_of_text|>\n");
+                }
+                if add_assistant {
+                    out.markup("<|start_of_role|>assistant<|end_of_role|>");
                 }
             }
             Template::Phi3 | Template::Zephyr => {
@@ -419,6 +439,15 @@ mod tests {
     }
 
     #[test]
+    fn granite() {
+        let text = Template::Granite.render_text(&conversation()[1..2], true, "");
+        assert_eq!(
+            text,
+            "<|start_of_role|>user<|end_of_role|>Hi<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>"
+        );
+    }
+
+    #[test]
     fn phi3_and_zephyr() {
         let text = Template::Phi3.render_text(&conversation()[1..2], true, "");
         assert_eq!(text, "<|user|>\nHi<|end|>\n<|assistant|>\n");
@@ -469,6 +498,7 @@ mod tests {
             ),
             ("<start_of_turn>{{ role }}", Some(Template::Gemma)),
             ("{{- '<|turn>' + role + '\\n' }}", Some(Template::Gemma4)),
+            ("{{- '<|start_of_role|>' + role }}", Some(Template::Granite)),
             ("[INST] <<SYS>>\n{{ system }}", Some(Template::Llama2)),
             (
                 "{{ bos_token }}[INST] {{ content }} [/INST]",

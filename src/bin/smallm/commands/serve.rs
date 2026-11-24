@@ -5,7 +5,10 @@ use std::sync::Arc;
 
 use smallm::Session;
 
-use super::{SESSION_SPECS, TEMPLATE_SPECS, chat_template, describe, load_model, session_config};
+use super::{
+    CONTEXT_SPECS, SESSION_SPECS, TEMPLATE_SPECS, chat_template, describe, load_model,
+    overflow_options, session_config,
+};
 use crate::args::{self, Args, Spec, value};
 use crate::server::api::Server;
 
@@ -23,6 +26,7 @@ fn specs() -> Vec<Spec> {
     SPECS
         .into_iter()
         .chain(SESSION_SPECS)
+        .chain(CONTEXT_SPECS)
         .chain(TEMPLATE_SPECS)
         .collect()
 }
@@ -82,6 +86,8 @@ pub fn main(raw: impl Iterator<Item = String>) -> Result<(), String> {
     }
     eprintln!("listening on http://{address}");
 
-    Arc::new(Server::new(session, template, model_id, api_key)).run(listener);
+    let mut server = Server::new(session, template, model_id, api_key);
+    (server.overflow, server.keep) = overflow_options(&args)?;
+    Arc::new(server).run(listener);
     Ok(())
 }

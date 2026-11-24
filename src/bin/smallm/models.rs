@@ -4,10 +4,13 @@ use std::path::{Path, PathBuf};
 
 /// The folder downloaded models are kept in.
 ///
-/// `SMALLM_MODELS` overrides the default, which follows each system's
-/// convention for application data.
+/// `SMALLM_MODELS`, then the `models` setting, override the default, which
+/// follows each system's convention for application data.
 pub fn models_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("SMALLM_MODELS").filter(|dir| !dir.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    if let Some(dir) = crate::config::get().and_then(|settings| settings.value("models")) {
         return PathBuf::from(dir);
     }
     let var = |name: &str| {

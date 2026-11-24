@@ -10,9 +10,11 @@
 //! | `term.rs`     | Ctrl+C handling, and what the terminal can show.   |
 //! | `screen.rs`   | A scrolling log with one progress bar under it.    |
 //! | `sha256.rs`   | Checks that a download arrived intact.             |
+//! | `config.rs`   | The settings file, `smallm.conf`.                  |
 
 mod args;
 mod commands;
+mod config;
 mod json;
 mod models;
 mod screen;
@@ -36,12 +38,15 @@ Commands:
   info <model>           Show what a model is
   bench <model>          Measure speed on this machine
   tokenize <model> <text>  Show how a model reads a text
+  config                 Show the settings file, or reset it with --reset
+  uninstall              Remove SmaLLM and the models it downloaded
   version                Print the version
 
 Run 'smallm <command> --help' for the options of a command.
 ";
 
 fn main() -> ExitCode {
+    config::init();
     let mut raw = std::env::args().skip(1);
     let Some(command) = raw.next() else {
         print!("{HELP}");
@@ -63,6 +68,8 @@ fn main() -> ExitCode {
         ("info", true) => show(commands::info::help()),
         ("bench", true) => show(commands::bench::help()),
         ("tokenize", true) => show(commands::info::tokenize_help()),
+        ("uninstall", true) => show(commands::uninstall::help()),
+        ("config", true) => show(commands::config::help()),
         ("run", false) => commands::run::main(rest),
         ("serve", false) => commands::serve::main(rest),
         ("pull", false) => commands::pull::pull(rest),
@@ -71,6 +78,8 @@ fn main() -> ExitCode {
         ("info", false) => commands::info::main(rest),
         ("bench", false) => commands::bench::main(rest),
         ("tokenize", false) => commands::info::tokenize(rest),
+        ("uninstall", false) => commands::uninstall::main(rest),
+        ("config", false) => commands::config::main(rest),
         (other, _) => Err(format!(
             "unknown command '{other}'. Run 'smallm help' for the list."
         )),

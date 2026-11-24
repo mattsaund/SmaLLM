@@ -133,6 +133,25 @@ pub(crate) struct TinyModel {
     pub output_scale: bool,
     /// Doubles the feed-forward width of the second half of the layers.
     pub wide_late_ff: bool,
+    /// Experts per mixture-of-experts layer. Zero for dense models.
+    pub experts: usize,
+    /// Experts each token goes through.
+    pub experts_used: usize,
+    /// Leading layers that stay dense in a model with experts.
+    pub dense_lead: usize,
+    /// GGUF's code for how router scores become weights: 1 for a softmax,
+    /// 2 for a sigmoid, 3 for a softmax over the chosen experts.
+    pub gating: u32,
+    /// A bias on the router scores, used only to choose (LFM2 MoE).
+    pub choice_bias: bool,
+    /// A gated expert that every token goes through (Qwen2 MoE).
+    pub shared_expert: bool,
+    /// Stores each expert's gate and up projections as one tensor.
+    pub fused_experts: bool,
+    /// Query and key norms as wide as all heads together (OLMoE).
+    pub wide_qk_norm: bool,
+    /// Granite's multipliers on embeddings, residuals, scores and logits.
+    pub granite_scales: bool,
     pub seed: u64,
 }
 
@@ -150,9 +169,12 @@ impl TinyModel {
             n_head_kv: 2,
             n_ff: width,
             n_vocab: 40,
-            qk_norm: matches!(arch, "qwen3" | "gemma3" | "gemma4" | "lfm2" | "lfm3"),
+            qk_norm: matches!(
+                arch,
+                "qwen3" | "qwen3moe" | "gemma3" | "gemma4" | "lfm2" | "lfm2moe" | "lfm3" | "olmoe"
+            ),
             post_norm: matches!(arch, "gemma3" | "gemma4" | "lfm3"),
-            bias: arch == "qwen2",
+            bias: matches!(arch, "qwen2" | "qwen2moe"),
             fused: false,
             window: 0,
             rope_factors: false,
@@ -165,13 +187,39 @@ impl TinyModel {
             values_from_keys: false,
             output_scale: false,
             wide_late_ff: false,
+            experts: 0,
+            experts_used: 0,
+            dense_lead: 0,
+            gating: 1,
+            choice_bias: false,
+            shared_expert: false,
+            fused_experts: false,
+            wide_qk_norm: arch == "olmoe",
+            granite_scales: matches!(arch, "granite" | "granitemoe"),
             seed: 1,
         };
+        if matches!(
+            arch,
+            "qwen2moe" | "qwen3moe" | "olmoe" | "granitemoe" | "lfm2moe"
+        ) {
+            model.experts = 4;
+            model.experts_used = 2;
+        }
         match arch {
             "lfm2" => {
                 model.n_layer = 4;
                 model.conv_kernel = 3;
             }
+            "lfm2moe" => {
+                model.n_layer = 4;
+                model.conv_kernel = 3;
+                model.dense_lead = 1;
+                model.gating = 2;
+                model.choice_bias = true;
+            }
+            "qwen2moe" => model.shared_expert = true,
+            // Every fourth layer is left unrotated.
+            "smollm3" => model.n_layer = 4,
             "lfm3" => {
                 model.n_layer = 6;
                 model.conv_kernel = 4;
@@ -235,6 +283,11 @@ impl TinyModel {
         } else {
             self.n_ff
         }
+    }
+
+    /// True when layer `index` is a mixture of experts.
+    pub fn has_experts(&self, index: usize) -> bool {
+        self.experts > 0 && index >= self.dense_lead
     }
 
     /// True when layer `index` computes keys and values of its own.
@@ -329,6 +382,26 @@ impl TinyModel {
                 &format!("{arch}.embedding_length_per_layer_input"),
                 self.per_layer as u32,
             );
+        }
+        if self.experts > 0 {
+            builder
+                .u32(&format!("{arch}.expert_count"), self.experts as u32)
+                .u32(
+                    &format!("{arch}.expert_used_count"),
+                    self.experts_used as u32,
+                )
+                .u32(&format!("{arch}.expert_gating_func"), self.gating)
+                .u32(
+                    &format!("{arch}.expert_feed_forward_length"),
+                    self.n_ff as u32,
+                );
+        }
+        if self.granite_scales {
+            builder
+                .f32(&format!("{arch}.embedding_scale"), 2.0)
+                .f32(&format!("{arch}.residual_scale"), 0.5)
+                .f32(&format!("{arch}.logit_scale"), 3.0)
+                .f32(&format!("{arch}.attention.scale"), 0.3);
         }
 
         // A minimal vocabulary: three special tokens, then one per id.
@@ -443,12 +516,67 @@ impl TinyModel {
                     );
                 }
             }
-            if self.fused {
+            if self.has_experts(layer) {
+                // One matrix per expert, stacked in a three-dimensional
+                // tensor, innermost dimension first.
+                let count = self.experts;
+                let mut expert_rng = Rng(self.seed ^ (0xe0 + layer as u64));
+                let mut stacked = |builder: &mut Builder, part: &str, rows: usize, cols: usize| {
+                    let n = count * rows * cols;
+                    let data = random_weights(&mut expert_rng, self.ty, n, weight_scale);
+                    let dims = [cols as u64, rows as u64, count as u64];
+                    builder.tensor(&name(part), &dims, id, data);
+                };
+                if self.fused_experts {
+                    stacked(&mut builder, "ffn_gate_up_exps.weight", 2 * n_ff, d);
+                } else {
+                    stacked(&mut builder, "ffn_gate_exps.weight", n_ff, d);
+                    stacked(&mut builder, "ffn_up_exps.weight", n_ff, d);
+                }
+                stacked(&mut builder, "ffn_down_exps.weight", d, n_ff);
+                matrix(
+                    &mut builder,
+                    &name("ffn_gate_inp.weight"),
+                    count,
+                    d,
+                    weight_scale,
+                );
+                if self.shared_expert {
+                    matrix(
+                        &mut builder,
+                        &name("ffn_gate_shexp.weight"),
+                        n_ff,
+                        d,
+                        weight_scale,
+                    );
+                    matrix(
+                        &mut builder,
+                        &name("ffn_up_shexp.weight"),
+                        n_ff,
+                        d,
+                        weight_scale,
+                    );
+                    matrix(
+                        &mut builder,
+                        &name("ffn_down_shexp.weight"),
+                        d,
+                        n_ff,
+                        weight_scale,
+                    );
+                }
+            } else if self.fused {
                 matrix(
                     &mut builder,
                     &name("ffn_up.weight"),
                     2 * n_ff,
                     d,
+                    weight_scale,
+                );
+                matrix(
+                    &mut builder,
+                    &name("ffn_down.weight"),
+                    d,
+                    n_ff,
                     weight_scale,
                 );
             } else {
@@ -460,14 +588,14 @@ impl TinyModel {
                     weight_scale,
                 );
                 matrix(&mut builder, &name("ffn_up.weight"), n_ff, d, weight_scale);
+                matrix(
+                    &mut builder,
+                    &name("ffn_down.weight"),
+                    d,
+                    n_ff,
+                    weight_scale,
+                );
             }
-            matrix(
-                &mut builder,
-                &name("ffn_down.weight"),
-                d,
-                n_ff,
-                weight_scale,
-            );
             if self.per_layer > 0 {
                 let per = self.per_layer;
                 matrix(&mut builder, &name("inp_gate.weight"), per, d, weight_scale);
@@ -520,20 +648,33 @@ impl TinyModel {
                 let kernel = taps_rng.floats(self.conv_kernel * d, -1.0, 1.0);
                 builder.tensor_f32(&name("shortconv.conv.weight"), &[taps, d as u64], &kernel);
             } else if self.qk_norm {
-                vector(
-                    &mut builder,
-                    &name("attn_q_norm.weight"),
-                    head_dim,
-                    0.5,
-                    1.5,
-                );
+                let (q_width, k_width) = if self.wide_qk_norm {
+                    (q_dim, kv_dim)
+                } else {
+                    (head_dim, head_dim)
+                };
+                vector(&mut builder, &name("attn_q_norm.weight"), q_width, 0.5, 1.5);
                 if self.owns_kv(layer) {
+                    vector(&mut builder, &name("attn_k_norm.weight"), k_width, 0.5, 1.5);
+                }
+            }
+            if self.has_experts(layer) {
+                if self.choice_bias {
                     vector(
                         &mut builder,
-                        &name("attn_k_norm.weight"),
-                        head_dim,
+                        &name("exp_probs_b.bias"),
+                        self.experts,
+                        -0.5,
                         0.5,
-                        1.5,
+                    );
+                }
+                if self.shared_expert {
+                    vector(
+                        &mut builder,
+                        &name("ffn_gate_inp_shexp.weight"),
+                        d,
+                        -0.2,
+                        0.2,
                     );
                 }
             }

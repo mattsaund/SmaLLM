@@ -25,11 +25,11 @@ use crate::error::Result;
 use crate::gguf::Gguf;
 use crate::tokenizer::Tokenizer;
 
-pub use config::{ARCHITECTURES, Activation, Config, LayerSpec, Mixer, Rope};
+pub use config::{ARCHITECTURES, Activation, Config, Gating, LayerSpec, Mixer, Rope, Routing};
 pub use forward::{Phase, Profile, Session, SessionConfig};
 pub use weights::{
-    AttentionWeights, ConvWeights, Layer, Linear, Matrix, MixerWeights, PerLayerInputs,
-    PerLayerWeights, Weights,
+    AttentionWeights, ConvWeights, Dense, ExpertMatrix, Experts, FeedForward, Layer, Linear,
+    Matrix, MixerWeights, PerLayerInputs, PerLayerWeights, Weights,
 };
 
 /// A model file, opened and ready to run.

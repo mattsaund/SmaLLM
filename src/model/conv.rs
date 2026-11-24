@@ -180,6 +180,37 @@ impl ConvState {
         position
     }
 
+    /// Removes positions `keep..keep + discard` and moves the later ones
+    /// down, as the session does when its context slides. A block's state
+    /// does not depend on positions, so only where the rings keep each
+    /// input changes. Checkpoints are dropped: their positions are gone.
+    pub fn shift(&mut self, keep: usize, discard: usize) {
+        let discard = discard.min(self.len.saturating_sub(keep));
+        self.checkpoints.clear();
+        if discard == 0 || self.rings.is_empty() {
+            self.len -= discard;
+            return;
+        }
+        let d = self.n_embd;
+        let first = self
+            .valid_from
+            .max(self.len.saturating_sub(self.capacity))
+            .max(keep + discard);
+        let mut moved = vec![0.0; (self.len - first) * d];
+        for ring in &mut self.rings {
+            for (index, position) in (first..self.len).enumerate() {
+                let at = (position % self.capacity) * d;
+                moved[index * d..(index + 1) * d].copy_from_slice(&ring[at..at + d]);
+            }
+            for (index, position) in (first - discard..self.len - discard).enumerate() {
+                let at = (position % self.capacity) * d;
+                ring[at..at + d].copy_from_slice(&moved[index * d..(index + 1) * d]);
+            }
+        }
+        self.len -= discard;
+        self.valid_from = first - discard;
+    }
+
     /// Bytes of memory the rings and checkpoints take.
     pub fn bytes(&self) -> usize {
         let floats = self.rings.iter().map(Vec::len).sum::<usize>()
@@ -283,6 +314,17 @@ mod tests {
         assert_eq!(state.rewind(10), 0);
         assert_eq!(state_at(&state, 0, 0), [0.0, 0.0]);
         assert_eq!(state.bytes(), rings);
+    }
+
+    #[test]
+    fn shifting_keeps_the_recent_inputs() {
+        let mut state = ConvState::new(&[true], 3, 1);
+        feed(&mut state, &[0], 0, 300, 32);
+        state.shift(1, 100);
+        // The state at the new end is the inputs of the old positions 298
+        // and 299, which held 299 and 300.
+        assert_eq!(state_at(&state, 0, 200), [299.0, 300.0]);
+        assert_eq!(state.bytes(), (2 + RECENT) * 4);
     }
 
     #[test]

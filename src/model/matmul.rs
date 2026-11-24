@@ -32,8 +32,8 @@ use crate::threads::ThreadPool;
 
 use super::weights::Linear;
 
-/// The most matrices one call can multiply.
-pub(super) const MAX_TARGETS: usize = 4;
+/// Targets one call can plan without allocating. More are allowed.
+const STACK_TARGETS: usize = 16;
 
 /// A chunk of rows should cost at least this many multiply-adds, or handing
 /// it to a thread costs more than computing it.
@@ -69,8 +69,22 @@ pub(super) struct Engine<'a> {
 /// One output of a multiplication: a linear map and where its result goes.
 pub(super) struct Target<'a> {
     pub linear: &'a Linear,
-    /// One output row per input vector, each `linear.rows` wide.
+    /// One output row per input vector it reads, each `linear.rows` wide.
     pub out: &'a mut [f32],
+    /// The input vectors this target reads. `None` for all of them. A
+    /// mixture of experts gives each expert the tokens routed to it.
+    pub inputs: Option<Range<usize>>,
+}
+
+impl<'a> Target<'a> {
+    /// A target that reads every input vector.
+    pub fn new(linear: &'a Linear, out: &'a mut [f32]) -> Target<'a> {
+        Target {
+            linear,
+            out,
+            inputs: None,
+        }
+    }
 }
 
 /// Activation vectors quantized for one block family.
@@ -239,6 +253,9 @@ struct Plan {
     /// First row of this target in the combined row numbering.
     first: usize,
     rows: usize,
+    /// The input vectors this target reads.
+    first_vector: usize,
+    vectors: usize,
     /// The first stored row, and the distance between rows.
     data: *const u8,
     row_bytes: usize,
@@ -251,7 +268,6 @@ struct Job<'a> {
     plans: &'a [Option<Plan>],
     x: *const f32,
     cols: usize,
-    count: usize,
     scratch: &'a ActScratch,
     /// True when the kernels read the float input directly.
     exact: bool,
@@ -292,7 +308,8 @@ impl Job<'_> {
                 self.kernels.fill_tile(tile, plan.ty, bytes, plan.row_bytes);
                 debug_assert_eq!(tile.cols, self.cols);
                 let mut results = [0.0f32; MAX_TILE_ROWS];
-                for index in 0..self.count {
+                let inputs = plan.first_vector..plan.first_vector + plan.vectors;
+                for (slot, index) in inputs.enumerate() {
                     let act = acts.act(index, self.cols, group);
                     let sums = acts.scaled_sums(index, self.cols).as_ptr();
                     // SAFETY: the tile and the activations both hold `cols`
@@ -301,7 +318,7 @@ impl Job<'_> {
                     unsafe {
                         dot(tile, act, sums, group, results.as_mut_ptr());
                         for (r, value) in results[..count].iter().enumerate() {
-                            *plan.out.add(index * plan.rows + row + r) = *value;
+                            *plan.out.add(slot * plan.rows + row + r) = *value;
                         }
                     }
                 }
@@ -329,7 +346,8 @@ impl Job<'_> {
                 // receive buffers of the sizes their contracts require.
                 unsafe {
                     let weights = plan.data.add(row * plan.row_bytes);
-                    for index in 0..self.count {
+                    let inputs = plan.first_vector..plan.first_vector + plan.vectors;
+                    for (slot, index) in inputs.enumerate() {
                         let value = match plan.dot {
                             RowDot::Float(dot) => {
                                 dot(weights, self.x.add(index * self.cols), self.cols)
@@ -352,7 +370,7 @@ impl Job<'_> {
                                 dot(weights, self.cols, act)
                             }
                         };
-                        *plan.out.add(index * plan.rows + row) = value;
+                        *plan.out.add(slot * plan.rows + row) = value;
                     }
                 }
             }
@@ -376,7 +394,8 @@ impl Engine<'_> {
         if count == 0 || targets.is_empty() {
             return;
         }
-        assert!(targets.len() <= MAX_TARGETS && x.len() == count * cols);
+        assert_eq!(x.len(), count * cols);
+        let inputs = |target: &Target<'_>| target.inputs.clone().unwrap_or(0..count);
 
         // Quantize the input once for each block family in use.
         let exact = self.kernels.is_exact();
@@ -388,7 +407,14 @@ impl Engine<'_> {
         };
         let height = self.kernels.tile_rows();
         assert!(height <= MAX_TILE_ROWS);
-        let tiled = !exact && height > 0 && count >= TILE_BATCH;
+        // A target takes the tile route when it reads a batch of vectors.
+        let tiles = |target: &Target<'_>| {
+            !exact
+                && height > 0
+                && inputs(target).len() >= TILE_BATCH
+                && target.linear.matrix.ty.family() != Family::Float
+        };
+        let tiled = targets.iter().any(tiles);
         let start = scratch.timing.then(Instant::now);
         if uses(Family::Block32) {
             scratch
@@ -404,14 +430,24 @@ impl Engine<'_> {
             scratch.quantize_time += start.elapsed();
         }
 
-        let mut plans = [None; MAX_TARGETS];
+        let mut stack = [None; STACK_TARGETS];
+        let mut heap = Vec::new();
+        let plans: &mut [Option<Plan>] = if targets.len() <= STACK_TARGETS {
+            &mut stack[..targets.len()]
+        } else {
+            heap.resize(targets.len(), None);
+            &mut heap
+        };
         let mut total_rows = 0;
+        let mut total_work = 0;
         for (plan, target) in plans.iter_mut().zip(targets.iter_mut()) {
             let matrix = &target.linear.matrix;
+            let vectors = inputs(target);
             assert_eq!(matrix.cols, cols, "matrix width must match the input");
+            assert!(vectors.end <= count, "inputs must lie inside the batch");
             assert_eq!(
                 target.out.len(),
-                count * target.linear.rows,
+                vectors.len() * target.linear.rows,
                 "output size must match"
             );
             assert!(target.linear.first_row + target.linear.rows <= matrix.rows);
@@ -421,25 +457,28 @@ impl Engine<'_> {
                 dot: self.kernels.row_dot(matrix.ty),
                 ty: matrix.ty,
                 family: matrix.ty.family(),
-                tiled: tiled && matrix.ty.family() != Family::Float,
+                tiled: tiles(target),
                 first: total_rows,
                 rows: target.linear.rows,
+                first_vector: vectors.start,
+                vectors: vectors.len(),
                 data: self.map.as_slice()[offset..].as_ptr(),
                 row_bytes: matrix.row_bytes,
                 out: target.out.as_mut_ptr(),
             });
             total_rows += target.linear.rows;
+            total_work += target.linear.rows * vectors.len() * cols;
         }
         let job = Job {
             kernels: self.kernels,
-            plans: &plans,
+            plans,
             x: x.as_ptr(),
             cols,
-            count,
             scratch,
             exact,
         };
-        let mut grain = rows_per_chunk(total_rows, cols * count, self.pool.threads());
+        let work_per_row = total_work / total_rows.max(1);
+        let mut grain = rows_per_chunk(total_rows, work_per_row, self.pool.threads());
         if tiled {
             // Whole tiles per chunk, so no thread pads a tile with empty rows.
             grain = grain.next_multiple_of(height);

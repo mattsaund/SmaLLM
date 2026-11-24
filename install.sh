@@ -11,9 +11,16 @@
 # Every step prints a line, and one progress bar for the whole installation
 # stays at the bottom of the screen.
 #
-# To remove SmaLLM again:
+# Anything SmaLLM needs that the machine lacks is installed along with it,
+# after asking: curl, which `smallm pull` downloads with, and for a build
+# from source, Rust and a C compiler. System packages come from the
+# system's own package manager.
+#
+# To remove SmaLLM again, with its downloaded models:
 #
 #   curl -fsSL https://raw.githubusercontent.com/mattsaund/SmaLLM/main/install.sh | sh -s -- --uninstall
+#
+# `smallm uninstall` does the same.
 #
 # Override anything with the environment:
 #   SMALLM_REPO=...         git URL to clone
@@ -155,18 +162,91 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 # --- uninstall -----------------------------------------------------------------
+#
+# The program knows what it put where, so it removes itself. Its questions
+# are read from the terminal, as this script's are. Options after
+# --uninstall, such as --yes or --keep-models, are passed on to it.
 
 if [ "${1:-}" = "--uninstall" ]; then
+    shift
+    if [ -x "$PREFIX/smallm" ] && "$PREFIX/smallm" help 2>/dev/null | grep -q uninstall; then
+        if [ -t 0 ]; then
+            "$PREFIX/smallm" uninstall "$@"
+        elif ( : < /dev/tty ) 2>/dev/null; then
+            "$PREFIX/smallm" uninstall "$@" < /dev/tty
+        else
+            "$PREFIX/smallm" uninstall "$@" < /dev/null
+        fi
+        exit $?
+    fi
     if [ -e "$PREFIX/smallm" ]; then
         rm -f "$PREFIX/smallm"
         log "Removed" "$PREFIX/smallm"
     else
         log "Absent" "no smallm in $PREFIX"
     fi
-    log "Kept" "downloaded models, in ~/.local/share/smallm on Linux and"
-    log "" "~/Library/Application Support/smallm on macOS. Delete that folder to remove them."
     exit 0
 fi
+
+# --- what SmaLLM needs from the system -----------------------------------------
+#
+# pkg_install installs system packages with the system's package manager,
+# through sudo when this is not root. It runs in the foreground, so sudo can
+# ask for a password. It fails where there is no package manager it knows.
+
+pkg_install() {
+    clear_bar
+    as_root=
+    if [ "$(id -u)" != 0 ]; then
+        have sudo || return 1
+        as_root=sudo
+    fi
+    if have apt-get; then
+        $as_root apt-get update -qq && $as_root apt-get install -y -qq "$@"
+    elif have dnf; then
+        $as_root dnf install -y -q "$@"
+    elif have yum; then
+        $as_root yum install -y -q "$@"
+    elif have pacman; then
+        $as_root pacman -S --noconfirm --needed "$@"
+    elif have zypper; then
+        $as_root zypper --non-interactive install "$@"
+    elif have apk; then
+        $as_root apk add --quiet "$@"
+    elif have xbps-install; then
+        $as_root xbps-install -y "$@"
+    else
+        return 1
+    fi
+}
+
+# need_curl: `smallm pull` downloads models with curl.
+need_curl() {
+    have curl && return 0
+    warn "Missing" "curl, which smallm uses to download models."
+    if ask "Install it with the system's package manager?" && pkg_install curl; then
+        log "Installed" "curl"
+    else
+        warn "Without" "curl, 'smallm pull' cannot download. Install curl to use it."
+    fi
+}
+
+# need_compiler: Rust links programs with the linker of a C compiler.
+need_compiler() {
+    { have cc || have gcc || have clang; } && return 0
+    if [ "$(uname -s)" = Darwin ]; then
+        die "building needs Apple's command line tools: run 'xcode-select --install', then run this again"
+    fi
+    warn "Missing" "a C compiler, whose linker the Rust build uses."
+    package=gcc
+    have apt-get && package=build-essential
+    have apk && package=build-base
+    ask "Install $package with the system's package manager?" ||
+        die "a C compiler is needed: install gcc or clang, then run this again"
+    pkg_install "$package" ||
+        die "could not install $package: install gcc or clang, then run this again"
+    log "Installed" "$package"
+}
 
 # --- steps that both routes share ------------------------------------------------
 
@@ -278,6 +358,7 @@ put_in_place() {
 
 # What to say once there is a binary, from either route to one.
 finish() {
+    need_curl
     progress 100 "installed"
     version=$("$PREFIX/smallm" version 2>/dev/null || echo "smallm, unknown version")
     log "Installed" "$version in $PREFIX/smallm"
@@ -420,18 +501,31 @@ if ! have cargo; then
     fi
 fi
 have cargo || die "cargo still not on PATH"
-have cc || have gcc || have clang || die "a C compiler is needed for its linker: install gcc or clang, then run this again"
+need_compiler
 log "Found" "$(cargo --version 2>/dev/null || echo cargo)"
 
 if in_checkout; then
     SRC="$(pwd)"
     log "Building" "the checkout in $SRC"
 else
-    have git || die "git is required to fetch the source"
     SRC="$WORK/src"
     progress 42 "fetching the source"
-    run_logged 42 48 "fetching the source" git clone --depth 1 --branch "$REF" "$REPO" "$SRC" ||
-        die "could not clone $REPO"
+    if have git; then
+        run_logged 42 48 "fetching the source" git clone --depth 1 --branch "$REF" "$REPO" "$SRC" ||
+            die "could not clone $REPO"
+    else
+        # Without git, GitHub serves the same files as an archive.
+        case "$REPO" in
+            https://github.com/*) ;;
+            *) die "git is needed to fetch $REPO" ;;
+        esac
+        slug=${REPO#https://github.com/}
+        slug=${slug%.git}
+        fetch "https://github.com/$slug/archive/$REF.tar.gz" "$WORK/source.tar.gz" 42 47 ||
+            die "could not download the source"
+        mkdir -p "$SRC" && tar -xzf "$WORK/source.tar.gz" -C "$SRC" --strip-components=1 ||
+            die "could not unpack the source"
+    fi
     log "Fetched" "$REPO ($REF), $(find "$SRC" -type f -not -path '*/.git/*' | wc -l | tr -d ' ') files"
 fi
 

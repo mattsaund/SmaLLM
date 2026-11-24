@@ -17,6 +17,41 @@ use crate::model::Session;
 use crate::sampler::{Sampler, SamplerConfig};
 use crate::tokenizer::Tokenizer;
 
+/// What generation does when the context window is full.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Overflow {
+    /// Keep the start of the context, such as the system prompt, and drop
+    /// the oldest tokens after it.
+    #[default]
+    Middle,
+    /// Drop the oldest tokens and slide forward. Only the first token
+    /// stays, when it marks the beginning of the text.
+    Slide,
+    /// End the answer.
+    Stop,
+}
+
+impl Overflow {
+    /// Every choice, for listings.
+    pub const ALL: [Overflow; 3] = [Overflow::Middle, Overflow::Slide, Overflow::Stop];
+
+    /// The name of the choice, as given on the command line.
+    pub fn name(self) -> &'static str {
+        match self {
+            Overflow::Middle => "middle",
+            Overflow::Slide => "slide",
+            Overflow::Stop => "stop",
+        }
+    }
+
+    /// Looks up a choice by its name.
+    pub fn from_name(name: &str) -> Option<Overflow> {
+        Overflow::ALL
+            .into_iter()
+            .find(|choice| choice.name() == name)
+    }
+}
+
 /// Options for one generation.
 #[derive(Clone, Debug, Default)]
 pub struct Options {
@@ -30,6 +65,11 @@ pub struct Options {
     pub stop: Vec<String>,
     /// Show control tokens in the output instead of hiding them.
     pub show_special: bool,
+    /// What to do when the context window is full.
+    pub overflow: Overflow,
+    /// Tokens at the start of the context that [`Overflow::Middle`] keeps.
+    /// `None` keeps the prompt. At most half the window is kept either way.
+    pub keep: Option<usize>,
 }
 
 /// Why a generation ended.
@@ -67,6 +107,9 @@ pub struct Stats {
     pub context_tokens: usize,
     /// Size of the context window in tokens.
     pub context_size: usize,
+    /// Tokens dropped from the context to make room, from the prompt or
+    /// while generating.
+    pub dropped_tokens: usize,
     /// Bytes of memory the context holds, for the key/value cache and any
     /// other per-token state.
     pub context_bytes: usize,
@@ -153,6 +196,7 @@ pub fn chat_tokens_fitting(
     messages: &[Message],
     n_ctx: usize,
     reserve: usize,
+    overflow: Overflow,
 ) -> (Vec<u32>, usize) {
     use crate::chat::Role;
     let mut kept: Vec<Message> = messages.to_vec();
@@ -161,9 +205,11 @@ pub fn chat_tokens_fitting(
         if tokens.len() + reserve <= n_ctx {
             return (tokens, messages.len() - kept.len());
         }
-        // The oldest turn that is not a system message, unless it is the
-        // only one left.
-        let droppable = kept.iter().position(|message| message.role != Role::System);
+        // The oldest turn, unless it is the only one left. Sliding drops
+        // system messages too. The other choices keep them.
+        let droppable = kept
+            .iter()
+            .position(|message| overflow == Overflow::Slide || message.role != Role::System);
         match droppable {
             Some(index) if index + 1 < kept.len() => {
                 kept.remove(index);
@@ -179,6 +225,44 @@ pub fn chat_tokens_fitting(
     }
 }
 
+/// The number of tokens a chat prompt spends on its opening: the system
+/// messages and the first message of the user. That is the start
+/// [`Overflow::Middle`] keeps in a chat, so the model never loses its
+/// instructions or the question that began the conversation.
+pub fn opening_tokens(
+    tokenizer: &Tokenizer,
+    template: Template,
+    messages: &[Message],
+    prompt: &[u32],
+) -> usize {
+    use crate::chat::Role;
+    let system = messages
+        .iter()
+        .take_while(|message| message.role == Role::System)
+        .count();
+    let first_user = usize::from(messages.get(system).is_some_and(|m| m.role == Role::User));
+    if system + first_user == 0 {
+        return 0;
+    }
+    // The opening renders the same in front of any conversation, up to the
+    // turn after it.
+    let alone = chat_tokens(tokenizer, template, &messages[..system + first_user]);
+    alone.iter().zip(prompt).take_while(|(a, b)| a == b).count()
+}
+
+/// Where the protected start of the context ends, for `overflow`. The rest
+/// of the context is what may be dropped.
+fn kept_start(session: &Session, overflow: Overflow, keep: usize) -> usize {
+    let tokens = session.tokens();
+    let half = session.n_ctx() / 2;
+    let bos = session.model().tokenizer().bos();
+    let first_is_bos = usize::from(bos.is_some() && tokens.first().copied() == bos);
+    match overflow {
+        Overflow::Middle => keep.max(first_is_bos).min(half),
+        Overflow::Slide | Overflow::Stop => first_is_bos,
+    }
+}
+
 /// Generates from a prompt that is already tokenized.
 pub fn run_tokens(
     session: &mut Session,
@@ -191,6 +275,27 @@ pub fn run_tokens(
     }
     let model = std::sync::Arc::clone(session.model());
     let tokenizer = model.tokenizer();
+    let keep = options.keep.unwrap_or(prompt.len());
+    let mut dropped = 0;
+
+    // A prompt too long for the window loses its oldest tokens after the
+    // kept start, leaving a quarter of the window for the answer.
+    let n_ctx = session.n_ctx();
+    let cut: Vec<u32>;
+    let prompt = if prompt.len() + n_ctx / 4 > n_ctx && options.overflow != Overflow::Stop {
+        let head = match options.overflow {
+            Overflow::Middle => keep.min(n_ctx / 2),
+            _ => {
+                usize::from(tokenizer.bos().is_some() && prompt.first().copied() == tokenizer.bos())
+            }
+        };
+        let tail = (n_ctx - n_ctx / 4).saturating_sub(head).max(1);
+        dropped = prompt.len() - head - tail;
+        cut = [&prompt[..head], &prompt[prompt.len() - tail..]].concat();
+        &cut[..]
+    } else {
+        prompt
+    };
 
     // Keep the part of the context the prompt shares with it. The last
     // prompt token is always evaluated, to get fresh logits.
@@ -216,7 +321,17 @@ pub fn run_tokens(
     let finish = loop {
         if let Some(token) = pending.take() {
             if session.tokens().len() >= session.n_ctx() {
-                break Finish::Context;
+                // Make room by dropping the older half of what may go.
+                let len = session.tokens().len();
+                let start = kept_start(session, options.overflow, keep);
+                if options.overflow == Overflow::Stop || len <= start + 1 {
+                    break Finish::Context;
+                }
+                session.shift(start, (len - start) / 2);
+                dropped += len - session.tokens().len();
+                if session.tokens().len() == len {
+                    break Finish::Context;
+                }
             }
             session.eval(&[token])?;
         }
@@ -253,6 +368,7 @@ pub fn run_tokens(
         // conversation, and the next turn evaluates it.
         context_tokens: session.tokens().len() + usize::from(pending.is_some()),
         context_size: session.n_ctx(),
+        dropped_tokens: dropped,
         context_bytes: session.cache_bytes(),
     })
 }
@@ -369,6 +485,57 @@ impl<'a> TextStream<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{Model, SessionConfig};
+    use crate::tensor::TensorType;
+    use crate::testing::TinyModel;
+    use std::sync::Arc;
+
+    /// Generates 80 tokens greedily in a window of 32.
+    fn overflowing(overflow: Overflow, keep: Option<usize>) -> (Stats, Vec<u32>) {
+        let model =
+            Arc::new(Model::from_bytes(TinyModel::new("llama", TensorType::F32).build()).unwrap());
+        let config = SessionConfig {
+            n_ctx: 32,
+            threads: 1,
+            ..Default::default()
+        };
+        let mut session = Session::new(model, config).unwrap();
+        let options = Options {
+            max_tokens: 80,
+            sampler: SamplerConfig {
+                temperature: 0.0,
+                ..Default::default()
+            },
+            overflow,
+            keep,
+            ..Default::default()
+        };
+        let prompt = [1, 5, 9, 12, 7, 30, 8, 8, 21, 3];
+        let stats = run_tokens(&mut session, &prompt, &options, |_| true).unwrap();
+        (stats, session.tokens().to_vec())
+    }
+
+    #[test]
+    fn a_full_context_slides_or_keeps_its_start() {
+        // Stopping ends the answer where the window ends.
+        let (stats, _) = overflowing(Overflow::Stop, None);
+        assert_eq!((stats.finish, stats.dropped_tokens), (Finish::Context, 0));
+
+        // The others make room and finish the answer.
+        for (overflow, keep, kept) in [
+            (Overflow::Slide, None, 1),
+            (Overflow::Middle, Some(4), 4),
+            (Overflow::Middle, None, 10),
+        ] {
+            let (stats, tokens) = overflowing(overflow, keep);
+            assert_eq!(stats.finish, Finish::Length, "{overflow:?}");
+            assert_eq!(stats.generated_tokens, 80);
+            assert!(stats.dropped_tokens > 0 && tokens.len() <= 32);
+            // The kept start is still the prompt's.
+            let prompt = [1u32, 5, 9, 12, 7, 30, 8, 8, 21, 3];
+            assert_eq!(tokens[..kept], prompt[..kept], "{overflow:?}");
+        }
+    }
 
     /// Feeds byte pieces through a stream and collects what it delivers.
     fn stream(stop: &[&str], pieces: &[&[u8]]) -> (Vec<String>, bool) {

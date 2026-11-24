@@ -233,8 +233,20 @@ fn gemma_4_e2b_q4_0() {
 }
 
 #[test]
+fn lfm2_8b_a1b_q4_k_m() {
+    check("LFM2-8B-A1B-Q4_K_M");
+}
+
+#[test]
+fn granite_3_1_1b_a400m_q4_k_m() {
+    check("granite-3.1-1b-a400m-instruct-Q4_K_M");
+}
+
+#[test]
 fn every_golden_file_has_a_test() {
     let tested = [
+        "LFM2-8B-A1B-Q4_K_M",
+        "granite-3.1-1b-a400m-instruct-Q4_K_M",
         "LFM2.5-350M-Q4_K_M",
         "LFM2.5-1.2B-Instruct-Q4_K_M",
         "gemma-4-E2B-it-Q4_0",

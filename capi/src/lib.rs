@@ -20,7 +20,7 @@ use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::Arc;
 
 use smallm::chat::{Message, Role, Template};
-use smallm::generate::{self, Finish, Options};
+use smallm::generate::{self, Finish, Options, Overflow};
 use smallm::{Error, Model, Sampler, SamplerConfig, Session, SessionConfig};
 
 /// Result codes. Zero is success, negative values are failures.
@@ -664,6 +664,7 @@ unsafe fn options(params: *const SmallmGenerateParams) -> Options {
         sampler: params.sampler.to_config(),
         stop,
         show_special: false,
+        ..Options::default()
     }
 }
 
@@ -812,6 +813,7 @@ pub unsafe extern "C" fn smallm_chat(
         &messages,
         session.0.n_ctx(),
         ANSWER_RESERVE,
+        Overflow::default(),
     );
     // SAFETY: guaranteed by the caller.
     unsafe {

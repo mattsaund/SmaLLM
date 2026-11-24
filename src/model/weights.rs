@@ -51,7 +51,8 @@ pub struct AttentionWeights {
     /// The value map is `None` when the keys, before their norm and
     /// rotation, serve as values (Gemma 4).
     pub kv: Option<(Linear, Option<Linear>)>,
-    /// Per-head normalization of queries and keys, when the model has it.
+    /// Normalization of queries and keys, when the model has it: per head,
+    /// or over all heads at once when the weight is that wide.
     pub q_norm: Option<Vec<f32>>,
     pub k_norm: Option<Vec<f32>>,
     /// One gate per head on the attention output, when the model has it:
@@ -90,6 +91,59 @@ pub struct PerLayerWeights {
     pub post_norm: Vec<f32>,
 }
 
+/// A gated feed-forward network: `down(act(gate(x)) * up(x))`.
+pub struct Dense {
+    pub gate: Linear,
+    pub up: Linear,
+    pub down: Linear,
+}
+
+/// The same matrix of every expert, stored back to back in one tensor.
+#[derive(Clone, Copy, Debug)]
+pub struct ExpertMatrix {
+    pub matrix: Matrix,
+    /// Rows of one expert's matrix.
+    pub rows: usize,
+    /// Rows from one expert's matrix to the next.
+    pub stride: usize,
+    /// Row where expert zero's matrix starts.
+    pub offset: usize,
+}
+
+impl ExpertMatrix {
+    /// Expert `index`'s matrix as a linear map.
+    pub fn expert(&self, index: usize) -> Linear {
+        Linear {
+            matrix: self.matrix,
+            first_row: index * self.stride + self.offset,
+            rows: self.rows,
+            bias: None,
+        }
+    }
+}
+
+/// A mixture of experts: each token goes through a few of many small
+/// feed-forward networks, chosen by a router.
+pub struct Experts {
+    /// Scores every expert for a token.
+    pub router: Linear,
+    /// Added to the scores when experts are chosen, but not when their
+    /// outputs are weighed (LFM2 MoE).
+    pub choice_bias: Option<Vec<f32>>,
+    pub gate: ExpertMatrix,
+    pub up: ExpertMatrix,
+    pub down: ExpertMatrix,
+    /// A network that every token goes through as well (Qwen2 MoE), with
+    /// an optional gate: one score per token, through a sigmoid.
+    pub shared: Option<(Dense, Option<Linear>)>,
+}
+
+/// The feed-forward part of a block.
+pub enum FeedForward {
+    Dense(Box<Dense>),
+    Experts(Box<Experts>),
+}
+
 /// The weights of one block.
 pub struct Layer {
     pub attn_norm: Vec<f32>,
@@ -97,9 +151,7 @@ pub struct Layer {
     /// Normalization of the mixer's output, when the model has it.
     pub attn_post_norm: Option<Vec<f32>>,
     pub ffn_norm: Vec<f32>,
-    pub ffn_gate: Linear,
-    pub ffn_up: Linear,
-    pub ffn_down: Linear,
+    pub ffn: FeedForward,
     /// Normalization of the feed-forward output, when the model has it.
     pub ffn_post_norm: Option<Vec<f32>>,
     pub per_layer: Option<PerLayerWeights>,
@@ -155,12 +207,11 @@ impl Weights {
         };
         // One table of rotary divisors serves every layer that uses one, so
         // those layers must rotate the same number of elements.
-        let mut rotating = config
-            .layers
-            .iter()
-            .filter(|layer| layer.mixer == Mixer::Attention && layer.rope_factors);
+        let mut rotating = config.layers.iter().filter(|layer| {
+            layer.mixer == Mixer::Attention && layer.rope_factors && layer.rope_dims > 0
+        });
         let rope_factors = match rotating.next() {
-            Some(first) => {
+            Some(first) if file.tensor("rope_freqs.weight").is_some() => {
                 if rotating.any(|layer| layer.rope_dims != first.rope_dims) {
                     return Err(Error::unsupported(
                         "rotary divisors for layers that rotate different widths",
@@ -168,7 +219,7 @@ impl Weights {
                 }
                 optional_vector(file, "rope_freqs.weight", first.rope_dims / 2)?
             }
-            None => None,
+            _ => None,
         };
 
         let per_layer = config.per_layer_embd;
@@ -186,15 +237,6 @@ impl Weights {
         let mut layers = Vec::with_capacity(config.n_layer);
         for (index, spec) in config.layers.iter_mut().enumerate() {
             let name = |part: &str| format!("blk.{index}.{part}");
-            if spec.n_ff == 0 {
-                spec.n_ff = file
-                    .tensor(&name("ffn_down.weight"))
-                    .map(TensorInfo::cols)
-                    .ok_or_else(|| {
-                        Error::format(format!("missing tensor: {}", name("ffn_down.weight")))
-                    })?;
-            }
-            let n_ff = spec.n_ff;
             let layer_whole =
                 |part: &str, rows: usize, cols: usize| whole(file, &name(part), rows, cols);
 
@@ -240,8 +282,13 @@ impl Weights {
                     MixerWeights::Attention(AttentionWeights {
                         q,
                         kv: if owns_kv { kv } else { None },
-                        q_norm: optional_vector(file, &name("attn_q_norm.weight"), spec.head_dim)?,
-                        k_norm: optional_vector(file, &name("attn_k_norm.weight"), spec.head_dim)?,
+                        q_norm: head_norm(file, &name("attn_q_norm.weight"), spec.head_dim, q_dim)?,
+                        k_norm: head_norm(
+                            file,
+                            &name("attn_k_norm.weight"),
+                            spec.head_dim,
+                            kv_dim,
+                        )?,
                         gate: match file.tensor(&name("attn_gate.weight")) {
                             Some(_) => Some(layer_whole("attn_gate", spec.n_head, d)?),
                             None => None,
@@ -280,22 +327,30 @@ impl Weights {
                 }
             };
 
-            // The gate is its own tensor, or the first half of a double
-            // height `ffn_up`.
-            let (ffn_gate, ffn_up) = if file.tensor(&name("ffn_gate.weight")).is_some() {
-                (
-                    layer_whole("ffn_gate", n_ff, d)?,
-                    layer_whole("ffn_up", n_ff, d)?,
-                )
-            } else {
-                let fused = matrix(file, &name("ffn_up.weight"), 2 * n_ff, d)?;
-                let part = |first_row: usize| Linear {
-                    matrix: fused,
-                    first_row,
-                    rows: n_ff,
-                    bias: None,
-                };
-                (part(0), part(n_ff))
+            let ffn = match &config.routing {
+                Some(routing) if file.tensor(&name("ffn_gate_inp.weight")).is_some() => {
+                    let experts = experts(file, index, d, routing.count)?;
+                    spec.n_ff_expert = experts.gate.rows;
+                    spec.n_ff = experts
+                        .shared
+                        .as_ref()
+                        .map_or(0, |(shared, _)| shared.down.matrix.cols);
+                    FeedForward::Experts(Box::new(experts))
+                }
+                _ => {
+                    if spec.n_ff == 0 {
+                        spec.n_ff = file
+                            .tensor(&name("ffn_down.weight"))
+                            .map(TensorInfo::cols)
+                            .ok_or_else(|| {
+                                Error::format(format!(
+                                    "missing tensor: {}",
+                                    name("ffn_down.weight")
+                                ))
+                            })?;
+                    }
+                    FeedForward::Dense(Box::new(dense(file, &name("ffn"), "", d, spec.n_ff)?))
+                }
             };
 
             let per_layer_weights = if per_layer > 0 {
@@ -313,9 +368,7 @@ impl Weights {
                 mixer,
                 attn_post_norm: optional_vector(file, &name("post_attention_norm.weight"), d)?,
                 ffn_norm: vector(file, &name("ffn_norm.weight"), d)?,
-                ffn_gate,
-                ffn_up,
-                ffn_down: layer_whole("ffn_down", d, n_ff)?,
+                ffn,
                 ffn_post_norm: optional_vector(file, &name("post_ffw_norm.weight"), d)?,
                 per_layer: per_layer_weights,
                 output_scale: optional_vector(file, &name("layer_output_scale.weight"), 1)?
@@ -331,6 +384,110 @@ impl Weights {
             per_layer_inputs,
         })
     }
+}
+
+/// Binds a gated feed-forward network: `{prefix}_gate{suffix}`,
+/// `{prefix}_up{suffix}` and `{prefix}_down{suffix}`. The gate is its own
+/// tensor, or the first half of a double-height up matrix.
+fn dense(file: &Gguf, prefix: &str, suffix: &str, d: usize, n_ff: usize) -> Result<Dense> {
+    let part = |role: &str| format!("{prefix}_{role}{suffix}");
+    let (gate, up) = if file.tensor(&format!("{}.weight", part("gate"))).is_some() {
+        (
+            whole(file, &part("gate"), n_ff, d)?,
+            whole(file, &part("up"), n_ff, d)?,
+        )
+    } else {
+        let fused = matrix(file, &format!("{}.weight", part("up")), 2 * n_ff, d)?;
+        let half = |first_row: usize| Linear {
+            matrix: fused,
+            first_row,
+            rows: n_ff,
+            bias: None,
+        };
+        (half(0), half(n_ff))
+    };
+    Ok(Dense {
+        gate,
+        up,
+        down: whole(file, &part("down"), d, n_ff)?,
+    })
+}
+
+/// Binds the experts of layer `index`, and its shared expert if it has one.
+fn experts(file: &Gguf, index: usize, d: usize, count: usize) -> Result<Experts> {
+    let name = |part: &str| format!("blk.{index}.{part}");
+    let down = file.tensor(&name("ffn_down_exps.weight")).ok_or_else(|| {
+        Error::format(format!("missing tensor: {}", name("ffn_down_exps.weight")))
+    })?;
+    let n_ff = down.cols();
+    // Gate and up are separate tensors, or one with each expert's gate
+    // rows followed by its up rows.
+    let (gate, up) = if file.tensor(&name("ffn_gate_up_exps.weight")).is_some() {
+        let fused = stacked(file, &name("ffn_gate_up_exps.weight"), count, 2 * n_ff, d)?;
+        let half = |offset: usize| ExpertMatrix {
+            matrix: fused,
+            rows: n_ff,
+            stride: 2 * n_ff,
+            offset,
+        };
+        (half(0), half(n_ff))
+    } else {
+        let each = |part: &str| -> Result<ExpertMatrix> {
+            Ok(ExpertMatrix {
+                matrix: stacked(file, &name(part), count, n_ff, d)?,
+                rows: n_ff,
+                stride: n_ff,
+                offset: 0,
+            })
+        };
+        (each("ffn_gate_exps.weight")?, each("ffn_up_exps.weight")?)
+    };
+    let shared = match file.tensor(&name("ffn_down_shexp.weight")) {
+        Some(tensor) => {
+            let n_shared = tensor.cols();
+            let gate = match file.tensor(&name("ffn_gate_inp_shexp.weight")) {
+                Some(_) => Some(whole(file, &name("ffn_gate_inp_shexp"), 1, d)?),
+                None => None,
+            };
+            Some((dense(file, &name("ffn"), "_shexp", d, n_shared)?, gate))
+        }
+        None => None,
+    };
+    Ok(Experts {
+        router: whole(file, &name("ffn_gate_inp"), count, d)?,
+        choice_bias: optional_vector(file, &name("exp_probs_b.bias"), count)?,
+        gate,
+        up,
+        down: ExpertMatrix {
+            matrix: stacked(file, &name("ffn_down_exps.weight"), count, d, n_ff)?,
+            rows: d,
+            stride: d,
+            offset: 0,
+        },
+        shared,
+    })
+}
+
+/// Binds a tensor that holds one `rows` by `cols` matrix per expert, as one
+/// tall matrix.
+fn stacked(file: &Gguf, name: &str, count: usize, rows: usize, cols: usize) -> Result<Matrix> {
+    let (tensor, ty) = supported(file, name)?;
+    if tensor.dims != [cols, rows, count] {
+        return Err(Error::format(format!(
+            "tensor {name} has shape {:?}, expected [{cols}, {rows}, {count}]",
+            tensor.dims
+        )));
+    }
+    let row_bytes = ty
+        .row_bytes(cols)
+        .ok_or_else(|| Error::format(format!("tensor {name} has a bad row size")))?;
+    Ok(Matrix {
+        ty,
+        rows: rows * count,
+        cols,
+        offset: tensor.offset,
+        row_bytes,
+    })
 }
 
 /// Binds the whole matrix `{name}.weight`, with `{name}.bias` when there is
@@ -362,7 +519,13 @@ fn supported<'a>(file: &'a Gguf, name: &str) -> Result<(&'a TensorInfo, TensorTy
 /// elements.
 fn matrix(file: &Gguf, name: &str, rows: usize, cols: usize) -> Result<Matrix> {
     let (tensor, ty) = supported(file, name)?;
-    if tensor.dims.len() != 2 || tensor.cols() != cols || tensor.rows() != rows {
+    // A single row may be stored as a vector.
+    let shape_ok = match tensor.dims.len() {
+        1 => rows == 1 && tensor.dims[0] == cols,
+        2 => tensor.cols() == cols && tensor.rows() == rows,
+        _ => false,
+    };
+    if !shape_ok {
         return Err(Error::format(format!(
             "tensor {name} has shape {:?}, expected [{cols}, {rows}]",
             tensor.dims
@@ -394,6 +557,20 @@ fn vector(file: &Gguf, name: &str, len: usize) -> Result<Vec<f32>> {
     let mut values = vec![0.0; len];
     dequantize_row(ty, file.tensor_data(tensor), &mut values);
     Ok(values)
+}
+
+/// A norm of queries or keys: one head wide, applied to each head, or as
+/// wide as all heads together (OLMoE), applied to the whole vector.
+fn head_norm(
+    file: &Gguf,
+    name: &str,
+    head_dim: usize,
+    all_heads: usize,
+) -> Result<Option<Vec<f32>>> {
+    match file.tensor(name) {
+        Some(tensor) if tensor.n_elements() == all_heads => vector(file, name, all_heads).map(Some),
+        _ => optional_vector(file, name, head_dim),
+    }
 }
 
 /// Like [`vector`], for tensors a model may leave out.

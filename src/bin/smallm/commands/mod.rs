@@ -1,17 +1,19 @@
 //! The commands of the `smallm` program, and what they share.
 
 pub mod bench;
+pub mod config;
 pub mod info;
 pub mod pull;
 pub mod run;
 pub mod serve;
+pub mod uninstall;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use smallm::chat::Template;
-use smallm::generate::{Finish, Stats};
+use smallm::generate::{Finish, Overflow, Stats};
 use smallm::tensor::type_name;
 use smallm::{Model, SamplerConfig, SessionConfig};
 
@@ -36,6 +38,33 @@ pub const SESSION_SPECS: [Spec; 3] = [
         "Prompt tokens evaluated together (default: 32)",
     ),
 ];
+
+/// Options for what happens when the context window fills.
+pub const CONTEXT_SPECS: [Spec; 2] = [
+    value(
+        "overflow",
+        None,
+        "When the context is full: 'middle' keeps the start and drops the oldest after it, \
+         'slide' drops the oldest, 'stop' ends the answer (default: middle)",
+    ),
+    value(
+        "keep",
+        None,
+        "Tokens at the start that 'middle' keeps (default: the system prompt and first question)",
+    ),
+];
+
+/// Reads `--overflow` and `--keep`.
+pub fn overflow_options(args: &Args) -> Result<(Overflow, Option<usize>), String> {
+    let overflow = match args.get("overflow") {
+        None => Overflow::default(),
+        Some(name) => Overflow::from_name(name).ok_or_else(|| {
+            let names: Vec<&str> = Overflow::ALL.iter().map(|choice| choice.name()).collect();
+            format!("--overflow is one of {}, not '{name}'", names.join(", "))
+        })?,
+    };
+    Ok((overflow, args.number("keep")?))
+}
 
 /// Options of every command that generates text.
 pub const SAMPLER_SPECS: [Spec; 9] = [
@@ -217,6 +246,9 @@ pub fn stats_line(stats: &Stats) -> String {
         stats.context_used() * 100.0,
         models::human_bytes(stats.context_bytes as u64)
     );
+    if stats.dropped_tokens > 0 {
+        line.push_str(&format!(", {} oldest tokens dropped", stats.dropped_tokens));
+    }
     let stopped = match stats.finish {
         Finish::End | Finish::Stop => None,
         Finish::Length => Some("token limit"),
@@ -254,6 +286,7 @@ mod tests {
             finish: Finish::Context,
             context_tokens: 554,
             context_size: 4096,
+            dropped_tokens: 0,
             context_bytes: 9_400_000,
         };
         assert_eq!(
@@ -261,6 +294,12 @@ mod tests {
             "42 tokens at 21.0 tok/s | prompt 23 tokens at 460 tok/s (+489 reused) | \
              context 554/4096 (14%), 9.4 MB | stopped: context full"
         );
+        let slid = Stats {
+            dropped_tokens: 2048,
+            finish: Finish::End,
+            ..stats
+        };
+        assert!(stats_line(&slid).ends_with("9.4 MB, 2048 oldest tokens dropped"));
     }
 
     #[test]

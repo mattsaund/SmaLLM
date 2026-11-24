@@ -120,6 +120,46 @@ impl KvCache {
         }
     }
 
+    /// Removes positions `keep..keep + discard` and moves the later ones
+    /// down to close the gap. `fix_key` is called with each moved key, one
+    /// head at a time, so the caller can rotate it to its new position.
+    pub fn shift(
+        &mut self,
+        keep: usize,
+        discard: usize,
+        mut fix_key: impl FnMut(usize, &mut [f32]),
+    ) {
+        let len = self.len;
+        let discard = discard.min(len.saturating_sub(keep));
+        if discard == 0 {
+            return;
+        }
+        let at = |position: usize, dim: usize| {
+            (
+                position / CHUNK_POSITIONS,
+                (position % CHUNK_POSITIONS) * dim,
+            )
+        };
+        for (layer, shape) in self.layers.iter().enumerate() {
+            let dim = shape.head_dim;
+            let mut row = vec![0.0; dim];
+            for head in &mut self.heads[shape.first..shape.first + shape.n_heads] {
+                // Moving down in increasing order never overwrites a row
+                // that is still to be moved.
+                for from in keep + discard..len {
+                    let ((source, start), (target, place)) =
+                        (at(from, dim), at(from - discard, dim));
+                    row.copy_from_slice(&head.keys[source][start..start + dim]);
+                    fix_key(layer, &mut row);
+                    head.keys[target][place..place + dim].copy_from_slice(&row);
+                    row.copy_from_slice(&head.values[source][start..start + dim]);
+                    head.values[target][place..place + dim].copy_from_slice(&row);
+                }
+            }
+        }
+        self.truncate(len - discard);
+    }
+
     /// Stores the key and value of `position` in `layer`. Both hold every
     /// head side by side. The position must have been reserved.
     pub fn write(&mut self, layer: usize, position: usize, key: &[f32], value: &[f32]) {
@@ -264,6 +304,36 @@ mod tests {
         assert_eq!(cache.len(), CHUNK_POSITIONS);
         cache.truncate(0);
         assert_eq!(cache.allocated_bytes(), 0);
+    }
+
+    #[test]
+    fn shifting_closes_the_gap() {
+        let mut cache = KvCache::new(&[(1, 2), (0, 0)]);
+        let positions = CHUNK_POSITIONS + 10;
+        cache.reserve(positions);
+        for position in 0..positions {
+            let value = position as f32;
+            cache.write(0, position, &[value, -value], &[value, value]);
+        }
+        cache.set_len(positions);
+        // Drop positions 3 to 102. Every moved key is marked.
+        cache.shift(3, 100, |layer, key| {
+            assert_eq!(layer, 0);
+            key[1] = 1.0;
+        });
+        assert_eq!(cache.len(), positions - 100);
+        let mut seen = Vec::new();
+        cache.for_each_run(0, 0, 0, cache.len(), |_, keys, values| {
+            for (key, value) in keys.chunks_exact(2).zip(values.chunks_exact(2)) {
+                seen.push((key[0], key[1], value[0]));
+            }
+        });
+        assert_eq!(seen[2], (2.0, -2.0, 2.0));
+        assert_eq!(seen[3], (103.0, 1.0, 103.0));
+        assert_eq!(
+            seen.last(),
+            Some(&((positions - 1) as f32, 1.0, (positions - 1) as f32))
+        );
     }
 
     #[test]

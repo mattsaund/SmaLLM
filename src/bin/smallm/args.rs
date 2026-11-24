@@ -86,6 +86,14 @@ impl Args {
             };
             args.options.push((spec.long, value));
         }
+        // Settings from the settings file fill in options not given here.
+        if let Some(settings) = crate::config::get() {
+            for spec in specs.iter().filter(|spec| spec.takes_value) {
+                if let (false, Some(value)) = (args.has(spec.long), settings.value(spec.long)) {
+                    args.options.push((spec.long, Some(value.to_string())));
+                }
+            }
+        }
         Ok(args)
     }
 

@@ -13,8 +13,21 @@ use crate::kernels::{self, Kernels};
 use crate::tensor::TensorType;
 use crate::testing::TinyModel;
 
-const ARCHS: [&str; 7] = [
-    "llama", "qwen2", "qwen3", "gemma3", "gemma4", "lfm2", "lfm3",
+const ARCHS: [&str; 14] = [
+    "llama",
+    "qwen2",
+    "qwen3",
+    "qwen2moe",
+    "qwen3moe",
+    "gemma3",
+    "gemma4",
+    "lfm2",
+    "lfm2moe",
+    "lfm3",
+    "granite",
+    "granitemoe",
+    "olmoe",
+    "smollm3",
 ];
 
 const QUANT_TYPES: [TensorType; 11] = [
@@ -157,6 +170,72 @@ mod oracle {
         }
     }
 
+    /// A gated feed-forward network.
+    fn feed_forward(model: &Model, w: &Dense, h: &[f64]) -> Vec<f64> {
+        let activation = model.config().activation;
+        let gate = apply(model, &w.gate, h);
+        let up = apply(model, &w.up, h);
+        let mixed: Vec<f64> = gate
+            .iter()
+            .zip(&up)
+            .map(|(g, u)| activate(*g, activation) * u)
+            .collect();
+        apply(model, &w.down, &mixed)
+    }
+
+    /// A mixture of experts, following llama.cpp's routing step by step.
+    fn mixture(model: &Model, w: &Experts, h: &[f64]) -> Vec<f64> {
+        let c = model.config();
+        let routing = c.routing.expect("routing");
+        let scores = apply(model, &w.router, h);
+        let sigmoid = |x: f64| 1.0 / (1.0 + (-x).exp());
+        let softmax = |x: &[f64]| {
+            let top = x.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let exps: Vec<f64> = x.iter().map(|v| (v - top).exp()).collect();
+            let sum: f64 = exps.iter().sum();
+            exps.iter().map(|e| e / sum).collect::<Vec<f64>>()
+        };
+        let probs: Vec<f64> = match routing.gating {
+            Gating::Softmax => softmax(&scores),
+            Gating::Sigmoid => scores.iter().map(|&s| sigmoid(s)).collect(),
+            Gating::SoftmaxChosen => scores.clone(),
+        };
+        let key = |e: usize| probs[e] + w.choice_bias.as_ref().map_or(0.0, |b| b[e] as f64);
+        let mut order: Vec<usize> = (0..routing.count).collect();
+        order.sort_by(|&a, &b| key(b).total_cmp(&key(a)));
+        let chosen = &order[..routing.used];
+        let mut weights: Vec<f64> = chosen.iter().map(|&e| probs[e]).collect();
+        if routing.gating == Gating::SoftmaxChosen {
+            weights = softmax(&weights);
+        }
+        if routing.normalize {
+            let sum = weights.iter().sum::<f64>().max(6.103515625e-5);
+            weights.iter_mut().for_each(|w| *w /= sum);
+        }
+        weights.iter_mut().for_each(|w| *w *= routing.scale as f64);
+
+        let mut out = vec![0.0; c.n_embd];
+        for (&expert, weight) in chosen.iter().zip(weights) {
+            let dense = Dense {
+                gate: w.gate.expert(expert),
+                up: w.up.expert(expert),
+                down: w.down.expert(expert),
+            };
+            let result = feed_forward(model, &dense, h);
+            out.iter_mut()
+                .zip(result)
+                .for_each(|(o, r)| *o += weight * r);
+        }
+        if let Some((shared, gate)) = &w.shared {
+            let g = gate
+                .as_ref()
+                .map_or(1.0, |gate| sigmoid(apply(model, gate, h)[0]));
+            let result = feed_forward(model, shared, h);
+            out.iter_mut().zip(result).for_each(|(o, r)| *o += g * r);
+        }
+        out
+    }
+
     fn add(x: &mut [f64], update: &[f64]) {
         x.iter_mut()
             .zip(update)
@@ -187,10 +266,13 @@ mod oracle {
                     Some(wv) => apply(model, wv, h),
                     None => k.clone(),
                 };
+                // A norm as wide as all heads applies to the whole vector.
+                if let Some(weight) = a.k_norm.as_deref().filter(|w| w.len() != hd) {
+                    k = rms_norm(&k, Some(weight), c.norm_eps);
+                }
                 for head in k.chunks_exact_mut(hd) {
-                    let normed = rms_norm(head, a.k_norm.as_deref(), c.norm_eps);
-                    if a.k_norm.is_some() {
-                        head.copy_from_slice(&normed);
+                    if let Some(weight) = a.k_norm.as_deref().filter(|w| w.len() == hd) {
+                        head.copy_from_slice(&rms_norm(head, Some(weight), c.norm_eps));
                     }
                     rotate(head, position, spec, c.rope, factors);
                 }
@@ -213,9 +295,12 @@ mod oracle {
             .enumerate()
             .map(|(position, h)| {
                 let mut q = apply(model, &a.q, h);
+                if let Some(weight) = a.q_norm.as_deref().filter(|w| w.len() != hd) {
+                    q = rms_norm(&q, Some(weight), c.norm_eps);
+                }
                 for head in q.chunks_exact_mut(hd) {
-                    if a.q_norm.is_some() {
-                        head.copy_from_slice(&rms_norm(head, a.q_norm.as_deref(), c.norm_eps));
+                    if let Some(weight) = a.q_norm.as_deref().filter(|w| w.len() == hd) {
+                        head.copy_from_slice(&rms_norm(head, Some(weight), c.norm_eps));
                     }
                     rotate(head, position, spec, c.rope, factors);
                 }
@@ -352,20 +437,22 @@ mod oracle {
                 if let Some(weight) = &layer.attn_post_norm {
                     update = rms_norm(&update, Some(weight), eps);
                 }
+                update
+                    .iter_mut()
+                    .for_each(|v| *v *= c.residual_scale as f64);
                 add(&mut x[position], &update);
 
                 let h = rms_norm(&x[position], Some(&layer.ffn_norm), eps);
-                let gate = apply(model, &layer.ffn_gate, &h);
-                let up = apply(model, &layer.ffn_up, &h);
-                let mixed: Vec<f64> = gate
-                    .iter()
-                    .zip(&up)
-                    .map(|(g, u)| activate(*g, c.activation) * u)
-                    .collect();
-                let mut update = apply(model, &layer.ffn_down, &mixed);
+                let mut update = match &layer.ffn {
+                    FeedForward::Dense(dense) => feed_forward(model, dense, &h),
+                    FeedForward::Experts(experts) => mixture(model, experts, &h),
+                };
                 if let Some(weight) = &layer.ffn_post_norm {
                     update = rms_norm(&update, Some(weight), eps);
                 }
+                update
+                    .iter_mut()
+                    .for_each(|v| *v *= c.residual_scale as f64);
                 add(&mut x[position], &update);
 
                 if let Some(plw) = &layer.per_layer {
@@ -394,6 +481,9 @@ mod oracle {
             eps,
         );
         let mut logits = apply(model, &w.output, &last);
+        logits
+            .iter_mut()
+            .for_each(|logit| *logit /= c.logit_scale as f64);
         if c.logit_softcap > 0.0 {
             let cap = c.logit_softcap as f64;
             logits
@@ -408,7 +498,7 @@ mod oracle {
 fn float_models_match_the_oracle() {
     for arch in ARCHS {
         let mut variants = vec![TinyModel::new(arch, TensorType::F32)];
-        if !matches!(arch, "gemma4" | "lfm3") {
+        if matches!(arch, "llama" | "qwen2" | "qwen3" | "gemma3" | "lfm2") {
             let mut fused = TinyModel::new(arch, TensorType::F32);
             fused.fused = true;
             fused.bias = true;
@@ -423,6 +513,16 @@ fn float_models_match_the_oracle() {
             let mut partial = TinyModel::new(arch, TensorType::F32);
             partial.rope_dims = partial.head_dim() / 2;
             variants.push(partial);
+        }
+        if arch == "llama" {
+            // Mixtral: a Llama with experts, gate and up stored together,
+            // weighed by a softmax over the chosen experts only.
+            let mut mixtral = TinyModel::new(arch, TensorType::F32);
+            mixtral.experts = 4;
+            mixtral.experts_used = 2;
+            mixtral.fused_experts = true;
+            mixtral.gating = 3;
+            variants.push(mixtral);
         }
         if arch == "gemma4" {
             // Values of their own, and no layers that share caches.
@@ -586,7 +686,15 @@ fn new_layer_kinds_batch_and_thread_exactly() {
     // Batches below the tile route compute each token the same way, so the
     // convolution state, shared caches and skipped rows must not change a
     // bit of the result.
-    for arch in ["gemma4", "lfm2", "lfm3"] {
+    for arch in [
+        "gemma4",
+        "lfm2",
+        "lfm3",
+        "qwen2moe",
+        "lfm2moe",
+        "olmoe",
+        "granitemoe",
+    ] {
         for ty in [TensorType::F32, TensorType::Q8_0] {
             let model = load(&TinyModel::new(arch, ty));
             let expected = logits(&model, &PROMPT, 1, 1);
@@ -612,7 +720,7 @@ fn new_layer_kinds_batch_and_thread_exactly() {
 
 #[test]
 fn new_layer_kinds_stay_close_to_the_oracle_when_quantized() {
-    for arch in ["gemma4", "lfm2", "lfm3"] {
+    for arch in ["gemma4", "lfm2", "lfm3", "qwen3moe", "lfm2moe"] {
         for ty in [TensorType::Q8_0, TensorType::Q4_0, TensorType::Q4K] {
             let model = load(&TinyModel::new(arch, ty));
             let expected = oracle::logits(&model, &PROMPT);
@@ -653,6 +761,34 @@ fn convolution_state_survives_rolling_back() {
         assert_eq!(session.cache_bytes(), full_size);
         session.clear();
         assert!(session.cache_bytes() < full_size / 4);
+    }
+}
+
+#[test]
+fn shifting_the_context_matches_a_fresh_start_in_one_layer() {
+    // With one layer, every key and value depends only on its own token and
+    // position, so after a shift the session holds exactly what a fresh one
+    // reading the kept tokens would. Rotating keys back must get there.
+    let tokens: Vec<u32> = (0..300u32).map(|i| 3 + (i * 7) % 37).collect();
+    for arch in ["llama", "qwen3", "gemma3", "lfm2", "smollm3"] {
+        let mut spec = TinyModel::new(arch, TensorType::F32);
+        spec.n_layer = 1;
+        spec.rope_factors = arch == "llama";
+        let model = load(&spec);
+        let mut session = session(&model, 2, 8, None);
+        session.eval(&tokens).unwrap();
+        session.shift(3, 260);
+        let mut kept = tokens[..3].to_vec();
+        kept.extend(&tokens[263..]);
+        assert_eq!(session.tokens(), kept);
+        session.eval(&[30, 31]).unwrap();
+        kept.extend([30, 31]);
+        let fresh: Vec<f64> = logits(&model, &kept, 2, 8)
+            .iter()
+            .map(|v| *v as f64)
+            .collect();
+        let error = relative_error(session.logits(), &fresh);
+        assert!(error < 1e-4, "{arch}: error {error}");
     }
 }
 

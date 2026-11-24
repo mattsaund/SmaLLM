@@ -11,8 +11,21 @@ use crate::error::{Error, Result};
 use crate::gguf::Gguf;
 
 /// Architectures this engine runs, as named in `general.architecture`.
-pub const ARCHITECTURES: [&str; 7] = [
-    "llama", "qwen2", "qwen3", "gemma3", "gemma4", "lfm2", "lfm3",
+pub const ARCHITECTURES: [&str; 14] = [
+    "llama",
+    "qwen2",
+    "qwen3",
+    "qwen2moe",
+    "qwen3moe",
+    "gemma3",
+    "gemma4",
+    "lfm2",
+    "lfm2moe",
+    "lfm3",
+    "granite",
+    "granitemoe",
+    "olmoe",
+    "smollm3",
 ];
 
 /// Which two elements of an attention head a rotary embedding rotates
@@ -30,6 +43,31 @@ pub enum Rope {
 pub enum Activation {
     Silu,
     Gelu,
+}
+
+/// How a mixture of experts turns the router's scores into weights.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gating {
+    /// A softmax over every expert's score.
+    Softmax,
+    /// A sigmoid of each score on its own.
+    Sigmoid,
+    /// A softmax over the scores of the chosen experts only.
+    SoftmaxChosen,
+}
+
+/// How the mixture-of-experts layers pick and weigh their experts.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Routing {
+    /// Experts in each mixture layer.
+    pub count: usize,
+    /// Experts each token goes through.
+    pub used: usize,
+    pub gating: Gating,
+    /// Divide the chosen experts' weights by their sum.
+    pub normalize: bool,
+    /// Multiplier on the weights. One for none.
+    pub scale: f32,
 }
 
 /// How a block mixes information across positions.
@@ -71,8 +109,12 @@ pub struct LayerSpec {
     /// Multiplier on attention scores before the softmax.
     pub attention_scale: f32,
     /// Width of the feed-forward layer. Zero until the weights are bound,
-    /// when the file does not state it.
+    /// when the file does not state it. In a mixture-of-experts layer it is
+    /// the width of the shared expert, or zero when there is none.
     pub n_ff: usize,
+    /// Width of each expert in a mixture-of-experts layer, set when the
+    /// weights are bound. Zero in other layers.
+    pub n_ff_expert: usize,
 }
 
 impl LayerSpec {
@@ -128,6 +170,13 @@ pub struct Config {
     /// Width of each layer's slice of the per-layer token embeddings. Zero
     /// for models without them. Gemma 4 has them.
     pub per_layer_embd: usize,
+    /// Multiplier on each block's output before it joins the hidden state
+    /// (Granite). One for none.
+    pub residual_scale: f32,
+    /// The logits are divided by this (Granite). One for none.
+    pub logit_scale: f32,
+    /// The expert settings, for models with mixture-of-experts layers.
+    pub routing: Option<Routing>,
 }
 
 impl Config {
@@ -169,9 +218,7 @@ impl Config {
                 "missing or invalid metadata: {arch}.attention.head_count"
             )));
         }
-        if meta.usize("expert_count").unwrap_or(0) > 0 {
-            return Err(Error::unsupported("mixture-of-experts models"));
-        }
+        let routing = meta.routing()?;
 
         // Head widths: one for full attention, and maybe another for the
         // sliding-window layers.
@@ -219,6 +266,7 @@ impl Config {
                     kv_source: None,
                     attention_scale: 1.0 / (head_dim as f32).sqrt(),
                     n_ff: n_ff[layer],
+                    n_ff_expert: 0,
                 })
                 .collect(),
             norm_eps: meta.f32("attention.layer_norm_rms_epsilon").unwrap_or(1e-5),
@@ -229,6 +277,9 @@ impl Config {
             value_norm: false,
             conv_kernel: 0,
             per_layer_embd: 0,
+            residual_scale: 1.0,
+            logit_scale: 1.0,
+            routing,
             arch: arch.clone(),
         };
 
@@ -246,8 +297,27 @@ impl Config {
 
         match arch.as_str() {
             // Llama weights are stored so that neighbors rotate together.
+            // Mixtral is a Llama with experts.
             "llama" => config.rope = Rope::Pairs,
-            "qwen2" | "qwen3" => {}
+            "qwen2" | "qwen3" | "qwen2moe" | "qwen3moe" | "olmoe" => {}
+            // SmolLM3 leaves every fourth layer unrotated.
+            "smollm3" => {
+                config.rope = Rope::Pairs;
+                for layer in config.layers.iter_mut().skip(3).step_by(4) {
+                    layer.rope_dims = 0;
+                }
+            }
+            "granite" | "granitemoe" => {
+                config.rope = Rope::Pairs;
+                config.embedding_scale = meta.f32("embedding_scale").unwrap_or(1.0);
+                config.residual_scale = meta.f32("residual_scale").unwrap_or(1.0);
+                config.logit_scale = meta.f32("logit_scale").unwrap_or(1.0);
+                if let Some(scale) = meta.f32("attention.scale").filter(|&scale| scale != 0.0) {
+                    for layer in &mut config.layers {
+                        layer.attention_scale = scale;
+                    }
+                }
+            }
             "gemma3" => {
                 config.activation = Activation::Gelu;
                 config.embedding_scale = (n_embd as f32).sqrt();
@@ -305,7 +375,7 @@ impl Config {
                     layer.kv_source = Some(first_shared - if local { 2 } else { 1 });
                 }
             }
-            "lfm2" | "lfm3" => {
+            "lfm2" | "lfm2moe" | "lfm3" => {
                 config.conv_kernel = meta.required("shortconv.l_cache")?;
                 for layer in &mut config.layers {
                     if layer.n_head_kv == 0 {
@@ -374,6 +444,14 @@ impl Config {
                         "layer {index} cannot read the keys and values of layer {source}"
                     )));
                 }
+            }
+        }
+        if let Some(routing) = &self.routing {
+            if routing.used == 0 || routing.used > routing.count || routing.count > 1 << 16 {
+                return Err(Error::format(format!(
+                    "{} of {} experts per token",
+                    routing.used, routing.count
+                )));
             }
         }
         if self.conv_kernel == 1 || self.conv_kernel > 64 {
@@ -496,6 +574,40 @@ impl Meta<'_> {
                 .map(|layer| layer % period < period - 1)
                 .collect(),
         }
+    }
+
+    /// The expert settings, when the model has experts. The defaults are
+    /// those of each architecture in llama.cpp.
+    fn routing(&self) -> Result<Option<Routing>> {
+        let count = self.usize("expert_count").unwrap_or(0);
+        if count == 0 {
+            return Ok(None);
+        }
+        let used = self.required("expert_used_count")?;
+        let gating = match self.usize("expert_gating_func") {
+            None | Some(0) | Some(1) => Gating::Softmax,
+            Some(2) => Gating::Sigmoid,
+            Some(3) => Gating::SoftmaxChosen,
+            Some(other) => {
+                return Err(Error::unsupported(format!(
+                    "expert gating function {other}"
+                )));
+            }
+        };
+        let normalize = self
+            .file
+            .get_bool(&self.key("expert_weights_norm"))
+            .unwrap_or(!matches!(self.arch, "qwen2moe" | "olmoe"));
+        Ok(Some(Routing {
+            count,
+            used,
+            gating,
+            normalize,
+            scale: self
+                .f32("expert_weights_scale")
+                .filter(|&scale| scale != 0.0)
+                .unwrap_or(1.0),
+        }))
     }
 
     /// The linear position scaling, as a multiplier on rotary angles. Other
@@ -652,7 +764,9 @@ mod tests {
 
         let mut builder = base("llama");
         builder.u32("llama.expert_count", 8);
-        assert!(config(&builder).is_err());
+        assert!(config(&builder).is_err(), "experts need a used count");
+        builder.u32("llama.expert_used_count", 9);
+        assert!(config(&builder).is_err(), "more used than there are");
 
         let mut builder = base("llama");
         builder.string("llama.rope.scaling.type", "yarn");

@@ -47,14 +47,28 @@ pub fn main(raw: impl Iterator<Item = String>) -> Result<(), String> {
     row("file size", human_bytes(model.file_size() as u64));
     row("weights", main_weight_type(model).to_string());
     row("layers", config.n_layer.to_string());
+    let dense = config
+        .layers
+        .iter()
+        .filter(|layer| layer.n_ff_expert == 0)
+        .map(|layer| layer.n_ff);
     row(
         "width",
-        format!(
-            "{} (feed-forward {})",
-            config.n_embd,
-            spread(config.layers.iter().map(|layer| layer.n_ff))
-        ),
+        format!("{} (feed-forward {})", config.n_embd, spread(dense)),
     );
+    if let Some(routing) = &config.routing {
+        let layers = config.layers.iter().filter(|layer| layer.n_ff_expert > 0);
+        row(
+            "experts",
+            format!(
+                "{} of {} per token, each {} wide, in {} layers",
+                routing.used,
+                routing.count,
+                spread(layers.clone().map(|layer| layer.n_ff_expert)),
+                layers.count()
+            ),
+        );
+    }
     let attention: Vec<&LayerSpec> = config
         .layers
         .iter()

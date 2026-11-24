@@ -11,8 +11,8 @@ use smallm::generate::{self, Options, Stats};
 use smallm::{Model, Session};
 
 use super::{
-    SAMPLER_SPECS, SESSION_SPECS, TEMPLATE_SPECS, chat_template, describe, load_model,
-    sampler_config, stats_line,
+    CONTEXT_SPECS, SAMPLER_SPECS, SESSION_SPECS, TEMPLATE_SPECS, chat_template, describe,
+    load_model, sampler_config, stats_line,
 };
 use crate::args::{self, Args, Spec, switch, value};
 use crate::term;
@@ -50,6 +50,7 @@ fn specs() -> Vec<Spec> {
     SPECS
         .into_iter()
         .chain(SESSION_SPECS)
+        .chain(CONTEXT_SPECS)
         .chain(SAMPLER_SPECS)
         .chain(TEMPLATE_SPECS)
         .collect()
@@ -82,11 +83,14 @@ pub fn main(raw: impl Iterator<Item = String>) -> Result<(), String> {
     let template = chat_template(&args, model)?;
     let mut session =
         Session::new(model.clone(), super::session_config(&args)?).map_err(|e| e.to_string())?;
+    let (overflow, keep) = super::overflow_options(&args)?;
     let options = Options {
         max_tokens: args.number("max-tokens")?.unwrap_or(0),
         sampler: sampler_config(&args)?,
         stop: args.all("stop"),
         show_special: args.has("show-special"),
+        overflow,
+        keep,
     };
     if verbose {
         eprintln!(
@@ -191,7 +195,17 @@ fn answer(
         messages,
         session.n_ctx(),
         ANSWER_RESERVE,
+        options.overflow,
     );
+    // In a chat, the start that `middle` keeps is the opening: the system
+    // prompt and the first question.
+    let mut options = options.clone();
+    options.keep = options.keep.or_else(|| {
+        Some(generate::opening_tokens(
+            tokenizer, template, messages, &tokens,
+        ))
+    });
+    let options = &options;
     if dropped > 0 {
         eprintln!("smallm: the context is full, so the {dropped} oldest messages were left out");
     }

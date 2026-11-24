@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use smallm::chat::{Message, Role, Template};
-use smallm::generate::{self, Finish, Options, Stats};
+use smallm::generate::{self, Finish, Options, Overflow, Stats};
 use smallm::{SamplerConfig, Session};
 
 use super::http::{self, Request};
@@ -44,6 +44,11 @@ pub struct Server {
     pub model_id: String,
     /// When set, requests must carry it as a bearer token.
     pub api_key: Option<String>,
+    /// What to do when a request fills the context, and the tokens at the
+    /// start to keep. A chat keeps its opening, the system prompt and the first
+    /// question, when `keep` is unset.
+    pub overflow: Overflow,
+    pub keep: Option<usize>,
     connections: AtomicUsize,
     next_id: AtomicU64,
 }
@@ -60,6 +65,8 @@ impl Server {
             template,
             model_id,
             api_key,
+            overflow: Overflow::default(),
+            keep: None,
             connections: AtomicUsize::new(0),
             next_id: AtomicU64::new(1),
         }
@@ -201,7 +208,7 @@ impl Server {
             .map_err(|_| "the body is not UTF-8".to_string())
             .and_then(Json::parse)
             .and_then(|body| Job::from_json(&body, kind));
-        let job = match parsed {
+        let mut job = match parsed {
             Ok(job) => job,
             Err(message) => return send_error(out, 400, &message),
         };
@@ -211,8 +218,8 @@ impl Server {
             .session
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let tokens = match &job.input {
-            Input::Text(prompt) => session.model().tokenizer().encode(prompt, true, true),
+        let (tokens, system) = match &job.input {
+            Input::Text(prompt) => (session.model().tokenizer().encode(prompt, true, true), None),
             Input::Chat(messages) => {
                 let Some(template) = self.template else {
                     return send_error(
@@ -222,20 +229,25 @@ impl Server {
                     );
                 };
                 let tokenizer = session.model().tokenizer();
-                generate::chat_tokens_fitting(
+                let tokens = generate::chat_tokens_fitting(
                     tokenizer,
                     template,
                     messages,
                     session.n_ctx(),
                     ANSWER_RESERVE,
+                    self.overflow,
                 )
-                .0
+                .0;
+                let system = generate::opening_tokens(tokenizer, template, messages, &tokens);
+                (tokens, Some(system))
             }
         };
+        job.options.overflow = self.overflow;
+        job.options.keep = self.keep.or(system);
         if tokens.is_empty() {
             return send_error(out, 400, "the prompt is empty");
         }
-        if tokens.len() >= session.n_ctx() {
+        if tokens.len() >= session.n_ctx() && self.overflow == Overflow::Stop {
             return send_error(out, 400, "the prompt does not fit in the context window");
         }
 
@@ -393,6 +405,8 @@ impl Job {
             sampler,
             stop,
             show_special: false,
+            overflow: Overflow::default(),
+            keep: None,
         };
         let include_usage = body
             .get("stream_options")
@@ -695,6 +709,7 @@ mod tests {
             finish: Finish::Length,
             context_tokens: 8,
             context_size: 64,
+            dropped_tokens: 0,
             context_bytes: 1024,
         }
     }

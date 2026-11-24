@@ -4,15 +4,18 @@
 #
 # Downloads the ready-made smallm.exe from the latest GitHub release and
 # checks it against the release's SHA-256 list. When there is none to
-# download, it builds from source, which needs Rust and the Visual Studio
-# Build Tools.
+# download, it builds from source. Rust is installed for that, after
+# asking, with a toolchain that needs nothing else on x86-64. Without git,
+# the source comes as an archive.
 #
 # Every step prints a line, and one progress bar for the whole installation
 # stays at the bottom of the window.
 #
-# To remove SmaLLM again:
+# To remove SmaLLM again, with its downloaded models:
 #
 #   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/mattsaund/SmaLLM/main/install.ps1))) -Uninstall
+#
+# `smallm uninstall` does the same.
 #
 # Override anything with the environment:
 #   $env:SMALLM_REPO         git URL (default: https://github.com/mattsaund/SmaLLM.git)
@@ -333,6 +336,37 @@ param([switch]$Uninstall)
         return $true
     }
 
+    # A yes-or-no question, where Enter means yes.
+    function Confirm-Step([string]$Question) {
+        Clear-Bar
+        $answer = Read-Host ('{0,12} {1} [Y/n]' -f '', $Question)
+        return -not ($answer -match '^\s*[Nn]')
+    }
+
+    # Installs Rust for the current user. On x86-64 the GNU toolchain is
+    # chosen, which brings its own linker, so no Visual Studio is needed.
+    function Install-Rust {
+        Write-Warn 'Missing' 'SmaLLM is written in Rust, and cargo is not installed.'
+        Write-Log '' "The Rust toolchain goes in ~\.rustup and ~\.cargo, and 'rustup self uninstall' removes it again."
+        if (-not (Confirm-Step 'Install it now?')) {
+            throw 'building from source needs Rust. Install it from https://rustup.rs and run this again'
+        }
+        $arm = Test-Arm64
+        $machine = if ($arm) { 'aarch64' } else { 'x86_64' }
+        $installer = Join-Path $screen.Work 'rustup-init.exe'
+        if (-not (Get-File "https://win.rustup.rs/$machine" $installer 5 8)) {
+            throw 'could not download the Rust installer'
+        }
+        $arguments = @('-y', '--profile', 'minimal', '--default-toolchain', 'stable')
+        if (-not $arm) { $arguments += @('--default-host', 'x86_64-pc-windows-gnu') }
+        $code = Invoke-Logged 8 40 'installing Rust' $installer $arguments
+        if ($code -ne 0) { throw 'the Rust installer failed. The lines above say why' }
+        if ($arm) {
+            Write-Warn 'Note' 'on ARM64, Rust links with the Visual Studio Build Tools, which must be installed.'
+        }
+        $env:PATH = (Join-Path $HOME '.cargo\bin') + ";$env:PATH"
+    }
+
     # --- build from source -----------------------------------------------------
 
     # Build with cargo from a checkout or a fresh clone.
@@ -343,7 +377,7 @@ param([switch]$Uninstall)
                 $env:PATH = "$cargoBin;$env:PATH"
             }
             else {
-                throw 'building from source needs Rust. Install it from https://rustup.rs and run this again'
+                Install-Rust
             }
         }
         Write-Log 'Found' ((& cargo --version) -join ' ')
@@ -352,10 +386,25 @@ param([switch]$Uninstall)
             Write-Log 'Building' "the checkout in $source"
         }
         else {
-            if (-not (Have 'git')) { throw 'git is needed to fetch the source' }
             $source = Join-Path $screen.Work 'src'
-            $code = Invoke-Logged 42 48 'fetching the source' 'git' @('clone', '--depth', '1', '--branch', $Ref, $Repo, $source)
-            if ($code -ne 0) { throw "could not clone $Repo ($Ref)" }
+            if (Have 'git') {
+                $code = Invoke-Logged 42 48 'fetching the source' 'git' @('clone', '--depth', '1', '--branch', $Ref, $Repo, $source)
+                if ($code -ne 0) { throw "could not clone $Repo ($Ref)" }
+            }
+            else {
+                # Without git, GitHub serves the same files as an archive.
+                if ($Repo -notmatch '^https://github\.com/') { throw "git is needed to fetch $Repo" }
+                $slug = $Repo -replace '^https://github\.com/', '' -replace '\.git$', ''
+                $archive = Join-Path $screen.Work 'source.zip'
+                if (-not (Get-File "https://github.com/$slug/archive/$Ref.zip" $archive 42 46)) {
+                    throw 'could not download the source'
+                }
+                $unpacked = Join-Path $screen.Work 'unpacked'
+                Expand-Archive -Path $archive -DestinationPath $unpacked -Force
+                $top = Get-ChildItem -Path $unpacked -Directory | Select-Object -First 1
+                if (-not $top) { throw 'the source archive was empty' }
+                Move-Item -Path $top.FullName -Destination $source
+            }
             $count = (Get-ChildItem -Path $source -Recurse -File | Where-Object { $_.FullName -notmatch '\\\.git\\' }).Count
             Write-Log 'Fetched' ('{0} ({1}), {2} files' -f $Repo, $Ref, $count)
         }
@@ -399,7 +448,13 @@ param([switch]$Uninstall)
         $binary = Join-Path $prefix 'smallm.exe'
 
         if ($Uninstall) {
-            if (Test-Path $binary) {
+            # The program knows what it put where, so it removes itself and
+            # its models, after asking.
+            $knows = (Test-Path $binary) -and ((& $binary help) -join ' ') -match 'uninstall'
+            if ($knows) {
+                & $binary uninstall
+            }
+            elseif (Test-Path $binary) {
                 Remove-Item -Force $binary -ErrorAction Stop
                 Write-Log 'Removed' $binary
             }
@@ -407,7 +462,6 @@ param([switch]$Uninstall)
                 Write-Log 'Absent' "no smallm.exe in $prefix"
             }
             Remove-FromPath -Prefix $prefix
-            Write-Log 'Kept' 'downloaded models, in %LOCALAPPDATA%\smallm. Delete that folder to remove them.'
             return
         }
 
@@ -432,6 +486,10 @@ param([switch]$Uninstall)
         Clear-Bar
         $screen.Live = $false
         Add-ToPath -Prefix $prefix
+        # `smallm pull` downloads with curl.exe, part of Windows since 10.
+        if (-not (Have 'curl.exe')) {
+            Write-Warn 'Missing' "curl.exe, which 'smallm pull' downloads with. Install it from https://curl.se/windows"
+        }
         Write-Log 'Next' 'get a model:   smallm pull bartowski/SmolLM2-135M-Instruct-GGUF'
         Write-Log '' 'chat with it:  smallm run SmolLM2-135M'
     }

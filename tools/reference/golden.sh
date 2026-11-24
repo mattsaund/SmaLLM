@@ -48,4 +48,6 @@ tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf       zephyr.txt  32
 LFM2.5-350M-Q4_K_M.gguf                    chatml.txt  32
 LFM2.5-1.2B-Instruct-Q4_K_M.gguf           chatml.txt  32
 gemma-4-E2B-it-Q4_0.gguf                   gemma4.txt  32
+LFM2-8B-A1B-Q4_K_M.gguf                    chatml.txt  32
+granite-3.1-1b-a400m-instruct-Q4_K_M.gguf  granite.txt 32
 TABLE

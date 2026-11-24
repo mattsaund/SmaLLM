@@ -47,12 +47,13 @@ use crate::tensor::quant::dequantize_row;
 use crate::threads::{ThreadPool, default_threads};
 
 use super::Model;
-use super::config::{Activation, Config, LayerSpec, Mixer, Rope};
+use super::config::{Activation, Config, Gating, LayerSpec, Mixer, Rope, Routing};
 use super::conv::ConvState;
 use super::kv::KvCache;
-use super::matmul::{ActScratch, Engine, MAX_TARGETS, Target};
+use super::matmul::{ActScratch, Engine, Target};
 use super::weights::{
-    AttentionWeights, ConvWeights, Matrix, MixerWeights, PerLayerInputs, PerLayerWeights,
+    AttentionWeights, ConvWeights, Dense, Experts, FeedForward, Linear, Matrix, MixerWeights,
+    PerLayerInputs, PerLayerWeights,
 };
 
 /// Context length used when the caller does not choose one.
@@ -248,6 +249,23 @@ impl RopeTables {
         }
     }
 
+    /// `(cos, sin)` of every pair for a rotation back by `delta` positions,
+    /// one table for each set of rotary settings.
+    fn back(&self, delta: usize) -> Vec<Vec<f32>> {
+        self.kinds
+            .iter()
+            .map(|kind| {
+                kind.freqs
+                    .iter()
+                    .flat_map(|frequency| {
+                        let (sin, cos) = (-(delta as f64) * frequency).sin_cos();
+                        [cos as f32, sin as f32]
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
     /// The `(cos, sin)` pairs of `layer` for token `index` of the batch.
     fn row(&self, layer: usize, index: usize) -> &[f32] {
         let kind = &self.kinds[self.of_layer[layer]];
@@ -311,6 +329,16 @@ fn rms_norm_unit(kernels: &Kernels, x: &mut [f32], eps: f32) {
     x.iter_mut().for_each(|value| *value *= scale);
 }
 
+/// A query or key norm that applies to each head on its own.
+fn head_norm(norm: &Option<Vec<f32>>, head_dim: usize) -> Option<&[f32]> {
+    norm.as_deref().filter(|weight| weight.len() == head_dim)
+}
+
+/// A query or key norm that applies to all heads together (OLMoE).
+fn whole_norm(norm: &Option<Vec<f32>>, head_dim: usize) -> Option<&[f32]> {
+    norm.as_deref().filter(|weight| weight.len() != head_dim)
+}
+
 /// Reads row `row` of `matrix` as f32.
 fn read_row(map: &Mapping, matrix: &Matrix, row: usize, out: &mut [f32]) {
     let start = matrix.offset + row * matrix.row_bytes;
@@ -347,6 +375,36 @@ struct ConvScratch {
     sum: Vec<f32>,
 }
 
+/// Buffers of the mixture-of-experts layers. Empty for other models.
+#[derive(Default)]
+struct ExpertScratch {
+    /// The router's scores, one row per token.
+    scores: Vec<f32>,
+    /// Experts already picked for the row being routed.
+    taken: Vec<bool>,
+    /// Each row's experts and weights, row after row.
+    chosen: Vec<(usize, f32)>,
+    /// Where each expert's rows start in the grouped order, and the next
+    /// free place while they are sorted there.
+    starts: Vec<usize>,
+    next: Vec<usize>,
+    /// The grouped order: for each expert, the rows routed to it, with
+    /// their weights.
+    pairs: Vec<(usize, f32)>,
+    /// The rows of `pairs` that each expert in use reads.
+    groups: Vec<Range<usize>>,
+    /// The gate, up and down maps of each expert in use.
+    linears: Vec<Linear>,
+    /// The input of every pair, then its gate and up projections, then
+    /// its output.
+    inputs: Vec<f32>,
+    gate: Vec<f32>,
+    up: Vec<f32>,
+    out: Vec<f32>,
+    /// The shared expert's gate, one per row.
+    shared_gates: Vec<f32>,
+}
+
 /// Buffers of Gemma 4's per-layer inputs. Empty for other models.
 #[derive(Default)]
 struct PerLayerScratch {
@@ -369,6 +427,7 @@ struct Scratch {
     /// The feed-forward gate and up projections.
     gate: Vec<f32>,
     up: Vec<f32>,
+    experts: ExpertScratch,
     per_layer: PerLayerScratch,
     acts: ActScratch,
     rope: RopeTables,
@@ -468,6 +527,27 @@ impl Session {
             .max()
             .unwrap_or(0);
         let (q_dim, kv_dim, n_ff) = (c.max_q_dim(), c.max_kv_dim(), c.max_n_ff());
+        let experts = match &c.routing {
+            Some(routing) => {
+                let n_ff_expert = c
+                    .layers
+                    .iter()
+                    .map(|layer| layer.n_ff_expert)
+                    .max()
+                    .unwrap_or(0);
+                let pairs = batch * routing.used;
+                ExpertScratch {
+                    scores: vec![0.0; batch * routing.count],
+                    inputs: vec![0.0; pairs * d],
+                    gate: vec![0.0; pairs * n_ff_expert],
+                    up: vec![0.0; pairs * n_ff_expert],
+                    out: vec![0.0; pairs * d],
+                    shared_gates: vec![0.0; batch],
+                    ..ExpertScratch::default()
+                }
+            }
+            None => ExpertScratch::default(),
+        };
         let scratch = Scratch {
             x: vec![0.0; batch * d],
             h: vec![0.0; batch * d],
@@ -486,6 +566,7 @@ impl Session {
             conv: conv_scratch,
             gate: vec![0.0; batch * n_ff],
             up: vec![0.0; batch * n_ff],
+            experts,
             per_layer,
             acts: ActScratch::default(),
             rope: RopeTables::new(c, model.weights().rope_factors.as_deref()),
@@ -592,6 +673,36 @@ impl Session {
         self.run(&replay, false);
     }
 
+    /// Removes tokens `keep..keep + discard` from the context and moves the
+    /// later ones down to close the gap. This is how a full context makes
+    /// room for more: see [`Overflow`](crate::generate::Overflow).
+    ///
+    /// The moved tokens are not read again. Their cached keys are rotated
+    /// back by `discard` positions, which rotary embeddings allow: a key
+    /// rotated for position `p` and then back by `d` is the key for `p - d`.
+    /// What the kept tokens took from the removed ones stays in their
+    /// cache, as in llama.cpp's context shift. The last few tokens always
+    /// stay, since a convolution's state is made of them. The logits are
+    /// stale until the next [`eval`](Self::eval).
+    pub fn shift(&mut self, keep: usize, discard: usize) {
+        let len = self.tokens.len();
+        let keep = keep.min(len);
+        let discard = discard.min(len.saturating_sub(keep + self.conv.rows()));
+        if discard == 0 {
+            return;
+        }
+        let model = Arc::clone(&self.model);
+        let config = model.config();
+        let rope = &self.scratch.rope;
+        let back = rope.back(discard);
+        self.kv.shift(keep, discard, |layer, key| {
+            let dims = config.layers[layer].rope_dims;
+            rotate(&mut key[..dims], &back[rope.of_layer[layer]], config.rope);
+        });
+        self.conv.shift(keep, discard);
+        self.tokens.drain(keep..keep + discard);
+    }
+
     /// Empties the context.
     pub fn clear(&mut self) {
         self.truncate(0);
@@ -658,6 +769,7 @@ impl Session {
             conv: conv_scratch,
             gate,
             up,
+            experts,
             per_layer,
             acts,
             rope,
@@ -744,39 +856,20 @@ impl Session {
                 layer.attn_post_norm.as_deref(),
                 d,
                 eps,
+                config.residual_scale,
             );
 
-            // Feed-forward: a gated projection up and a projection down.
+            // Feed-forward: a gated network, or a mixture of them.
             for (out, row) in h_active.chunks_exact_mut(d).zip(x_active.chunks_exact(d)) {
                 rms_norm(kernels, row, &layer.ffn_norm, eps, out);
             }
             pass.lap(Phase::Norm);
-            let n_ff = spec.n_ff;
-            let gate = &mut gate[..n_active * n_ff];
-            let up = &mut up[..n_active * n_ff];
-            let mut targets = [
-                Target {
-                    linear: &layer.ffn_gate,
-                    out: &mut *gate,
-                },
-                Target {
-                    linear: &layer.ffn_up,
-                    out: &mut *up,
-                },
-            ];
-            pass.multiply(h_active, d, &mut targets);
-            pass.lap(Phase::FeedForwardUp);
-            apply_gate(kernels, pool, config.activation, gate, up);
-            pass.lap(Phase::Activation);
-            pass.multiply(
-                gate,
-                n_ff,
-                &mut [Target {
-                    linear: &layer.ffn_down,
-                    out: &mut *h_active,
-                }],
-            );
-            pass.lap(Phase::FeedForwardDown);
+            match &layer.ffn {
+                FeedForward::Dense(dense) => pass.dense(dense, spec.n_ff, h_active, gate, up),
+                FeedForward::Experts(weights) => {
+                    pass.experts(weights, spec, h_active, (gate, up), experts)
+                }
+            }
             add_residual(
                 kernels,
                 x_active,
@@ -784,6 +877,7 @@ impl Session {
                 layer.ffn_post_norm.as_deref(),
                 d,
                 eps,
+                config.residual_scale,
             );
 
             if let Some(weights) = &layer.per_layer {
@@ -805,11 +899,12 @@ impl Session {
             pass.multiply(
                 normalized,
                 d,
-                &mut [Target {
-                    linear: &weights.output,
-                    out: &mut logits[..],
-                }],
+                &mut [Target::new(&weights.output, &mut logits[..])],
             );
+            if config.logit_scale != 1.0 {
+                let scale = 1.0 / config.logit_scale;
+                logits.iter_mut().for_each(|logit| *logit *= scale);
+            }
             if config.logit_softcap > 0.0 {
                 let cap = config.logit_softcap;
                 logits
@@ -900,29 +995,17 @@ impl Pass<'_> {
 
         // Keys and values for every row the cache needs. Queries and gates
         // for the active rows only.
-        let mut kept = Vec::with_capacity(MAX_TARGETS);
+        let mut kept = Vec::with_capacity(4);
         if let Some((wk, wv)) = &w.kv {
-            kept.push(Target {
-                linear: wk,
-                out: &mut *k,
-            });
+            kept.push(Target::new(wk, &mut *k));
             if let Some(wv) = wv {
-                kept.push(Target {
-                    linear: wv,
-                    out: &mut *v,
-                });
+                kept.push(Target::new(wv, &mut *v));
             }
         }
-        let mut queried = Vec::with_capacity(MAX_TARGETS);
-        queried.push(Target {
-            linear: &w.q,
-            out: &mut *q,
-        });
+        let mut queried = Vec::with_capacity(4);
+        queried.push(Target::new(&w.q, &mut *q));
         if let Some(wg) = &w.gate {
-            queried.push(Target {
-                linear: wg,
-                out: &mut *gates,
-            });
+            queried.push(Target::new(wg, &mut *gates));
         }
         self.project(h, run, kept, queried);
         self.lap(Phase::Project);
@@ -935,8 +1018,11 @@ impl Pass<'_> {
             let rows = k.chunks_exact_mut(kv_dim).zip(v.chunks_exact_mut(kv_dim));
             for (token, (key, value)) in rows.enumerate() {
                 let angles = rope.row(run.index, token);
+                if let Some(weight) = whole_norm(&w.k_norm, head_dim) {
+                    rms_norm_in_place(kernels, key, weight, eps);
+                }
                 for head in key.chunks_exact_mut(head_dim) {
-                    if let Some(weight) = &w.k_norm {
+                    if let Some(weight) = head_norm(&w.k_norm, head_dim) {
                         rms_norm_in_place(kernels, head, weight, eps);
                     }
                     rotate(&mut head[..spec.rope_dims], angles, config.rope);
@@ -952,8 +1038,11 @@ impl Pass<'_> {
         }
         for (row, token) in q.chunks_exact_mut(q_dim).zip(run.active.clone()) {
             let angles = rope.row(run.index, token);
+            if let Some(weight) = whole_norm(&w.q_norm, head_dim) {
+                rms_norm_in_place(kernels, row, weight, eps);
+            }
             for head in row.chunks_exact_mut(head_dim) {
-                if let Some(weight) = &w.q_norm {
+                if let Some(weight) = head_norm(&w.q_norm, head_dim) {
                     rms_norm_in_place(kernels, head, weight, eps);
                 }
                 rotate(&mut head[..spec.rope_dims], angles, config.rope);
@@ -987,10 +1076,7 @@ impl Pass<'_> {
         self.multiply(
             out,
             q_dim,
-            &mut [Target {
-                linear: &w.out,
-                out: &mut h[..n_active * d],
-            }],
+            &mut [Target::new(&w.out, &mut h[..n_active * d])],
         );
         self.lap(Phase::AttentionOut);
     }
@@ -1003,20 +1089,8 @@ impl Pass<'_> {
         let b = &mut s.b[..count * d];
         let signal = &mut s.signal[..count * d];
         let c = &mut s.c[..n_active * d];
-        let kept = vec![
-            Target {
-                linear: &w.b,
-                out: &mut *b,
-            },
-            Target {
-                linear: &w.x,
-                out: &mut *signal,
-            },
-        ];
-        let queried = vec![Target {
-            linear: &w.c,
-            out: &mut *c,
-        }];
+        let kept = vec![Target::new(&w.b, &mut *b), Target::new(&w.x, &mut *signal)];
+        let queried = vec![Target::new(&w.c, &mut *c)];
         self.project(h, run, kept, queried);
         self.lap(Phase::Project);
 
@@ -1049,12 +1123,174 @@ impl Pass<'_> {
         self.multiply(
             c,
             d,
-            &mut [Target {
-                linear: &w.out_proj,
-                out: &mut h[..n_active * d],
-            }],
+            &mut [Target::new(&w.out_proj, &mut h[..n_active * d])],
         );
         self.lap(Phase::AttentionOut);
+    }
+
+    /// A gated feed-forward network on the rows of `h`, which it replaces
+    /// with its output.
+    fn dense(&mut self, w: &Dense, n_ff: usize, h: &mut [f32], gate: &mut [f32], up: &mut [f32]) {
+        let d = self.config.n_embd;
+        let rows = h.len() / d;
+        let (gate, up) = (&mut gate[..rows * n_ff], &mut up[..rows * n_ff]);
+        let mut targets = [
+            Target::new(&w.gate, &mut *gate),
+            Target::new(&w.up, &mut *up),
+        ];
+        self.multiply(h, d, &mut targets);
+        self.lap(Phase::FeedForwardUp);
+        apply_gate(
+            self.engine.kernels,
+            self.engine.pool,
+            self.config.activation,
+            gate,
+            up,
+        );
+        self.lap(Phase::Activation);
+        self.multiply(gate, n_ff, &mut [Target::new(&w.down, h)]);
+        self.lap(Phase::FeedForwardDown);
+    }
+
+    /// A mixture of experts on the rows of `h`, which it replaces with its
+    /// output. The router picks a few experts for each row, and the row's
+    /// output is their outputs summed with the router's weights.
+    ///
+    /// The rows are sorted by expert, so each expert multiplies all of its
+    /// rows at once, and every expert in use runs in the same multiply. A
+    /// generated token wakes the threads twice per layer, not twice per
+    /// expert. `dense` holds the buffers of a shared expert.
+    fn experts(
+        &mut self,
+        w: &Experts,
+        spec: &LayerSpec,
+        h: &mut [f32],
+        dense: (&mut [f32], &mut [f32]),
+        s: &mut ExpertScratch,
+    ) {
+        let config = self.config;
+        let routing = config.routing.expect("a model with experts has routing");
+        let kernels = self.engine.kernels;
+        let (d, n_ff, used) = (config.n_embd, spec.n_ff_expert, routing.used);
+        let rows = h.len() / d;
+        let total = rows * used;
+
+        // The router's scores, and each row's choice of experts.
+        let scores = &mut s.scores[..rows * routing.count];
+        self.multiply(h, d, &mut [Target::new(&w.router, &mut *scores)]);
+        s.chosen.clear();
+        for row in scores.chunks_exact_mut(routing.count) {
+            choose(
+                kernels,
+                &routing,
+                w.choice_bias.as_deref(),
+                row,
+                &mut s.taken,
+                &mut s.chosen,
+            );
+        }
+
+        // Sort the pairs of row and expert by expert.
+        s.starts.clear();
+        s.starts.resize(routing.count + 1, 0);
+        for &(expert, _) in &s.chosen {
+            s.starts[expert + 1] += 1;
+        }
+        for expert in 0..routing.count {
+            s.starts[expert + 1] += s.starts[expert];
+        }
+        s.next.clear();
+        s.next.extend_from_slice(&s.starts[..routing.count]);
+        s.pairs.clear();
+        s.pairs.resize(total, (0, 0.0));
+        for (index, &(expert, weight)) in s.chosen.iter().enumerate() {
+            s.pairs[s.next[expert]] = (index / used, weight);
+            s.next[expert] += 1;
+        }
+        s.groups.clear();
+        s.linears.clear();
+        for expert in 0..routing.count {
+            let group = s.starts[expert]..s.starts[expert + 1];
+            if !group.is_empty() {
+                s.groups.push(group);
+                s.linears.extend([
+                    w.gate.expert(expert),
+                    w.up.expert(expert),
+                    w.down.expert(expert),
+                ]);
+            }
+        }
+        let inputs = &mut s.inputs[..total * d];
+        for (input, &(row, _)) in inputs.chunks_exact_mut(d).zip(&s.pairs) {
+            input.copy_from_slice(&h[row * d..(row + 1) * d]);
+        }
+
+        // Every expert's gate and up projections in one multiply.
+        let (gate, up) = (&mut s.gate[..total * n_ff], &mut s.up[..total * n_ff]);
+        let mut targets = Vec::with_capacity(2 * s.groups.len());
+        let (mut gate_rest, mut up_rest) = (&mut *gate, &mut *up);
+        for (group, maps) in s.groups.iter().zip(s.linears.chunks_exact(3)) {
+            let size = group.len() * n_ff;
+            let (gate_part, gate_tail) = std::mem::take(&mut gate_rest).split_at_mut(size);
+            let (up_part, up_tail) = std::mem::take(&mut up_rest).split_at_mut(size);
+            (gate_rest, up_rest) = (gate_tail, up_tail);
+            for (linear, out) in [(&maps[0], gate_part), (&maps[1], up_part)] {
+                targets.push(Target {
+                    linear,
+                    out,
+                    inputs: Some(group.clone()),
+                });
+            }
+        }
+        self.multiply(inputs, d, &mut targets);
+        drop(targets);
+        self.lap(Phase::FeedForwardUp);
+        apply_gate(kernels, self.engine.pool, config.activation, gate, up);
+        self.lap(Phase::Activation);
+
+        // Every expert's down projection, each on its own rows.
+        let out = &mut s.out[..total * d];
+        let mut targets = Vec::with_capacity(s.groups.len());
+        let mut rest = &mut *out;
+        for (group, maps) in s.groups.iter().zip(s.linears.chunks_exact(3)) {
+            let (part, tail) = std::mem::take(&mut rest).split_at_mut(group.len() * d);
+            rest = tail;
+            targets.push(Target {
+                linear: &maps[2],
+                out: part,
+                inputs: Some(group.clone()),
+            });
+        }
+        self.multiply(gate, n_ff, &mut targets);
+        drop(targets);
+        self.lap(Phase::FeedForwardDown);
+
+        // A shared expert sees every row, scaled by its own gate. Then the
+        // chosen experts' outputs are added with their weights.
+        match &w.shared {
+            Some((shared, shared_gate)) => {
+                let gates = &mut s.shared_gates[..rows];
+                match shared_gate {
+                    Some(linear) => {
+                        self.multiply(h, d, &mut [Target::new(linear, &mut *gates)]);
+                        gates
+                            .iter_mut()
+                            .for_each(|g| *g = 1.0 / (1.0 + (-*g).exp()));
+                    }
+                    None => gates.fill(1.0),
+                }
+                self.dense(shared, spec.n_ff, h, dense.0, dense.1);
+                for (row, &g) in h.chunks_exact_mut(d).zip(gates.iter()) {
+                    row.iter_mut().for_each(|value| *value *= g);
+                }
+            }
+            None => h.fill(0.0),
+        }
+        for (output, &(row, weight)) in out.chunks_exact(d).zip(&s.pairs) {
+            for (value, x) in h[row * d..(row + 1) * d].iter_mut().zip(output) {
+                *value += weight * x;
+            }
+        }
     }
 
     /// Gemma 4's per-layer inputs for each token: its own row of the
@@ -1071,14 +1307,7 @@ impl Pass<'_> {
         let (d, per) = (config.n_embd, config.per_layer_embd);
         let width = per * config.n_layer;
         let inputs = &mut s.inputs[..tokens.len() * width];
-        self.multiply(
-            x,
-            d,
-            &mut [Target {
-                linear: &w.model_proj,
-                out: &mut *inputs,
-            }],
-        );
+        self.multiply(x, d, &mut [Target::new(&w.model_proj, &mut *inputs)]);
         let projection_scale = 1.0 / (d as f32).sqrt();
         let embedding_scale = (per as f32).sqrt();
         for (row, &token) in inputs.chunks_exact_mut(width).zip(tokens) {
@@ -1111,14 +1340,7 @@ impl Pass<'_> {
         let (d, per, n_active) = (config.n_embd, config.per_layer_embd, run.active.len());
         let width = per * config.n_layer;
         let gate = &mut s.gate[..n_active * per];
-        self.multiply(
-            x,
-            d,
-            &mut [Target {
-                linear: &w.gate,
-                out: &mut *gate,
-            }],
-        );
+        self.multiply(x, d, &mut [Target::new(&w.gate, &mut *gate)]);
         self.lap(Phase::FeedForwardUp);
         for (gate, token) in gate.chunks_exact_mut(per).zip(run.active.clone()) {
             let start = token * width + run.index * per;
@@ -1127,14 +1349,7 @@ impl Pass<'_> {
                 .gelu_mul(gate, &s.inputs[start..start + per]);
         }
         self.lap(Phase::Activation);
-        self.multiply(
-            gate,
-            per,
-            &mut [Target {
-                linear: &w.proj,
-                out: &mut *h,
-            }],
-        );
+        self.multiply(gate, per, &mut [Target::new(&w.proj, &mut *h)]);
         self.lap(Phase::FeedForwardDown);
         add_residual(
             self.engine.kernels,
@@ -1143,7 +1358,60 @@ impl Pass<'_> {
             Some(&w.post_norm),
             d,
             config.norm_eps,
+            1.0,
         );
+    }
+}
+
+/// Picks the experts for one row of router scores, as llama.cpp does. The
+/// scores become probabilities, the best `routing.used` of them (after the
+/// choice bias) are chosen, and their probabilities become the weights.
+fn choose(
+    kernels: &Kernels,
+    routing: &Routing,
+    bias: Option<&[f32]>,
+    scores: &mut [f32],
+    taken: &mut Vec<bool>,
+    chosen: &mut Vec<(usize, f32)>,
+) {
+    match routing.gating {
+        Gating::Softmax => kernels.softmax(scores),
+        Gating::Sigmoid => scores
+            .iter_mut()
+            .for_each(|score| *score = 1.0 / (1.0 + (-*score).exp())),
+        Gating::SoftmaxChosen => {}
+    }
+    taken.clear();
+    taken.resize(scores.len(), false);
+    let first = chosen.len();
+    for _ in 0..routing.used {
+        let mut best: Option<(usize, f32)> = None;
+        for (expert, &score) in scores.iter().enumerate() {
+            let key = score + bias.map_or(0.0, |bias| bias[expert]);
+            if !taken[expert] && best.is_none_or(|(_, top)| key > top) {
+                best = Some((expert, key));
+            }
+        }
+        let Some((expert, _)) = best else { break };
+        taken[expert] = true;
+        chosen.push((expert, scores[expert]));
+    }
+    let weights = &mut chosen[first..];
+    if routing.gating == Gating::SoftmaxChosen {
+        let top = weights
+            .iter()
+            .fold(f32::NEG_INFINITY, |top, w| top.max(w.1));
+        weights.iter_mut().for_each(|w| w.1 = (w.1 - top).exp());
+        let sum: f32 = weights.iter().map(|w| w.1).sum();
+        weights.iter_mut().for_each(|w| w.1 /= sum);
+    }
+    if routing.normalize {
+        // The floor is llama.cpp's, so a row of tiny weights stays finite.
+        let sum = weights.iter().map(|w| w.1).sum::<f32>().max(6.103_515_6e-5);
+        weights.iter_mut().for_each(|w| w.1 /= sum);
+    }
+    if routing.scale != 1.0 {
+        weights.iter_mut().for_each(|w| w.1 *= routing.scale);
     }
 }
 
@@ -1174,7 +1442,7 @@ fn apply_gate(
 }
 
 /// Adds a block's output to the hidden state, normalizing it first when the
-/// model has a post-norm.
+/// model has a post-norm, and scaling it when the model scales residuals.
 fn add_residual(
     kernels: &Kernels,
     x: &mut [f32],
@@ -1182,10 +1450,14 @@ fn add_residual(
     post_norm: Option<&[f32]>,
     d: usize,
     eps: f32,
+    scale: f32,
 ) {
     for (row, update) in x.chunks_exact_mut(d).zip(update.chunks_exact_mut(d)) {
         if let Some(weight) = post_norm {
             rms_norm_in_place(kernels, update, weight, eps);
+        }
+        if scale != 1.0 {
+            update.iter_mut().for_each(|delta| *delta *= scale);
         }
         for (value, delta) in row.iter_mut().zip(update.iter()) {
             *value += delta;
