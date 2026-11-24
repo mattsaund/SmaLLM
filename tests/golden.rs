@@ -278,6 +278,11 @@ fn granite_4_0_h_350m_q4_k_m() {
 }
 
 #[test]
+fn granite_4_0_h_tiny_q4_k_m() {
+    check("granite-4.0-h-tiny-Q4_K_M");
+}
+
+#[test]
 fn every_golden_file_has_a_test() {
     let tested = [
         "gpt-oss-20b-MXFP4",
@@ -300,6 +305,7 @@ fn every_golden_file_has_a_test() {
         "mamba-370m-hf.Q8_0",
         "mamba2-130m-hf-q8_0",
         "granite-4.0-h-350m-Q4_K_M",
+        "granite-4.0-h-tiny-Q4_K_M",
     ];
     for entry in std::fs::read_dir(golden_dir()).unwrap() {
         let path = entry.unwrap().path();
