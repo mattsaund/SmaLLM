@@ -3,13 +3,14 @@
 SmaLLM is a small, fast engine that runs language models on your own
 hardware. It reads the same GGUF model files as llama.cpp and Ollama, and it
 is built for the low end: single-board computers, mini PCs and old laptops.
-One program of about a megabyte. No dependencies, nothing to configure.
+One program of about half a megabyte, which holds a few megabytes of memory
+besides the model. No dependencies, nothing to configure.
 
 **Full installation size:**\
-1.03 MB Linux (x86_64), 0.89 MB Linux (arm64)\
-0.86 MB Linux (armv7), 0.85 MB Linux (riscv64)\
-0.80 MB macOS (Intel), 0.75 MB macOS (Apple silicon)\
-0.84 MB Windows (x86_64), 0.75 MB Windows (arm64)
+0.67 MB Linux (x86_64), 0.57 MB Linux (arm64)\
+0.54 MB Linux (armv7), 0.47 MB Linux (riscv64)\
+0.51 MB macOS (Intel), 0.47 MB macOS (Apple silicon)\
+0.70 MB Windows (x86_64), 0.61 MB Windows (arm64)
 
 ## Install
 
@@ -85,39 +86,105 @@ Tokens per second on an Intel Core i7-14700K, against llama.cpp b11846 with
 its `alderlake` CPU backend. Both ran on the CPU only, on the same Q4_K_M
 files.
 
-| Model | Threads | SmaLLM generate | llama.cpp generate | SmaLLM prompt | llama.cpp prompt |
-|---|---|---|---|---|---|
-| SmolLM2 135M | 1 | **146** | 139 | 255 | **431** |
-| | 4 | **338** | 240 | 877 | **1550** |
-| | 8 | **363** | 196 | 1410 | **2724** |
-| Gemma 3 270M | 1 | **68** | 67 | 295 | **484** |
-| | 4 | **146** | 131 | 987 | **1731** |
-| | 8 | **157** | 129 | 1637 | **2548** |
-| Qwen2.5 0.5B | 1 | 41 | 41 | 84 | **147** |
-| | 4 | **96** | 87 | 294 | **539** |
-| | 8 | **104** | 87 | 508 | **931** |
-| Llama 3.2 1B | 1 | 23 | **24** | 53 | **102** |
-| | 4 | **49** | 46 | 186 | **375** |
-| | 8 | **52** | 47 | 321 | **688** |
-| TinyLlama 1.1B | 1 | 27 | **29** | 51 | **99** |
-| | 4 | **59** | 54 | 181 | **367** |
-| | 8 | **65** | 57 | 308 | **706** |
+**Reading a prompt**
 
-Generating is level with llama.cpp on one thread, within 5 percent either
-way, and 8 to 85 percent faster on several. Reading a prompt is where
-llama.cpp is ahead, by 1.6 to 2.3 times. It multiplies several tokens
-against each block of weights at once, and SmaLLM does not do that yet. It
-is the first item on the to do list.
+| Model | Threads | SmaLLM | llama.cpp | |
+|---|---|---|---|---|
+| SmolLM2 135M | 1 | **843** | 431 | 2.0x |
+| | 4 | **2780** | 1550 | 1.8x |
+| | 8 | **4263** | 2724 | 1.6x |
+| Gemma 3 270M | 1 | **896** | 484 | 1.9x |
+| | 4 | **3002** | 1731 | 1.7x |
+| | 8 | **4241** | 2548 | 1.7x |
+| Qwen2.5 0.5B | 1 | **267** | 147 | 1.8x |
+| | 4 | **964** | 539 | 1.8x |
+| | 8 | **1638** | 931 | 1.8x |
+| Llama 3.2 1B | 1 | **116** | 102 | 1.1x |
+| | 4 | **434** | 375 | 1.2x |
+| | 8 | **740** | 688 | 1.1x |
+| TinyLlama 1.1B | 1 | **115** | 99 | 1.2x |
+| | 4 | **420** | 367 | 1.1x |
+| | 8 | 696 | 706 | 1.0x |
 
-How it was measured: a 256-token prompt, then 96 generated tokens, the best
-of three runs, with the two engines taking turns. `smallm bench` measures
-SmaLLM. [tools/reference](tools/reference/README.md) has the program that
-measures llama.cpp.
+**Generating**
 
-**Size.** The whole program, with chat, server and downloader, is about
-1 MB. The engine as a shared library is 0.6 MB. For scale, the CPU-only
-libraries of llama.cpp b11846 total 7.7 MB on the same machine. llama.cpp
-also does far more: more model families, GPUs, grammars and images.
+| Model | Threads | SmaLLM | llama.cpp | |
+|---|---|---|---|---|
+| SmolLM2 135M | 1 | **146** | 139 | 1.0x |
+| | 4 | **338** | 240 | 1.4x |
+| | 8 | **363** | 196 | 1.9x |
+| Gemma 3 270M | 1 | 68 | 67 | 1.0x |
+| | 4 | **146** | 131 | 1.1x |
+| | 8 | **157** | 129 | 1.2x |
+| Qwen2.5 0.5B | 1 | 41 | 41 | 1.0x |
+| | 4 | **96** | 87 | 1.1x |
+| | 8 | **104** | 87 | 1.2x |
+| Llama 3.2 1B | 1 | 23 | **24** | 1.0x |
+| | 4 | **49** | 46 | 1.1x |
+| | 8 | **52** | 47 | 1.1x |
+| TinyLlama 1.1B | 1 | 27 | **29** | 0.9x |
+| | 4 | **59** | 54 | 1.1x |
+| | 8 | **65** | 57 | 1.1x |
+
+Reading a prompt is up to twice as fast. A batch of tokens multiplies
+several rows of weights with one instruction, and the rows are unpacked once
+per batch. [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) has the details.
+
+Generating is level on one thread and ahead on several. One token at a time,
+both engines wait for memory to deliver the weights more than they compute,
+so neither can pull far ahead. On the 1B models llama.cpp is about 5 percent
+faster on a single thread.
+
+These are numbers from one x86 desktop. The ARM kernels pass the same tests
+but have not been timed on a board yet.
+
+How it was measured: a 256-token prompt, then 96 generated tokens, with the
+two engines taking turns. Each number is the engine's best run over three
+sessions, because the desktop was in use and a busy machine only makes a
+run slower. `smallm bench` measures SmaLLM.
+[tools/reference](tools/reference/README.md) has the program that measures
+llama.cpp.
+
+## Memory
+
+SmaLLM never copies weights out of the model file. The file is mapped into
+memory, and the system keeps as much of it there as it has room for. What
+the engine holds of its own is small:
+
+| Model | | Model loaded | With a 4,096-token context | After reading 256 tokens |
+|---|---|---|---|---|
+| SmolLM2 135M | SmaLLM | **1.9 MB** | **2.2 MB** | **15 MB** |
+| | llama.cpp | 25 MB | 116 MB | 132 MB |
+| Qwen2.5 0.5B | SmaLLM | **6.1 MB** | **6.5 MB** | **15 MB** |
+| | llama.cpp | 76 MB | 124 MB | 142 MB |
+| Llama 3.2 1B | SmaLLM | **7.5 MB** | **7.7 MB** | **29 MB** |
+| | llama.cpp | 498 MB | 627 MB | 658 MB |
+
+This is memory the process allocated, which the system cannot take back.
+Both engines also have the model file in memory, 105, 491 and 808 MB for
+these three, and the system can drop those pages whenever it needs the room.
+
+Two things make the difference. llama.cpp reserves the cache for the whole
+context window when a session starts, and SmaLLM grows it as the
+conversation grows. llama.cpp also keeps a rearranged copy of most weights
+for speed, and SmaLLM rearranges a few rows at a time in a few kilobytes of
+scratch memory.
+
+`smallm bench` prints these numbers for any model on Linux, and
+`ref mem` in [tools/reference](tools/reference/README.md) does the same for
+llama.cpp.
+
+## Size
+
+The whole program, with chat, server and downloader, is 0.47 to 0.70 MB
+depending on the platform. The engine as a shared library is 0.29 to
+0.43 MB. For scale, the CPU-only libraries of llama.cpp b11846 total 7.7 MB
+on the same machine. llama.cpp also does far more, as the to do list below
+shows.
+
+Released binaries are built with a standard library that is compiled for
+size, which takes a third off. Building from source with stable Rust gives
+the same program at about 0.9 MB.
 
 ## Context
 
@@ -194,7 +261,9 @@ static, with the header and the Python binding.
 - [x] GGUF loading by memory map, with every read bounds-checked
 - [x] The Llama, Qwen2, Qwen3 and Gemma 3 architectures
 - [x] Fourteen weight formats, float and quantized
-- [x] AVX2 kernels for x86-64 and NEON kernels for ARM64
+- [x] Kernels for AVX2, AVX-VNNI, NEON and the ARM dot product extension
+- [x] Prompt reading in tiles, up to twice as fast as llama.cpp
+- [x] A few megabytes of memory besides the model file
 - [x] SentencePiece and byte-level BPE tokenizers that match llama.cpp token for token on the test models
 - [x] Eight chat formats, recognized from the model file
 - [x] A context window with no built-in limit, tested at 262,144 tokens
@@ -203,24 +272,61 @@ static, with the header and the Python binding.
 - [x] A C API as a shared and a static library, and a Python binding
 - [x] One-line installers, and static Linux binaries for x86-64, ARM64, ARMv7 and RISC-V
 - [x] CI on Linux, macOS and Windows, on x86-64 and ARM, with ARMv7 and RISC-V under emulation
+- [ ] Speed and memory measured on ARM boards
 - [ ] A first tagged release
 
 ## To do
 
-- [ ] Batched kernels, so reading a prompt is as fast as generating.
+Everything here is something llama.cpp, Ollama or another engine does today
+and SmaLLM does not. The aim is to close the list without giving up the
+size, so the heavy items are meant to be parts of the build that can be
+left out.
+
+**Hardware**
+
 - [ ] GPUs, through Vulkan compute. It is the one API that reaches AMD, Intel and NVIDIA cards and the ARM GPUs in
       phones and boards, so one backend covers them. The engine runs on the CPU only today.
+- [ ] Apple GPUs through Metal, and NVIDIA through CUDA, where they beat what Vulkan gives.
 - [ ] NPUs. Every vendor has its own toolkit (Rockchip RKNN, Qualcomm QNN, Intel OpenVINO, Apple Core ML), so each
       one is a backend of its own. None exists yet.
 - [ ] TPUs. Google's Coral Edge TPU cannot hold a language model: it runs small, fully 8-bit TensorFlow Lite graphs
       and keeps about 8 MB of weights. Support waits for hardware that can.
-- [ ] AVX-VNNI and AVX-512 kernels for newer x86, NEON kernels for 32-bit ARM, and vector kernels for RISC-V.
-- [ ] A half-precision key/value cache, to halve the memory of long contexts.
+- [ ] AVX-512 kernels, NEON kernels for 32-bit ARM, and vector kernels for RISC-V.
 - [ ] A separate thread count for reading prompts. Efficiency cores help there and not in generation.
+
+**Models**
+
+- [ ] More architectures: Phi, Gemma 2, mixture-of-experts models such as Mixtral, and the families that are not
+      transformers (RWKV, Mamba).
+- [ ] Encoder models, for embeddings and reranking.
+- [ ] Images and audio as input.
+- [ ] The remaining weight formats: IQ1, IQ2, IQ3, IQ4_XS and the ternary ones.
+- [ ] LoRA adapters and control vectors.
+
+**Generation**
+
+- [ ] Grammar-constrained output, and JSON that follows a schema.
 - [ ] Jinja chat templates, for models whose format is not one of the eight built in.
-- [ ] More architectures: Phi, Gemma 2 and mixture-of-experts models.
+- [ ] More samplers: Mirostat, typical, DRY, XTC and dynamic temperature. Frequency and presence penalties, and a
+      bias on chosen tokens.
+- [ ] Token probabilities in the output.
+- [ ] Speculative decoding with a small draft model.
+- [ ] Saving a session's context to a file and loading it again.
 - [ ] Sliding the context window when it fills, instead of dropping whole turns.
-- [ ] Grammar-constrained output, tool calls and embeddings in the server.
+- [ ] A half-precision key/value cache, to halve the memory of long contexts.
+
+**Server**
+
+- [ ] Several requests at once.
+- [ ] Endpoints for embeddings, reranking, tokenizing and code infill.
+- [ ] Tool calls.
+- [ ] The Ollama API next to the OpenAI one, and several models loaded and unloaded on demand.
+- [ ] A built-in web page, and metrics.
+
+**Tools**
+
+- [ ] Converting and quantizing models. Today the GGUF file comes from elsewhere.
+- [ ] Perplexity and the other evaluation tools.
 - [ ] Bindings beyond Python, starting with Node.js and Go.
 - [ ] A `no_std` core, for boards without an operating system.
 
@@ -235,6 +341,9 @@ cargo build --release                  # target/release/smallm
 cargo build --release -p smallm-capi   # the C library, beside it
 cargo test --workspace
 ```
+
+The smaller build that the releases use needs a nightly compiler.
+`.github/workflows/release.yml` has the exact flags.
 
 ## Contributing
 

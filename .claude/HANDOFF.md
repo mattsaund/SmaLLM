@@ -28,9 +28,14 @@ What exists:
     4 rows per tile on NEON.
 
 Numbers from the desktop are in the README, measured against llama.cpp
-b11846. In short: prompt reading is 1.1 to 2.3 times faster than llama.cpp,
+b11846. In short: prompt reading is 1.0 to 2.0 times as fast as llama.cpp,
 generation is level with it on one thread and ahead on several, and the
 engine holds 2 to 8 MB of its own memory where llama.cpp holds 116 to 627.
+The program is 0.47 to 0.70 MB.
+
+The owner also wants feature parity with llama.cpp and the other engines.
+The README's to do list is the full gap list, grouped by area. Nothing on
+it is started.
 
 ## What to do first: measure
 

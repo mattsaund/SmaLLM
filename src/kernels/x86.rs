@@ -108,7 +108,7 @@ unsafe fn hsum(v: __m256) -> f32 {
     _mm_cvtss_f32(single)
 }
 
-/// See [`TileDot`](super::TileDot), for tiles of 8 rows.
+/// See [`TileDot`], for tiles of 8 rows.
 ///
 /// A step loads 4 columns of all 8 rows, 32 bytes, and multiplies them with
 /// the same 4 activation bytes repeated in every lane. `maddubs` adds the
