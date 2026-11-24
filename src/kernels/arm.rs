@@ -56,7 +56,7 @@ const fn kernels(
         row_quant,
         tile_rows: 4,
         tile_dot,
-        tile_fill: scalar::tile_fill,
+        tile_fill,
     }
 }
 
@@ -852,6 +852,319 @@ unsafe fn q6_k_row<D: ByteDot>(row: *const u8, n: usize, act: ActRef) -> f32 {
         }
     }
     total
+}
+
+// ---------------------------------------------------------------------------
+// Filling tiles
+// ---------------------------------------------------------------------------
+
+/// See [`TileFill`](super::TileFill).
+///
+/// The common formats are unpacked 16 weights at a time for all four rows,
+/// and the four registers are transposed straight into the tile. The other
+/// formats take the portable fill.
+unsafe fn tile_fill(tile: &mut Tile, ty: TensorType, height: usize, data: &[u8], row_bytes: usize) {
+    let fill: unsafe fn(&mut Tile, [*const u8; 4]) -> bool = match ty {
+        TensorType::Q4_0 => fill_block32::<Q4_0>,
+        TensorType::Q5_0 => fill_block32::<Q5_0>,
+        TensorType::Q8_0 => fill_block32::<Q8_0>,
+        TensorType::Q4K => fill_k4::<false>,
+        TensorType::Q5K => fill_k4::<true>,
+        TensorType::Q6K => fill_q6_k,
+        _ => return tile.fill(ty, height, data, row_bytes),
+    };
+    if height != 4 {
+        return tile.fill(ty, height, data, row_bytes);
+    }
+    tile.prepare(ty, 4, row_bytes);
+    // Rows the tile lacks are read from a row of zeros, which decodes to
+    // weights of zero in each of these formats.
+    let blank = tile.blank_row(row_bytes).as_ptr();
+    let mut rows = [blank; 4];
+    for (row, bytes) in rows.iter_mut().zip(data.chunks_exact(row_bytes)) {
+        *row = bytes.as_ptr();
+    }
+    // SAFETY: every pointer in `rows` is valid for `row_bytes` bytes, which
+    // is a whole number of blocks, and `prepare` sized the tile for them.
+    tile.has_offset = unsafe { fill(tile, rows) };
+}
+
+/// Turns four registers of four 32-bit lanes into their transpose: lane `r`
+/// of result `k` is lane `k` of input `r`.
+#[inline(always)]
+unsafe fn transpose(rows: [uint32x4_t; 4]) -> [uint32x4_t; 4] {
+    // SAFETY: NEON is part of the AArch64 baseline.
+    unsafe {
+        let even_low = vreinterpretq_u64_u32(vtrn1q_u32(rows[0], rows[1]));
+        let odd_low = vreinterpretq_u64_u32(vtrn2q_u32(rows[0], rows[1]));
+        let even_high = vreinterpretq_u64_u32(vtrn1q_u32(rows[2], rows[3]));
+        let odd_high = vreinterpretq_u64_u32(vtrn2q_u32(rows[2], rows[3]));
+        [
+            vreinterpretq_u32_u64(vtrn1q_u64(even_low, even_high)),
+            vreinterpretq_u32_u64(vtrn1q_u64(odd_low, odd_high)),
+            vreinterpretq_u32_u64(vtrn2q_u64(even_low, even_high)),
+            vreinterpretq_u32_u64(vtrn2q_u64(odd_low, odd_high)),
+        ]
+    }
+}
+
+/// Writes 16 columns of a tile: `weights[r]` holds those columns of row `r`.
+#[inline(always)]
+unsafe fn store_columns(q: *mut i8, weights: [uint8x16_t; 4]) {
+    // SAFETY: the caller guarantees room for 4 steps of 16 bytes at `q`.
+    unsafe {
+        let lanes = transpose(weights.map(|row| vreinterpretq_u32_u8(row)));
+        for (step, lanes) in lanes.into_iter().enumerate() {
+            vst1q_u8(q.add(step * 16) as *mut u8, vreinterpretq_u8_u32(lanes));
+        }
+    }
+}
+
+/// Writes one value per row for each of 4 sub-blocks: `values[r]` holds the
+/// four values of row `r`. Each is written `repeat` times, for formats
+/// whose scales span more than one sub-block of 16 columns.
+#[inline(always)]
+unsafe fn store_affine(out: *mut f32, values: [float32x4_t; 4], repeat: usize) {
+    // SAFETY: the caller guarantees room for `4 * repeat` runs of four
+    // floats at `out`.
+    unsafe {
+        let lanes = transpose(values.map(|row| vreinterpretq_u32_f32(row)));
+        for (index, lanes) in lanes.into_iter().enumerate() {
+            for copy in 0..repeat {
+                vst1q_f32(
+                    out.add((index * repeat + copy) * 4),
+                    vreinterpretq_f32_u32(lanes),
+                );
+            }
+        }
+    }
+}
+
+/// Lanes that hold something other than zero, as a mask to gather with OR.
+#[inline(always)]
+unsafe fn nonzero(values: float32x4_t) -> uint32x4_t {
+    // SAFETY: NEON is part of the AArch64 baseline.
+    unsafe { vmvnq_u32(vceqq_f32(values, vdupq_n_f32(0.0))) }
+}
+
+/// A format with 32-weight blocks, the way a tile stores it: weights that
+/// are zero or more wherever the format allows, and the bias that took.
+trait TileBlock {
+    /// Bytes in one block.
+    const BYTES: usize;
+    /// What was added to the weights to make them non-negative.
+    const BIAS: f32;
+    /// The first and the last 16 weights of the block at `p`.
+    unsafe fn weights(p: *const u8) -> (uint8x16_t, uint8x16_t);
+}
+
+impl TileBlock for Q4_0 {
+    const BYTES: usize = 18;
+    const BIAS: f32 = 8.0;
+    #[inline(always)]
+    unsafe fn weights(p: *const u8) -> (uint8x16_t, uint8x16_t) {
+        // SAFETY: the caller guarantees an 18-byte block at `p`.
+        unsafe { nibbles(p.add(2)) }
+    }
+}
+
+impl TileBlock for Q5_0 {
+    const BYTES: usize = 22;
+    const BIAS: f32 = 16.0;
+    #[inline(always)]
+    unsafe fn weights(p: *const u8) -> (uint8x16_t, uint8x16_t) {
+        // SAFETY: the caller guarantees a 22-byte block at `p`.
+        unsafe {
+            let (low, high) = nibbles(p.add(6));
+            (
+                vorrq_u8(low, fifth_bits(p.add(2))),
+                vorrq_u8(high, fifth_bits(p.add(4))),
+            )
+        }
+    }
+}
+
+impl TileBlock for Q8_0 {
+    const BYTES: usize = 34;
+    const BIAS: f32 = 0.0;
+    #[inline(always)]
+    unsafe fn weights(p: *const u8) -> (uint8x16_t, uint8x16_t) {
+        // SAFETY: the caller guarantees a 34-byte block at `p`.
+        unsafe { (vld1q_u8(p.add(2)), vld1q_u8(p.add(18))) }
+    }
+}
+
+/// The fill of a format with blocks of 32 weights. Returns whether any
+/// offset is not zero.
+unsafe fn fill_block32<F: TileBlock>(tile: &mut Tile, rows: [*const u8; 4]) -> bool {
+    let (q, scale, offset) = (
+        tile.q.as_mut_ptr(),
+        tile.scale.as_mut_ptr(),
+        tile.offset.as_mut_ptr(),
+    );
+    let mut any = false;
+    // SAFETY: the caller guarantees `tile.cols / 32` blocks behind every
+    // row pointer and a tile sized for them.
+    unsafe {
+        for block in 0..tile.cols / 32 {
+            let mut low = [vdupq_n_u8(0); 4];
+            let mut high = [vdupq_n_u8(0); 4];
+            for r in 0..4 {
+                let p = rows[r].add(block * F::BYTES);
+                (low[r], high[r]) = F::weights(p);
+                // One scale per row, shared by both sub-blocks.
+                let d = half(p);
+                let shift = 0.0 - F::BIAS * d;
+                for sub in block * 2..block * 2 + 2 {
+                    *scale.add(sub * 4 + r) = d;
+                    *offset.add(sub * 4 + r) = shift;
+                }
+                any |= shift != 0.0;
+            }
+            store_columns(q.add(block * 128), low);
+            store_columns(q.add(block * 128 + 64), high);
+        }
+    }
+    any
+}
+
+/// The fill of Q4_K, and of Q5_K when `FIVE` is set. The two share their
+/// scales. Q5_K adds a fifth bit to every weight.
+unsafe fn fill_k4<const FIVE: bool>(tile: &mut Tile, rows: [*const u8; 4]) -> bool {
+    let (bytes, nibbles_at) = if FIVE { (176, 48) } else { (144, 16) };
+    let (q, scale, offset) = (
+        tile.q.as_mut_ptr(),
+        tile.scale.as_mut_ptr(),
+        tile.offset.as_mut_ptr(),
+    );
+    // SAFETY: the caller guarantees `tile.cols / 256` super-blocks behind
+    // every row pointer and a tile sized for them.
+    unsafe {
+        let low_nibble = vdupq_n_u8(0x0f);
+        let sixteen = vdupq_n_u8(0x10);
+        let mut any = vdupq_n_u32(0);
+        for block in 0..tile.cols / 256 {
+            // Eight scales and minimums per row, each for 32 weights, which
+            // is two sub-blocks of 16.
+            for part in 0..2 {
+                let mut scales = [vdupq_n_f32(0.0); 4];
+                let mut offsets = [vdupq_n_f32(0.0); 4];
+                for r in 0..4 {
+                    let p = rows[r].add(block * bytes);
+                    let (integers, minimums) = k4_scales(p.add(4));
+                    let integers = vcvtq_f32_s32(vld1q_s32(integers.as_ptr().add(part * 4)));
+                    let minimums = vcvtq_f32_s32(vld1q_s32(minimums.as_ptr().add(part * 4)));
+                    scales[r] = vmulq_n_f32(integers, half(p));
+                    offsets[r] = vnegq_f32(vmulq_n_f32(minimums, half(p.add(2))));
+                    any = vorrq_u32(any, nonzero(offsets[r]));
+                }
+                store_affine(scale.add((block * 16 + part * 8) * 4), scales, 2);
+                store_affine(offset.add((block * 16 + part * 8) * 4), offsets, 2);
+            }
+            // 32 bytes hold 64 weights: the low nibbles, then the high ones.
+            for pair in 0..4 {
+                let mut runs = [[vdupq_n_u8(0); 4]; 4];
+                for r in 0..4 {
+                    let p = rows[r].add(block * bytes);
+                    let first = vld1q_u8(p.add(nibbles_at + pair * 32));
+                    let second = vld1q_u8(p.add(nibbles_at + pair * 32 + 16));
+                    let mut weights = [
+                        vandq_u8(first, low_nibble),
+                        vandq_u8(second, low_nibble),
+                        vshrq_n_u8::<4>(first),
+                        vshrq_n_u8::<4>(second),
+                    ];
+                    if FIVE {
+                        // Bits `2 * pair` and `2 * pair + 1` of each byte
+                        // are the fifth bits of the low and high weights.
+                        let fifths = [vld1q_u8(p.add(16)), vld1q_u8(p.add(32))];
+                        let low_bit = vdupq_n_u8(1 << (2 * pair));
+                        let high_bit = vdupq_n_u8(1 << (2 * pair + 1));
+                        for side in 0..2 {
+                            let low = vandq_u8(vtstq_u8(fifths[side], low_bit), sixteen);
+                            let high = vandq_u8(vtstq_u8(fifths[side], high_bit), sixteen);
+                            weights[side] = vorrq_u8(weights[side], low);
+                            weights[2 + side] = vorrq_u8(weights[2 + side], high);
+                        }
+                    }
+                    for (run, weights) in weights.into_iter().enumerate() {
+                        runs[run][r] = weights;
+                    }
+                }
+                for (run, weights) in runs.into_iter().enumerate() {
+                    store_columns(q.add((block * 16 + pair * 4 + run) * 64), weights);
+                }
+            }
+        }
+        vmaxvq_u32(any) != 0
+    }
+}
+
+/// The fill of Q6_K. Weights are 4 low bits and 2 high bits, stored with a
+/// bias of 32, which is how the tile wants them.
+unsafe fn fill_q6_k(tile: &mut Tile, rows: [*const u8; 4]) -> bool {
+    const BYTES: usize = 210;
+    let (q, scale, offset) = (
+        tile.q.as_mut_ptr(),
+        tile.scale.as_mut_ptr(),
+        tile.offset.as_mut_ptr(),
+    );
+    // SAFETY: the caller guarantees `tile.cols / 256` super-blocks behind
+    // every row pointer and a tile sized for them.
+    unsafe {
+        let zero = vdupq_n_f32(0.0);
+        let low_nibble = vdupq_n_u8(0x0f);
+        let two_bits = vdupq_n_u8(3);
+        let mut any = vdupq_n_u32(0);
+        for block in 0..tile.cols / 256 {
+            // Sixteen signed 8-bit scales per row, times the block's scale.
+            for part in 0..4 {
+                let mut scales = [zero; 4];
+                let mut offsets = [zero; 4];
+                for r in 0..4 {
+                    let p = rows[r].add(block * BYTES);
+                    let wide = vmovl_s8(vld1_s8(p.add(192 + (part / 2) * 8) as *const i8));
+                    let four = if part % 2 == 0 {
+                        vget_low_s16(wide)
+                    } else {
+                        vget_high_s16(wide)
+                    };
+                    scales[r] = vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(four)), half(p.add(208)));
+                    offsets[r] = vsubq_f32(zero, vmulq_n_f32(scales[r], 32.0));
+                    any = vorrq_u32(any, nonzero(offsets[r]));
+                }
+                store_affine(scale.add((block * 16 + part * 4) * 4), scales, 1);
+                store_affine(offset.add((block * 16 + part * 4) * 4), offsets, 1);
+            }
+            // Each half of the block is 64 bytes of nibbles and 32 bytes of
+            // high bit pairs, and unpacks to four runs of 32 weights. A
+            // register holds 16 of them, so every run takes two turns.
+            for part in 0..2 {
+                for turn in 0..2 {
+                    let mut runs = [[vdupq_n_u8(0); 4]; 4];
+                    for r in 0..4 {
+                        let p = rows[r].add(block * BYTES);
+                        let first = vld1q_u8(p.add(part * 64 + turn * 16));
+                        let second = vld1q_u8(p.add(part * 64 + 32 + turn * 16));
+                        let high = vld1q_u8(p.add(128 + part * 32 + turn * 16));
+                        let top = |bits: uint8x16_t| vshlq_n_u8::<4>(vandq_u8(bits, two_bits));
+                        runs[0][r] = vorrq_u8(vandq_u8(first, low_nibble), top(high));
+                        runs[1][r] =
+                            vorrq_u8(vandq_u8(second, low_nibble), top(vshrq_n_u8::<2>(high)));
+                        runs[2][r] = vorrq_u8(vshrq_n_u8::<4>(first), top(vshrq_n_u8::<4>(high)));
+                        runs[3][r] = vorrq_u8(vshrq_n_u8::<4>(second), top(vshrq_n_u8::<6>(high)));
+                    }
+                    for (run, weights) in runs.into_iter().enumerate() {
+                        store_columns(
+                            q.add((block * 16 + part * 8 + run * 2 + turn) * 64),
+                            weights,
+                        );
+                    }
+                }
+            }
+        }
+        vmaxvq_u32(any) != 0
+    }
 }
 
 // ---------------------------------------------------------------------------
