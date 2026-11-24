@@ -3,7 +3,7 @@
 SmaLLM is a small, fast engine that runs language models on your own
 hardware. It reads the same GGUF model files as llama.cpp and Ollama, and it
 is built for the low end: single-board computers, mini PCs and old laptops.
-One program of under a megabyte, which holds a few megabytes of memory
+One program of about a megabyte, which holds a few megabytes of memory
 besides the model. No dependencies, and the defaults need no changes.
 
 **Full installation size:**\
@@ -13,8 +13,8 @@ besides the model. No dependencies, and the defaults need no changes.
 1.26 MB Windows (x86_64), 1.04 MB Windows (arm64)
 
 **Memory of its own, for Llama 3.2 1B with a 4,096-token context:**\
-7.7 MB, where llama.cpp holds 627 MB. [Memory](#memory) says how it was
-measured.
+7.7 MB, where llama.cpp holds 627 MB. [Memory](#memory) says how SmaLLM
+does it and how it was measured.
 
 ## Install
 
@@ -140,24 +140,64 @@ tokens, the best of three runs, with the engines taking turns.
 
 ## Memory
 
-SmaLLM never copies weights out of the model file. The file is mapped into
-memory, and the system keeps as much of it there as it has room for. What
-the engine holds of its own is small. For Llama 3.2 1B:
+SmaLLM's rule is simple: never copy what is already in the model file, and
+never reserve memory before it is needed. What the engine holds of its own
+stays in the megabytes. For Llama 3.2 1B:
 
 | | Model loaded | With a 4,096-token context | After reading 256 tokens |
 |---|---|---|---|
 | SmaLLM | **7.5 MB** | **7.7 MB** | **21 MB** |
 | llama.cpp | 498 MB | 627 MB | 636 MB |
 
-This is memory the process allocated, which the system cannot take back.
-Both engines also have the 808 MB model file in memory, and the system can
-drop those pages whenever it needs the room.
+The bigger the model, the bigger the gap. On gpt-oss-20b, llama.cpp's own
+memory is about 10 GB, and SmaLLM's is 33 MB.
 
-Two things make the difference. llama.cpp reserves the cache for the whole
-context window when a session starts, and SmaLLM grows it as the
-conversation grows. llama.cpp also keeps a rearranged copy of most weights
-for speed, and SmaLLM rearranges a few rows at a time in a few kilobytes of
-scratch memory. `smallm bench` prints these numbers for any model on Linux.
+### How it works
+
+- **The weights stay in the file.** The model file is mapped into memory,
+  and the matrix kernels read its quantized blocks where they are, in the
+  file's own layout. llama.cpp copies most weights into a rearranged layout
+  that suits its kernels, and that copy is most of the 498 MB above. SmaLLM gets the
+  same speed benefit without the copy: for a prompt it rearranges a few rows
+  at a time into a tile that fits in the CPU's cache, uses it, and moves on.
+  That is how fast matrix libraries have long multiplied large matrices.
+- **The cache grows with the conversation.** llama.cpp reserves the
+  key/value cache for the whole context window when a session starts.
+  SmaLLM adds it in pieces of 256 positions as the conversation grows, in
+  16-bit floats. A short chat costs a few megabytes, whatever the window.
+- **Working memory is small.** Scratch buffers fit a 32-token batch, the
+  vocabulary is read from the file in place, and only the last token's
+  logits are computed.
+- **Each model keeps only what it must.** DeepSeek's latent attention
+  caches one compressed row per position. Mamba and RWKV keep a fixed state
+  instead of a growing cache. Gemma 4's shared layers keep no cache at all.
+
+### What it is good for
+
+- **Small boards.** The engine leaves the memory to the model and to
+  whatever else the board runs.
+- **Models close to the size of RAM**, mixtures of experts above all. A
+  token reads only the experts it is routed to, and the system keeps the
+  busy ones in memory and drops the rest.
+- **Several programs on one model.** The pages of a mapped file are shared,
+  so they share one copy of the weights.
+- **Starting in milliseconds.** Nothing is copied or rearranged when a
+  model loads.
+
+### The fine print
+
+This is memory the process allocated, which the system cannot take back.
+Both engines also need the model file in memory to run at full speed, and
+the system keeps it there for them. Counting the file too, Llama 3.2 1B
+takes about 0.83 GB with SmaLLM and 1.4 GB with llama.cpp. The system can
+drop file pages and read them again when it runs short, so a tight fit runs
+slower instead of failing. That works best with fast storage, eMMC or NVMe
+rather than an SD card. And since the cache grows as needed, a context too
+large for the machine shows up when the conversation gets there, not when
+the session starts.
+
+`smallm bench` prints these numbers for any model on Linux. The comparison
+uses llama.cpp b11846 on an Intel Core i7-14700K, with a 4,096-token context.
 
 ## Size
 
