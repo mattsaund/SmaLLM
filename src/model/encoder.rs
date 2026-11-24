@@ -287,6 +287,9 @@ impl Encoder {
             per_layer_embd: 0,
             residual_scale: 1.0,
             logit_scale: 1.0,
+            attention_softcap: 0.0,
+            rope_attn_factor: 1.0,
+            long_context_after: 0,
             routing: None,
         };
         Ok((config, encoder))

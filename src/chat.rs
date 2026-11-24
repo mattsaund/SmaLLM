@@ -81,6 +81,8 @@ pub enum Template {
     Granite,
     /// `<|role|> ... <|end|>`
     Phi3,
+    /// `<|role|>...<|end|>` without newlines (Phi-4-mini)
+    Phi4Mini,
     /// `<|role|> ... ` then the model's end-of-text token.
     Zephyr,
     /// Fullwidth `<|User|>` and `<|Assistant|>` markers.
@@ -95,7 +97,7 @@ const DEEPSEEK_END: &str = "<\u{ff5c}end\u{2581}of\u{2581}sentence\u{ff5c}>";
 
 impl Template {
     /// Every template, for listings.
-    pub const ALL: [Template; 10] = [
+    pub const ALL: [Template; 11] = [
         Template::ChatMl,
         Template::Llama3,
         Template::Llama2,
@@ -104,6 +106,7 @@ impl Template {
         Template::Gemma4,
         Template::Granite,
         Template::Phi3,
+        Template::Phi4Mini,
         Template::Zephyr,
         Template::DeepSeek,
     ];
@@ -130,7 +133,12 @@ impl Template {
                 Template::Mistral
             })
         } else if has("<|assistant|>") && has("<|end|>") {
-            Some(Template::Phi3)
+            // Phi-4-mini writes the content right after the role.
+            if has("|>' + message['content']") {
+                Some(Template::Phi4Mini)
+            } else {
+                Some(Template::Phi3)
+            }
         } else if has("<|assistant|>") && has("<|user|>") {
             Some(Template::Zephyr)
         } else {
@@ -156,6 +164,7 @@ impl Template {
             Template::Gemma4 => "gemma4",
             Template::Granite => "granite",
             Template::Phi3 => "phi3",
+            Template::Phi4Mini => "phi4-mini",
             Template::Zephyr => "zephyr",
             Template::DeepSeek => "deepseek",
         }
@@ -286,6 +295,16 @@ impl Template {
                 }
                 if add_assistant {
                     out.markup("<|start_of_role|>assistant<|end_of_role|>");
+                }
+            }
+            Template::Phi4Mini => {
+                for message in messages {
+                    out.markup(&format!("<|{}|>", message.role.name()));
+                    out.content(&message.content);
+                    out.markup("<|end|>");
+                }
+                if add_assistant {
+                    out.markup("<|assistant|>");
                 }
             }
             Template::Phi3 | Template::Zephyr => {
@@ -451,6 +470,8 @@ mod tests {
     fn phi3_and_zephyr() {
         let text = Template::Phi3.render_text(&conversation()[1..2], true, "");
         assert_eq!(text, "<|user|>\nHi<|end|>\n<|assistant|>\n");
+        let text = Template::Phi4Mini.render_text(&conversation()[1..2], true, "");
+        assert_eq!(text, "<|user|>Hi<|end|><|assistant|>");
         let text = Template::Zephyr.render_text(&conversation()[1..2], true, "</s>");
         assert_eq!(text, "<|user|>\nHi</s>\n<|assistant|>\n");
     }
@@ -507,6 +528,10 @@ mod tests {
             (
                 "<|user|>\n{{ c }}<|end|>\n<|assistant|>",
                 Some(Template::Phi3),
+            ),
+            (
+                "{{ '<|' + message['role'] + '|>' + message['content'] + '<|end|>' }}{{ '<|assistant|>' }}",
+                Some(Template::Phi4Mini),
             ),
             (
                 "<|user|>\n{{ c }}{{ eos_token }}\n<|assistant|>",

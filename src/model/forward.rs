@@ -190,6 +190,9 @@ struct RopeKind {
     dims: usize,
     /// Angle per position of each rotated pair.
     freqs: Vec<f64>,
+    /// What every rotated value is multiplied by: the model's rotary
+    /// attention factor.
+    scale: f32,
     /// `(cos, sin)` of every pair, for each token of the batch.
     table: Vec<f32>,
 }
@@ -204,6 +207,7 @@ struct RopeTables {
 
 impl RopeTables {
     fn new(config: &Config, factors: Option<&[f32]>) -> RopeTables {
+        let scale = config.rope_attn_factor;
         let mut kinds = Vec::new();
         let mut settings = Vec::new();
         let mut of_layer = Vec::with_capacity(config.n_layer);
@@ -226,6 +230,7 @@ impl RopeTables {
                     kinds.push(RopeKind {
                         dims: layer.rope_dims,
                         freqs: frequencies(layer, factors),
+                        scale,
                         table: Vec::new(),
                     });
                     kinds.len() - 1
@@ -247,8 +252,8 @@ impl RopeTables {
                 let position = (first_position + index) as f64;
                 for frequency in &kind.freqs {
                     let (sin, cos) = (position * frequency).sin_cos();
-                    kind.table.push(cos as f32);
-                    kind.table.push(sin as f32);
+                    kind.table.push(cos as f32 * kind.scale);
+                    kind.table.push(sin as f32 * kind.scale);
                 }
             }
         }
@@ -275,6 +280,17 @@ impl RopeTables {
     fn row(&self, layer: usize, index: usize) -> &[f32] {
         let kind = &self.kinds[self.of_layer[layer]];
         &kind.table[index * kind.dims..(index + 1) * kind.dims]
+    }
+}
+
+/// The rotary divisors a session of `n_ctx` tokens uses: a LongRoPE model's
+/// long ones when the session reaches past the model's original context,
+/// as llama.cpp chooses them.
+fn rope_factors(model: &Model, n_ctx: usize) -> Option<&[f32]> {
+    let weights = model.weights();
+    match &weights.rope_factors_long {
+        Some(long) if n_ctx > model.config().long_context_after => Some(long),
+        _ => weights.rope_factors.as_deref(),
     }
 }
 
@@ -588,7 +604,7 @@ impl Session {
             experts,
             per_layer,
             acts: ActScratch::default(),
-            rope: RopeTables::new(c, model.weights().rope_factors.as_deref()),
+            rope: RopeTables::new(c, rope_factors(&model, n_ctx)),
         };
         // Layers that read another layer's cache have none of their own.
         let shapes: Vec<(usize, usize)> = c
@@ -1091,6 +1107,7 @@ impl Pass<'_> {
             q,
             first_position: self.first_position + run.active.start,
             window: spec.window,
+            softcap: config.attention_softcap,
         };
         let source = spec.kv_source.unwrap_or(run.index);
         attend(&self.engine, self.kv, source, spec, &query, &s.slots, out);
@@ -1506,6 +1523,8 @@ struct Query<'a> {
     /// How many positions a token may look back, itself included. Zero for
     /// no limit.
     window: usize,
+    /// Soft cap on the scores, `cap * tanh(score / cap)`. Zero for none.
+    softcap: f32,
 }
 
 /// Where a parallel loop writes, shared between its threads.
@@ -1592,6 +1611,12 @@ fn attend(
             );
         });
         for head_scores in scores.chunks_exact_mut(visible) {
+            if query.softcap > 0.0 {
+                let cap = query.softcap;
+                head_scores
+                    .iter_mut()
+                    .for_each(|score| *score = cap * (*score / cap).tanh());
+            }
             kernels.softmax(head_scores);
         }
         out.fill(0.0);

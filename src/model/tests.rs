@@ -13,7 +13,7 @@ use crate::kernels::{self, Kernels};
 use crate::tensor::TensorType;
 use crate::testing::TinyModel;
 
-const ARCHS: [&str; 14] = [
+const ARCHS: [&str; 16] = [
     "llama",
     "qwen2",
     "qwen3",
@@ -28,6 +28,8 @@ const ARCHS: [&str; 14] = [
     "granitemoe",
     "olmoe",
     "smollm3",
+    "gemma2",
+    "phi3",
 ];
 
 const QUANT_TYPES: [TensorType; 11] = [
@@ -143,22 +145,35 @@ mod oracle {
         head: &mut [f64],
         position: usize,
         spec: &LayerSpec,
-        rope: Rope,
+        config: &Config,
         factors: Option<&[f32]>,
     ) {
         let n = spec.rope_dims;
+        let scale = config.rope_attn_factor as f64;
         for i in 0..n / 2 {
             let frequency = (spec.rope_base as f64).powf(-2.0 * i as f64 / n as f64);
             let divisor = factors.map_or(1.0, |f| f[i] as f64);
             let angle = position as f64 * frequency * spec.rope_scale as f64 / divisor;
-            let (a, b) = match rope {
+            let (a, b) = match config.rope {
                 Rope::Pairs => (2 * i, 2 * i + 1),
                 Rope::Halves => (i, i + n / 2),
             };
             let (x0, x1) = (head[a], head[b]);
-            head[a] = x0 * angle.cos() - x1 * angle.sin();
-            head[b] = x0 * angle.sin() + x1 * angle.cos();
+            head[a] = (x0 * angle.cos() - x1 * angle.sin()) * scale;
+            head[b] = (x0 * angle.sin() + x1 * angle.cos()) * scale;
         }
+    }
+
+    /// The rotary divisors of a layer. The tests' sessions hold 2048
+    /// tokens, past every synthetic model's original context, so a
+    /// LongRoPE model uses its long ones.
+    fn factors_of<'a>(model: &'a Model, spec: &LayerSpec) -> Option<&'a [f32]> {
+        let w = model.weights();
+        let factors = match &w.rope_factors_long {
+            Some(long) if 2048 > model.config().long_context_after => Some(long.as_slice()),
+            _ => w.rope_factors.as_deref(),
+        };
+        factors.filter(|_| spec.rope_factors)
     }
 
     fn activate(x: f64, activation: Activation) -> f64 {
@@ -254,10 +269,10 @@ mod oracle {
         inputs: &[Vec<f64>],
         caches: &mut Caches,
     ) -> Vec<Vec<f64>> {
-        let (c, w) = (model.config(), model.weights());
+        let c = model.config();
         let spec = &c.layers[index];
         let hd = spec.head_dim;
-        let factors = w.rope_factors.as_deref().filter(|_| spec.rope_factors);
+        let factors = factors_of(model, spec);
         if let Some((wk, wv)) = &a.kv {
             let mut keys = Vec::new();
             let mut values = Vec::new();
@@ -275,7 +290,7 @@ mod oracle {
                     if let Some(weight) = a.k_norm.as_deref().filter(|w| w.len() == hd) {
                         head.copy_from_slice(&rms_norm(head, Some(weight), c.norm_eps));
                     }
-                    rotate(head, position, spec, c.rope, factors);
+                    rotate(head, position, spec, c, factors);
                 }
                 if c.value_norm {
                     for head in v.chunks_exact_mut(hd) {
@@ -303,7 +318,7 @@ mod oracle {
                     if let Some(weight) = a.q_norm.as_deref().filter(|w| w.len() == hd) {
                         head.copy_from_slice(&rms_norm(head, Some(weight), c.norm_eps));
                     }
-                    rotate(head, position, spec, c.rope, factors);
+                    rotate(head, position, spec, c, factors);
                 }
                 let first = match spec.window {
                     0 => 0,
@@ -317,8 +332,12 @@ mod oracle {
                     let scores: Vec<f64> = (first..=position)
                         .map(|j| {
                             let k = &keys[j][kv_head..kv_head + hd];
-                            q.iter().zip(k).map(|(a, b)| a * b).sum::<f64>()
-                                * spec.attention_scale as f64
+                            let score = q.iter().zip(k).map(|(a, b)| a * b).sum::<f64>()
+                                * spec.attention_scale as f64;
+                            match c.attention_softcap as f64 {
+                                0.0 => score,
+                                cap => cap * (score / cap).tanh(),
+                            }
                         })
                         .collect();
                     let max = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);

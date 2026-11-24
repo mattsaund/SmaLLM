@@ -152,6 +152,9 @@ pub(crate) struct TinyModel {
     pub wide_qk_norm: bool,
     /// Granite's multipliers on embeddings, residuals, scores and logits.
     pub granite_scales: bool,
+    /// Phi-3's LongRoPE: short and long rotary divisors, a short original
+    /// context, and a rotary attention factor.
+    pub longrope: bool,
     pub seed: u64,
 }
 
@@ -173,7 +176,7 @@ impl TinyModel {
                 arch,
                 "qwen3" | "qwen3moe" | "gemma3" | "gemma4" | "lfm2" | "lfm2moe" | "lfm3" | "olmoe"
             ),
-            post_norm: matches!(arch, "gemma3" | "gemma4" | "lfm3"),
+            post_norm: matches!(arch, "gemma2" | "gemma3" | "gemma4" | "lfm3"),
             bias: matches!(arch, "qwen2" | "qwen2moe"),
             fused: false,
             window: 0,
@@ -196,6 +199,7 @@ impl TinyModel {
             fused_experts: false,
             wide_qk_norm: arch == "olmoe",
             granite_scales: matches!(arch, "granite" | "granitemoe"),
+            longrope: arch == "phi3",
             seed: 1,
         };
         if matches!(
@@ -218,6 +222,14 @@ impl TinyModel {
                 model.choice_bias = true;
             }
             "qwen2moe" => model.shared_expert = true,
+            // Phi-3 stores query, key and value together, and the gate
+            // with `up`.
+            "phi3" => model.fused = true,
+            // Every other layer of Gemma 2 is windowed.
+            "gemma2" => {
+                model.n_layer = 4;
+                model.window = 3;
+            }
             // Every fourth layer is left unrotated.
             "smollm3" => model.n_layer = 4,
             "lfm3" => {
@@ -395,6 +407,17 @@ impl TinyModel {
                     &format!("{arch}.expert_feed_forward_length"),
                     self.n_ff as u32,
                 );
+        }
+        if arch == "gemma2" {
+            // Small caps, so that they matter for random weights.
+            builder
+                .f32(&format!("{arch}.attn_logit_softcapping"), 5.0)
+                .f32(&format!("{arch}.final_logit_softcapping"), 10.0);
+        }
+        if self.longrope {
+            builder
+                .u32(&format!("{arch}.rope.scaling.original_context_length"), 256)
+                .f32(&format!("{arch}.rope.scaling.attn_factor"), 1.1);
         }
         if self.granite_scales {
             builder
@@ -635,6 +658,15 @@ impl TinyModel {
                 0.5,
                 1.5,
             );
+        }
+        if self.longrope {
+            let pairs = if self.rope_dims > 0 {
+                self.rope_dims
+            } else {
+                self.head_dim()
+            } / 2;
+            vector(&mut builder, "rope_factors_short.weight", pairs, 1.0, 2.0);
+            vector(&mut builder, "rope_factors_long.weight", pairs, 2.0, 16.0);
         }
         for layer in layers {
             let name = |part: &str| format!("blk.{layer}.{part}");

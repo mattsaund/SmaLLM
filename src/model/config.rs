@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 use crate::gguf::Gguf;
 
 /// Architectures this engine runs, as named in `general.architecture`.
-pub const ARCHITECTURES: [&str; 14] = [
+pub const ARCHITECTURES: [&str; 16] = [
     "llama",
     "qwen2",
     "qwen3",
@@ -26,6 +26,8 @@ pub const ARCHITECTURES: [&str; 14] = [
     "granitemoe",
     "olmoe",
     "smollm3",
+    "gemma2",
+    "phi3",
 ];
 
 /// Which two elements of an attention head a rotary embedding rotates
@@ -175,6 +177,16 @@ pub struct Config {
     pub residual_scale: f32,
     /// The logits are divided by this (Granite). One for none.
     pub logit_scale: f32,
+    /// Soft cap on attention scores, `cap * tanh(score / cap)` (Gemma 2).
+    /// Zero for none.
+    pub attention_softcap: f32,
+    /// Multiplier on rotated queries and keys, which LongRoPE models such as
+    /// Phi-3 use to keep attention sharp at long context. One for none.
+    pub rope_attn_factor: f32,
+    /// The context length a LongRoPE model was trained with before its
+    /// context was extended. Longer sessions use its long rotary divisors.
+    /// Zero for models without them.
+    pub long_context_after: usize,
     /// The expert settings, for models with mixture-of-experts layers.
     pub routing: Option<Routing>,
 }
@@ -242,7 +254,10 @@ impl Config {
             .usize("rope.dimension_count_swa")
             .unwrap_or(head_dim_local.min(rope_dims));
         let rope_base = meta.f32("rope.freq_base").unwrap_or(10000.0);
-        let rope_base_local = meta.f32("rope.freq_base_swa").unwrap_or(10000.0);
+        // Gemma 2's windowed layers rotate like its others, unless the file
+        // says otherwise. Elsewhere they default to a base of 10000.
+        let default_local_base = if arch == "gemma2" { rope_base } else { 10000.0 };
+        let rope_base_local = meta.f32("rope.freq_base_swa").unwrap_or(default_local_base);
         let rope_scale = meta.rope_scale()?;
         let window = meta.usize("attention.sliding_window").unwrap_or(0);
 
@@ -279,6 +294,9 @@ impl Config {
             per_layer_embd: 0,
             residual_scale: 1.0,
             logit_scale: 1.0,
+            attention_softcap: 0.0,
+            rope_attn_factor: meta.f32("rope.scaling.attn_factor").unwrap_or(1.0),
+            long_context_after: 0,
             routing,
             arch: arch.clone(),
         };
@@ -318,19 +336,47 @@ impl Config {
                     }
                 }
             }
-            "gemma3" => {
+            "gemma2" => {
                 config.activation = Activation::Gelu;
                 config.embedding_scale = (n_embd as f32).sqrt();
-                config.logit_softcap = meta.f32("final_logit_softcapping").unwrap_or(0.0);
-                // The largest Gemma 3 scales attention by its nominal head
-                // width, which differs from the stored key width.
-                if n_layer == 62 {
+                config.logit_softcap = meta.f32("final_logit_softcapping").unwrap_or(30.0);
+                config.attention_softcap = meta.f32("attn_logit_softcapping").unwrap_or(50.0);
+                // Every other layer looks back over a window, by default
+                // 4096 positions.
+                let window = if window > 0 { window } else { 4096 };
+                for (layer, local) in config
+                    .layers
+                    .iter_mut()
+                    .zip(meta.window_pattern(n_layer, 2))
+                {
+                    if local {
+                        make_local(layer);
+                        layer.window = window;
+                        layer.rope_scale = rope_scale;
+                    }
+                }
+                // The largest Gemma 2 scales attention by its nominal head
+                // width, which differs from the stored key width, in every
+                // layer. So this comes after the windowed layers are set.
+                if n_layer == 46 {
                     let scale = 1.0 / ((n_embd / n_head[0]) as f32).sqrt();
                     config
                         .layers
                         .iter_mut()
                         .for_each(|layer| layer.attention_scale = scale);
                 }
+            }
+            // Phi-3 rotates halves. Its long-context versions bring two sets
+            // of rotary divisors, chosen by the length of the session.
+            "phi3" => {
+                config.long_context_after = meta
+                    .usize("rope.scaling.original_context_length")
+                    .unwrap_or(n_ctx_train);
+            }
+            "gemma3" => {
+                config.activation = Activation::Gelu;
+                config.embedding_scale = (n_embd as f32).sqrt();
+                config.logit_softcap = meta.f32("final_logit_softcapping").unwrap_or(0.0);
                 if window > 0 {
                     for (layer, local) in config
                         .layers
@@ -341,6 +387,16 @@ impl Config {
                             make_local(layer);
                         }
                     }
+                }
+                // The largest Gemma 3 scales attention by its nominal head
+                // width, which differs from the stored key width, in every
+                // layer. So this comes after the windowed layers are set.
+                if n_layer == 62 {
+                    let scale = 1.0 / ((n_embd / n_head[0]) as f32).sqrt();
+                    config
+                        .layers
+                        .iter_mut()
+                        .for_each(|layer| layer.attention_scale = scale);
                 }
             }
             "gemma4" => {
@@ -704,6 +760,30 @@ mod tests {
             let local = index % 6 != 5;
             assert_eq!(layer.window, if local { 512 } else { 0 });
             assert_eq!(layer.rope_base, if local { 10000.0 } else { 1e6 });
+        }
+    }
+
+    #[test]
+    fn the_largest_gemmas_scale_every_layer_alike() {
+        for (arch, n_layer) in [("gemma3", 62), ("gemma2", 46)] {
+            let mut builder = Builder::new();
+            builder
+                .string("general.architecture", arch)
+                .u32(&format!("{arch}.context_length"), 2048)
+                .u32(&format!("{arch}.embedding_length"), 96)
+                .u32(&format!("{arch}.block_count"), n_layer)
+                .u32(&format!("{arch}.attention.head_count"), 4)
+                .u32(&format!("{arch}.attention.head_count_kv"), 2)
+                .u32(&format!("{arch}.attention.key_length"), 32)
+                .u32(&format!("{arch}.attention.sliding_window"), 64);
+            let c = config(&builder).unwrap();
+            // The nominal head width is 96 / 4 = 24, not the stored 32.
+            let scale = 1.0 / 24f32.sqrt();
+            assert!(
+                c.layers.iter().all(|layer| layer.attention_scale == scale),
+                "{arch}"
+            );
+            assert!(c.layers.iter().any(|layer| layer.window > 0), "{arch}");
         }
     }
 

@@ -179,6 +179,9 @@ pub struct Weights {
     pub output_norm: Vec<f32>,
     /// Per-frequency divisors for rotary angles, when the model has them.
     pub rope_factors: Option<Vec<f32>>,
+    /// The divisors a LongRoPE model uses past its original context. Its
+    /// short ones are in `rope_factors`.
+    pub rope_factors_long: Option<Vec<f32>>,
     pub layers: Vec<Layer>,
     pub per_layer_inputs: Option<PerLayerInputs>,
 }
@@ -221,6 +224,17 @@ impl Weights {
             }
             _ => None,
         };
+        // LongRoPE (Phi-3) stores short and long divisors under other names.
+        let rotated = config
+            .layers
+            .iter()
+            .find(|layer| layer.mixer == Mixer::Attention)
+            .map_or(0, |layer| layer.rope_dims / 2);
+        let rope_factors = match rope_factors {
+            Some(factors) => Some(factors),
+            None => optional_vector(file, "rope_factors_short.weight", rotated)?,
+        };
+        let rope_factors_long = optional_vector(file, "rope_factors_long.weight", rotated)?;
 
         let per_layer = config.per_layer_embd;
         let per_layer_inputs = if per_layer > 0 {
@@ -380,6 +394,7 @@ impl Weights {
             output,
             output_norm,
             rope_factors,
+            rope_factors_long,
             layers,
             per_layer_inputs,
         })
@@ -400,6 +415,7 @@ impl Weights {
             },
             output_norm: Vec::new(),
             rope_factors: None,
+            rope_factors_long: None,
             layers: Vec::new(),
             per_layer_inputs: None,
         }
