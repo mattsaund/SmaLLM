@@ -158,7 +158,8 @@ SmaLLM/
 ├── docs/
 │   ├── ARCHITECTURE.md      how the engine works and why
 │   ├── CONTRIBUTING.md      this page
-│   └── DEVELOPMENT.md       running and measuring on single-board computers
+│   ├── DEVELOPMENT.md       running and measuring on single-board computers
+│   └── PARITY.md            where SmaLLM stands against llama.cpp and Ollama
 ├── install.sh, install.ps1  the one-line installers
 ├── .cargo/config.toml       static C runtime for Windows builds
 └── .github/workflows/       CI and releases

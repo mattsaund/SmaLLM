@@ -318,7 +318,8 @@ static, with the header and the Python binding.
 
 Features llama.cpp, Ollama or other engines have and SmaLLM lacks. Heavy
 items are planned as optional parts of the build, so the default binary
-stays small.
+stays small. [docs/PARITY.md](docs/PARITY.md) compares the three engines
+area by area, with measurements.
 
 **Hardware**
 
