@@ -4,18 +4,24 @@
 The IQ weight formats store groups of four or eight weights as an index
 into a grid of allowed patterns. ggml keeps those grids in
 ggml/src/ggml-common.h, one 64-bit or 32-bit word per pattern, a byte per
-weight. That is 33 KB of tables. Every byte in a grid is one of a few
-levels, though: three for the IQ2 and IQ1 grids, eight for the IQ3 grids.
-So this writes each pattern as a 16-bit code instead, with 2 or 3 bits per
-weight that select a level. The tables shrink to 9 KB.
+weight.
 
-The script checks the facts the decoders in src/tensor/quant.rs rely on
-instead of tables: the sign bytes of the IQ2 and IQ3 formats and the bit
-masks that test them. It fails if a newer ggml changes them.
+The grids of eight weights are 30 KB as ggml stores them. Every byte in
+them is one of three levels, though, so this writes each pattern as a
+16-bit code instead: 2 bits per weight that select a level. Those grids
+shrink to 7.5 KB. The decoders in src/tensor/quant.rs expand a code four
+weights at a time, through a table they build from the levels.
 
-For each grid it also writes a hash of ggml's original table. A test
-unpacks every code the way the decoders do and checks that it gets the
-same bytes back.
+The grids of four weights stay as ggml stores them. They are 3 KB, and a
+packed form would save only half of that.
+
+The script also checks the facts the decoders rely on instead of tables:
+the sign bytes of the IQ2 and IQ3 formats and the bit masks that test
+them. It fails if a newer ggml changes them.
+
+For each grid it writes a hash of ggml's original table. A test expands
+every entry the way the decoders do and checks that it gets the same
+bytes back.
 
 Usage:
     python3 tools/gen_iq_tables.py path/to/llama.cpp > src/tensor/iq_tables.rs
@@ -25,42 +31,29 @@ import re
 import sys
 from pathlib import Path
 
-# The grids, with the name ggml gives each one and the bytes in one entry.
+# The grids: the name here, the name ggml gives it, the weights in one
+# entry, and what it is for.
 GRIDS = [
-    ("IQ2XXS", "iq2xxs_grid", 8),
-    ("IQ2XS", "iq2xs_grid", 8),
-    ("IQ2S", "iq2s_grid", 8),
-    ("IQ3XXS", "iq3xxs_grid", 4),
-    ("IQ3S", "iq3s_grid", 4),
-    ("IQ1S", "iq1s_grid", 8),
+    ("IQ2XXS", "iq2xxs_grid", 8, "The IQ2_XXS grid: 256 patterns of eight weights."),
+    ("IQ2XS", "iq2xs_grid", 8, "The IQ2_XS grid: 512 patterns of eight weights."),
+    ("IQ2S", "iq2s_grid", 8, "The IQ2_S grid: 1024 patterns of eight weights."),
+    ("IQ3XXS", "iq3xxs_grid", 4, "The IQ3_XXS grid: 256 patterns of four weights."),
+    ("IQ3S", "iq3s_grid", 4, "The IQ3_S grid: 512 patterns of four weights."),
+    ("IQ1S", "iq1s_grid", 8, "The IQ1_S and IQ1_M grid: 2048 patterns of eight weights."),
 ]
 
-# Which grids share one list of levels, and the name of that list.
+# The levels of the packed grids. Grids that share levels share a list.
 LEVELS = {
     "IQ2XXS": "IQ2",
     "IQ2XS": "IQ2",
     "IQ2S": "IQ2",
-    "IQ3XXS": "IQ3XXS",
-    "IQ3S": "IQ3S",
     "IQ1S": "IQ1S",
 }
 
 # What each list of levels is for, for its comment.
 LEVEL_NOTES = {
     "IQ2": "The magnitudes in the IQ2_XXS, IQ2_XS and IQ2_S grids.",
-    "IQ3XXS": "The magnitudes in the IQ3_XXS grid.",
-    "IQ3S": "The magnitudes in the IQ3_S grid.",
     "IQ1S": "The values in the IQ1_S and IQ1_M grid.",
-}
-
-# What each grid is for, for its comment.
-GRID_NOTES = {
-    "IQ2XXS": "The IQ2_XXS grid: 256 patterns of eight weights.",
-    "IQ2XS": "The IQ2_XS grid: 512 patterns of eight weights.",
-    "IQ2S": "The IQ2_S grid: 1024 patterns of eight weights.",
-    "IQ3XXS": "The IQ3_XXS grid: 256 patterns of four weights.",
-    "IQ3S": "The IQ3_S grid: 512 patterns of four weights.",
-    "IQ1S": "The IQ1_S and IQ1_M grid: 2048 patterns of eight weights.",
 }
 
 
@@ -106,26 +99,24 @@ def check_signs(source):
         sys.exit("kmask_iq2xs is no longer one bit per weight")
 
 
-def pack(name, entries, width):
-    """Packs a grid into codes. Returns the levels, bits per weight and codes."""
-    values = [entry_values(entry, width) for entry in entries]
+def pack(name, entries):
+    """Packs a grid of eight weights into 16-bit codes, 2 bits per weight.
+    Returns the levels, padded to four, and the codes."""
+    values = [entry_values(entry, 8) for entry in entries]
     levels = sorted({value for row in values for value in row})
-    bits = 2 if len(levels) <= 4 else 3
-    if len(levels) > 8 or width * bits > 16:
-        sys.exit(f"{name}: {len(levels)} levels do not fit a 16-bit code")
+    if len(levels) > 4:
+        sys.exit(f"{name}: {len(levels)} levels do not fit in 2 bits")
     codes = []
     for row in values:
         code = 0
         for j, value in enumerate(row):
-            code |= levels.index(value) << (bits * j)
+            code |= levels.index(value) << (2 * j)
         codes.append(code)
     # Unpack every code again, as the decoders do, before trusting it.
     for code, row in zip(codes, values):
-        unpacked = [levels[(code >> (bits * j)) & ((1 << bits) - 1)] for j in range(width)]
-        if unpacked != row:
+        if [levels[(code >> (2 * j)) & 3] for j in range(8)] != row:
             sys.exit(f"{name}: a code does not unpack to its entry")
-    padded = levels + [0] * ((1 << bits) - len(levels))
-    return padded, bits, codes
+    return levels + [0] * (4 - len(levels)), codes
 
 
 def rust_list(numbers, per_line, form):
@@ -149,29 +140,37 @@ def main():
     print("//! Generated by tools/gen_iq_tables.py from ggml/src/ggml-common.h in")
     print("//! llama.cpp. Do not edit by hand.")
     print("//!")
-    print("//! ggml stores a grid entry as one byte per weight. Here an entry is a")
-    print("//! 16-bit code instead: 2 or 3 bits per weight, first weight lowest,")
-    print("//! each selecting one of the grid's levels. Entry `k` of a grid here")
-    print("//! unpacks to the bytes of entry `k` in ggml's grid.")
+    print("//! ggml stores a grid entry as one byte per weight. The grids of eight")
+    print("//! weights are packed here: an entry is a 16-bit code, 2 bits per weight,")
+    print("//! first weight lowest, each selecting one of the grid's levels. Entry")
+    print("//! `k` of a grid here unpacks to the bytes of entry `k` in ggml's grid.")
+    print("//! The grids of four weights keep ggml's form.")
     print()
 
     written_levels = set()
     hashes = []
-    for name, ggml_name, width in GRIDS:
+    for name, ggml_name, width, note in GRIDS:
         entries = table(source, ggml_name)
-        levels, bits, codes = pack(name, entries, width)
-        group = LEVELS[name]
-        if group not in written_levels:
-            written_levels.add(group)
-            print(f"/// {LEVEL_NOTES[group]} {bits} bits select one.")
-            items = ", ".join(str(level) for level in levels)
-            print(f"pub(crate) const {group}_LEVELS: [i8; {len(levels)}] = [{items}];")
-            print()
-        print(f"/// {GRID_NOTES[name]}")
-        print(f"/// Each code holds {width} indices into [`{group}_LEVELS`], {bits} bits each.")
-        print("#[rustfmt::skip]")
-        print(f"pub(crate) static {name}_GRID: [u16; {len(codes)}] = [")
-        print(rust_list(codes, 12, lambda code: f"0x{code:04x}"))
+        if width == 8:
+            levels, codes = pack(name, entries)
+            group = LEVELS[name]
+            if group not in written_levels:
+                written_levels.add(group)
+                print(f"/// {LEVEL_NOTES[group]} 2 bits select one.")
+                items = ", ".join(str(level) for level in levels)
+                print(f"pub(crate) const {group}_LEVELS: [i8; 4] = [{items}];")
+                print()
+            print(f"/// {note}")
+            print(f"/// Each code holds 8 indices into [`{group}_LEVELS`], 2 bits each.")
+            print("#[rustfmt::skip]")
+            print(f"pub(crate) static {name}_GRID: [u16; {len(codes)}] = [")
+            print(rust_list(codes, 12, lambda code: f"0x{code:04x}"))
+        else:
+            print(f"/// {note}")
+            print("/// Each word holds the four magnitudes, first weight lowest.")
+            print("#[rustfmt::skip]")
+            print(f"pub(crate) static {name}_GRID: [u32; {len(entries)}] = [")
+            print(rust_list(entries, 8, lambda entry: f"0x{entry:08x}"))
         print("];")
         print()
         original = [byte for entry in entries for byte in entry.to_bytes(width, "little")]
@@ -188,7 +187,7 @@ def main():
     print()
 
     print("/// The 64-bit FNV-1a hash of each grid as ggml stores it, entry after")
-    print("/// entry, its bytes in memory order. A test checks the codes against it.")
+    print("/// entry, its bytes in memory order. A test checks the grids against it.")
     print("#[cfg(test)]")
     print(f"pub(crate) const GRID_HASHES: [(&str, u64); {len(hashes)}] = [")
     for name, hash_value in hashes:
