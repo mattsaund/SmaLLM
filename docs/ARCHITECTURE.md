@@ -75,6 +75,13 @@ test checks every scanner against its expression on thousands of texts.
 Gemma 4 has a family of its own: it splits only at newlines and merges raw
 UTF-8 bytes with spaces written as `▁`.
 
+Embedding models bring two more kinds. WordPiece (BERT) cleans the text,
+lowercasing it and stripping accents with tables taken from llama.cpp, cuts
+it into words, and covers each word from the left with the longest tokens
+that fit. Unigram (T5, XLM-RoBERTa) first rewrites the text with the map of
+replacements the model carries, then picks, of all the ways to cover the
+text with tokens, the one whose token scores add up highest.
+
 Control tokens such as `<|im_end|>` are only recognized in text the engine
 trusts. A chat is rendered as a list of parts, markup and message text
 apart, and only markup is searched for control tokens. Somebody typing
@@ -128,6 +135,23 @@ batch while their state stays in its cache. The projections around it read
 the batch at once, like every other multiply. `model/forward/mamba.rs` has
 the details.
 
+A few architectures change the block a little. Switches cover them, not
+code of their own:
+
+- Gemma 2 caps attention scores, `cap * tanh(score / cap)`. gpt-oss gives
+  each head a learned score, a sink, that joins the softmax with no value
+  behind it, so a head can attend to nothing.
+- Phi-2 normalizes with LayerNorm and biases, and runs attention and an
+  ungated network, `down(act(up(h)))`, side by side on the same input.
+- gpt-oss gives its experts biases and OpenAI's SwiGLU, which clamps the
+  gate and the up projection.
+
+Rotation is plain, linearly scaled, or stretched for long contexts in one
+of two ways. LongRoPE (Phi-3) divides each frequency by a factor from the
+file, from a short set or a long one by the length of the context. YaRN
+(gpt-oss, DeepSeek) scales the low frequencies, keeps the high ones, blends
+the two along a ramp in between, and scales the rotated values up a little.
+
 `model/config.rs` turns the architecture name and its metadata into a few
 model-wide switches (how positions are rotated, the activation, embedding
 and logit scaling) and one `LayerSpec` per block. A layer's spec says how it
@@ -143,6 +167,13 @@ are summed with the router's weights. The tokens of a batch are sorted by
 expert, so each expert multiplies all of its tokens at once, and every
 expert in use runs in the same multiply. A generated token wakes the
 threads twice per layer, whatever the number of experts it uses.
+
+Embedding and reranking models (BERT, nomic-bert) run on the same matrix
+engine through `model/encoder.rs`. They read a whole text at once, with
+attention that looks both ways, and put out one vector for the text instead
+of a next token: the mean of all positions, or the first or last one. A
+reranker reads a query and a document together and scores the pair with a
+small classifier on that vector.
 
 Three choices keep it fast:
 
@@ -183,6 +214,13 @@ weight[i] = scale[i / 16] * q[i] + offset[i / 16]
 weights. The `q` part becomes the integer dot product. The offset part needs
 only the sum of each 16 activations, which is computed once when the vector
 is quantized.
+
+The i-quants (IQ1 to IQ3) store indices into grids of eight or four values
+each, which `tensor/iq_tables.rs` holds, generated from ggml's source. Their
+grid values become `q`. The ternary formats store -1, 0 and 1, and MXFP4
+stores 4-bit floats with a power-of-two scale for every 32 weights. They all
+fit the same shape. `tests/quant.rs` checks every format against ggml's own
+expansion, number for number.
 
 `tensor/quant.rs` is the single description of each format's bit layout, as
 plain scalar code. The kernels for the common formats are written again
@@ -277,12 +315,12 @@ every layer's state each 256 positions. A short rollback costs nothing. A
 longer one restores the last saved state before the cut and reads the
 tokens after it again.
 
-A Mamba block costs nothing per position either. Its state takes from a
-few hundred kilobytes to a few megabytes, the same at any length, and it
-cannot be taken apart again. So `model/recurrent.rs` saves a copy at the end of each prompt and
-keeps the last three. A chat's next prompt repeats the conversation, so the
-session goes back to the copy after the last prompt and reads the reply
-again as one batch.
+A recurrent block (Mamba, RWKV) folds each token into a state of fixed
+size, a matrix per head, so it needs no cache that grows. A state cannot be
+taken apart again, though. `model/recurrent.rs` saves every block's state at
+the end of each prompt and keeps the last three. Going back into a reply
+restores the state after the prompt before it, and the reply is read again
+as one batch, which is quick.
 
 When the window is full, the session drops the oldest tokens after a kept
 start: the first token, or the conversation's opening. The tokens after the
@@ -334,6 +372,11 @@ The loop in `generate.rs` does the bookkeeping around it:
   stop string is not shown until it is clear that it is not one.
 - **It trims long chats.** When a conversation outgrows the window, the
   oldest turns are left out and the system message is kept.
+- **It keeps reasoning apart.** Thinking models write their reasoning
+  between `<think>` tags or, in OpenAI's Harmony format, on a channel other
+  than the final one. A small state machine follows those markers, so the
+  reasoning can be shown faint, sent as its own field, or left out, and the
+  markers never reach the output.
 
 Chat formats are recognized from the template text in the model file and
 written out by hand. Running the template itself would take an interpreter

@@ -58,6 +58,10 @@ pub struct AttentionWeights {
     /// One gate per head on the attention output, when the model has it:
     /// each head's output is scaled by the sigmoid of its gate.
     pub gate: Option<Linear>,
+    /// One learned score per head that joins every softmax as if it were
+    /// another position with no value (gpt-oss). It lets a head attend to
+    /// nothing.
+    pub sinks: Option<Vec<f32>>,
     pub out: Linear,
 }
 
@@ -176,15 +180,25 @@ pub struct Experts {
     pub gate: ExpertMatrix,
     pub up: ExpertMatrix,
     pub down: ExpertMatrix,
+    /// Each expert's biases on its gate, up and down projections (gpt-oss):
+    /// one row per expert. They stay in the file until a row is used.
+    pub biases: Option<[Matrix; 3]>,
     /// A network that every token goes through as well (Qwen2 MoE), with
     /// an optional gate: one score per token, through a sigmoid.
     pub shared: Option<(Dense, Option<Linear>)>,
+}
+
+/// An ungated feed-forward network: `down(act(up(x)))`.
+pub struct Plain {
+    pub up: Linear,
+    pub down: Linear,
 }
 
 /// The feed-forward part of a block.
 pub enum FeedForward {
     Dense(Box<Dense>),
     Experts(Box<Experts>),
+    Plain(Box<Plain>),
     /// No feed-forward network: the block is its mixer alone (Mamba).
     None,
 }
@@ -192,9 +206,12 @@ pub enum FeedForward {
 /// The weights of one block.
 pub struct Layer {
     pub attn_norm: Vec<f32>,
+    /// The bias of a LayerNorm (Phi-2).
+    pub attn_norm_bias: Option<Vec<f32>>,
     pub mixer: MixerWeights,
     /// Normalization of the mixer's output, when the model has it.
     pub attn_post_norm: Option<Vec<f32>>,
+    /// Empty when attention and the feed-forward network share one norm.
     pub ffn_norm: Vec<f32>,
     pub ffn: FeedForward,
     /// Normalization of the feed-forward output, when the model has it.
@@ -222,6 +239,8 @@ pub struct Weights {
     /// model ties them.
     pub output: Linear,
     pub output_norm: Vec<f32>,
+    /// The bias of a final LayerNorm (Phi-2).
+    pub output_norm_bias: Option<Vec<f32>>,
     /// Per-frequency divisors for rotary angles, when the model has them.
     pub rope_factors: Option<Vec<f32>>,
     /// The divisors a LongRoPE model uses past its original context. Its
@@ -252,6 +271,11 @@ impl Weights {
         let output_norm = match file.tensor("output_norm.weight") {
             Some(_) => vector(file, "output_norm.weight", d)?,
             None => vector(file, "token_embd_norm.weight", d)?,
+        };
+        let output_norm_bias = if config.layer_norm {
+            Some(vector(file, "output_norm.bias", d)?)
+        } else {
+            None
         };
         // One table of rotary divisors serves every layer that uses one, so
         // those layers must rotate the same number of elements.
@@ -352,6 +376,7 @@ impl Weights {
                             Some(_) => Some(layer_whole("attn_gate", spec.n_head, d)?),
                             None => None,
                         },
+                        sinks: optional_vector(file, &name("attn_sinks.weight"), spec.n_head)?,
                         out: layer_whole("attn_output", d, q_dim)?,
                     })
                 }
@@ -414,7 +439,14 @@ impl Weights {
                                 ))
                             })?;
                     }
-                    FeedForward::Dense(Box::new(dense(file, &name("ffn"), "", d, spec.n_ff)?))
+                    if config.ungated {
+                        FeedForward::Plain(Box::new(Plain {
+                            up: layer_whole("ffn_up", spec.n_ff, d)?,
+                            down: layer_whole("ffn_down", d, spec.n_ff)?,
+                        }))
+                    } else {
+                        FeedForward::Dense(Box::new(dense(file, &name("ffn"), "", d, spec.n_ff)?))
+                    }
                 }
             };
 
@@ -428,15 +460,30 @@ impl Weights {
                 None
             };
 
+            // gpt-oss names its feed-forward norm "post_attention_norm",
+            // which elsewhere normalizes the attention output.
+            // Blocks that run both halves on one norm (Phi-2), and Mamba
+            // blocks without a feed-forward network, have no norm of it.
+            let (attn_post_norm, ffn_norm) = if config.arch == "gpt-oss" {
+                (None, vector(file, &name("post_attention_norm.weight"), d)?)
+            } else if config.parallel || bare {
+                (None, Vec::new())
+            } else {
+                (
+                    optional_vector(file, &name("post_attention_norm.weight"), d)?,
+                    vector(file, &name("ffn_norm.weight"), d)?,
+                )
+            };
             layers.push(Layer {
                 attn_norm: vector(file, &name("attn_norm.weight"), d)?,
-                mixer,
-                attn_post_norm: optional_vector(file, &name("post_attention_norm.weight"), d)?,
-                ffn_norm: if bare {
-                    Vec::new()
+                attn_norm_bias: if config.layer_norm {
+                    Some(vector(file, &name("attn_norm.bias"), d)?)
                 } else {
-                    vector(file, &name("ffn_norm.weight"), d)?
+                    None
                 },
+                mixer,
+                attn_post_norm,
+                ffn_norm,
                 ffn,
                 ffn_post_norm: optional_vector(file, &name("post_ffw_norm.weight"), d)?,
                 per_layer: per_layer_weights,
@@ -448,6 +495,7 @@ impl Weights {
             token_embd,
             output,
             output_norm,
+            output_norm_bias,
             rope_factors,
             rope_factors_long,
             layers,
@@ -469,6 +517,7 @@ impl Weights {
                 bias: None,
             },
             output_norm: Vec::new(),
+            output_norm_bias: None,
             rope_factors: None,
             rope_factors_long: None,
             layers: Vec::new(),
@@ -544,11 +593,22 @@ fn experts(file: &Gguf, index: usize, d: usize, count: usize) -> Result<Experts>
         }
         None => None,
     };
+    let biases = if file.tensor(&name("ffn_down_exps.bias")).is_some() {
+        Some([
+            matrix(file, &name("ffn_gate_exps.bias"), count, n_ff)?,
+            matrix(file, &name("ffn_up_exps.bias"), count, n_ff)?,
+            matrix(file, &name("ffn_down_exps.bias"), count, d)?,
+        ])
+    } else {
+        None
+    };
     Ok(Experts {
+        // The router's bias, when it has one, is added to every score.
         router: whole(file, &name("ffn_gate_inp"), count, d)?,
         choice_bias: optional_vector(file, &name("exp_probs_b.bias"), count)?,
         gate,
         up,
+        biases,
         down: ExpertMatrix {
             matrix: stacked(file, &name("ffn_down_exps.weight"), count, d, n_ff)?,
             rows: d,

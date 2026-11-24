@@ -5,6 +5,7 @@
 //! packed into a fixed number of bytes with one or more shared scales.
 
 pub mod f16;
+mod iq_tables;
 pub mod quant;
 
 /// The element types this engine can compute with.
@@ -38,6 +39,36 @@ pub enum TensorType {
     Q6K,
     /// 4 bits per weight through a non-linear table, one scale per 32.
     Iq4Nl,
+    /// The IQ4_NL table in 256-weight super-blocks with 6-bit scales, 4.25
+    /// bits per weight.
+    Iq4Xs,
+    /// Four weights at a time from a grid of 512 patterns, 3.44 bits per
+    /// weight.
+    Iq3S,
+    /// Four weights at a time from a grid of 256 patterns, 3.06 bits per
+    /// weight.
+    Iq3Xxs,
+    /// Eight weights at a time from a grid of 1024 patterns, 2.56 bits per
+    /// weight.
+    Iq2S,
+    /// Eight weights at a time from a grid of 512 patterns, 2.31 bits per
+    /// weight.
+    Iq2Xs,
+    /// Eight weights at a time from a grid of 256 patterns, 2.06 bits per
+    /// weight.
+    Iq2Xxs,
+    /// Eight weights at a time from a grid of 2048 patterns, with a scale
+    /// per 16 weights, 1.75 bits per weight.
+    Iq1M,
+    /// Eight weights at a time from a grid of 2048 patterns, with a scale
+    /// per 32 weights, 1.56 bits per weight.
+    Iq1S,
+    /// Weights of -1, 0 or 1, two bits each, one scale per 256.
+    Tq2_0,
+    /// Weights of -1, 0 or 1, five to a byte, one scale per 256.
+    Tq1_0,
+    /// 4-bit floats with a power of two shared by 32 of them.
+    Mxfp4,
 }
 
 /// How a type's blocks group, which decides how activations are quantized
@@ -68,8 +99,19 @@ impl TensorType {
             12 => TensorType::Q4K,
             13 => TensorType::Q5K,
             14 => TensorType::Q6K,
+            16 => TensorType::Iq2Xxs,
+            17 => TensorType::Iq2Xs,
+            18 => TensorType::Iq3Xxs,
+            19 => TensorType::Iq1S,
             20 => TensorType::Iq4Nl,
+            21 => TensorType::Iq3S,
+            22 => TensorType::Iq2S,
+            23 => TensorType::Iq4Xs,
+            29 => TensorType::Iq1M,
             30 => TensorType::BF16,
+            34 => TensorType::Tq1_0,
+            35 => TensorType::Tq2_0,
+            39 => TensorType::Mxfp4,
             _ => return None,
         })
     }
@@ -91,6 +133,17 @@ impl TensorType {
             TensorType::Q5K => "Q5_K",
             TensorType::Q6K => "Q6_K",
             TensorType::Iq4Nl => "IQ4_NL",
+            TensorType::Iq4Xs => "IQ4_XS",
+            TensorType::Iq3S => "IQ3_S",
+            TensorType::Iq3Xxs => "IQ3_XXS",
+            TensorType::Iq2S => "IQ2_S",
+            TensorType::Iq2Xs => "IQ2_XS",
+            TensorType::Iq2Xxs => "IQ2_XXS",
+            TensorType::Iq1M => "IQ1_M",
+            TensorType::Iq1S => "IQ1_S",
+            TensorType::Tq2_0 => "TQ2_0",
+            TensorType::Tq1_0 => "TQ1_0",
+            TensorType::Mxfp4 => "MXFP4",
         }
     }
 
@@ -118,6 +171,16 @@ impl TensorType {
             TensorType::Q4K => 144,
             TensorType::Q5K => 176,
             TensorType::Q6K => 210,
+            TensorType::Iq4Xs => 136,
+            TensorType::Iq3S => 110,
+            TensorType::Iq3Xxs => 98,
+            TensorType::Iq2S => 82,
+            TensorType::Iq2Xs => 74,
+            TensorType::Iq2Xxs | TensorType::Tq2_0 => 66,
+            TensorType::Iq1M => 56,
+            TensorType::Iq1S => 50,
+            TensorType::Tq1_0 => 54,
+            TensorType::Mxfp4 => 17,
         }
     }
 
@@ -130,12 +193,23 @@ impl TensorType {
             | TensorType::Q5_0
             | TensorType::Q5_1
             | TensorType::Q8_0
-            | TensorType::Iq4Nl => Family::Block32,
+            | TensorType::Iq4Nl
+            | TensorType::Mxfp4 => Family::Block32,
             TensorType::Q2K
             | TensorType::Q3K
             | TensorType::Q4K
             | TensorType::Q5K
-            | TensorType::Q6K => Family::Block256,
+            | TensorType::Q6K
+            | TensorType::Iq4Xs
+            | TensorType::Iq3S
+            | TensorType::Iq3Xxs
+            | TensorType::Iq2S
+            | TensorType::Iq2Xs
+            | TensorType::Iq2Xxs
+            | TensorType::Iq1M
+            | TensorType::Iq1S
+            | TensorType::Tq2_0
+            | TensorType::Tq1_0 => Family::Block256,
         }
     }
 
@@ -159,22 +233,11 @@ pub fn type_name(id: u32) -> &'static str {
     match id {
         9 => "Q8_1",
         15 => "Q8_K",
-        16 => "IQ2_XXS",
-        17 => "IQ2_XS",
-        18 => "IQ3_XXS",
-        19 => "IQ1_S",
-        21 => "IQ3_S",
-        22 => "IQ2_S",
-        23 => "IQ4_XS",
         24 => "I8",
         25 => "I16",
         26 => "I32",
         27 => "I64",
         28 => "F64",
-        29 => "IQ1_M",
-        34 => "TQ1_0",
-        35 => "TQ2_0",
-        39 => "MXFP4",
         40 => "NVFP4",
         _ => "unknown",
     }

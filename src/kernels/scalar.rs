@@ -610,6 +610,17 @@ scalar_row!(row_q3_k, quant::decode_q3_k, 110, 256);
 scalar_row!(row_q4_k, quant::decode_q4_k, 144, 256);
 scalar_row!(row_q5_k, quant::decode_q5_k, 176, 256);
 scalar_row!(row_q6_k, quant::decode_q6_k, 210, 256);
+scalar_row!(row_iq4_xs, quant::decode_iq4_xs, 136, 256);
+scalar_row!(row_iq3_s, quant::decode_iq3_s, 110, 256);
+scalar_row!(row_iq3_xxs, quant::decode_iq3_xxs, 98, 256);
+scalar_row!(row_iq2_s, quant::decode_iq2_s, 82, 256);
+scalar_row!(row_iq2_xs, quant::decode_iq2_xs, 74, 256);
+scalar_row!(row_iq2_xxs, quant::decode_iq2_xxs, 66, 256);
+scalar_row!(row_iq1_m, quant::decode_iq1_m, 56, 256);
+scalar_row!(row_iq1_s, quant::decode_iq1_s, 50, 256);
+scalar_row!(row_tq2_0, quant::decode_tq2_0, 66, 256);
+scalar_row!(row_tq1_0, quant::decode_tq1_0, 54, 256);
+scalar_row!(row_mxfp4, quant::decode_mxfp4, 17, 32);
 
 /// The scalar row kernel for a quantized type.
 pub(super) fn row_quant(ty: TensorType) -> DotQuant {
@@ -625,6 +636,17 @@ pub(super) fn row_quant(ty: TensorType) -> DotQuant {
         TensorType::Q4K => row_q4_k,
         TensorType::Q5K => row_q5_k,
         TensorType::Q6K => row_q6_k,
+        TensorType::Iq4Xs => row_iq4_xs,
+        TensorType::Iq3S => row_iq3_s,
+        TensorType::Iq3Xxs => row_iq3_xxs,
+        TensorType::Iq2S => row_iq2_s,
+        TensorType::Iq2Xs => row_iq2_xs,
+        TensorType::Iq2Xxs => row_iq2_xxs,
+        TensorType::Iq1M => row_iq1_m,
+        TensorType::Iq1S => row_iq1_s,
+        TensorType::Tq2_0 => row_tq2_0,
+        TensorType::Tq1_0 => row_tq1_0,
+        TensorType::Mxfp4 => row_mxfp4,
         TensorType::F32 | TensorType::F16 | TensorType::BF16 => {
             unreachable!("float types use the float row kernels")
         }
@@ -684,6 +706,17 @@ mod exact {
     exact_row!(row_q4_k, TensorType::Q4K);
     exact_row!(row_q5_k, TensorType::Q5K);
     exact_row!(row_q6_k, TensorType::Q6K);
+    exact_row!(row_iq4_xs, TensorType::Iq4Xs);
+    exact_row!(row_iq3_s, TensorType::Iq3S);
+    exact_row!(row_iq3_xxs, TensorType::Iq3Xxs);
+    exact_row!(row_iq2_s, TensorType::Iq2S);
+    exact_row!(row_iq2_xs, TensorType::Iq2Xs);
+    exact_row!(row_iq2_xxs, TensorType::Iq2Xxs);
+    exact_row!(row_iq1_m, TensorType::Iq1M);
+    exact_row!(row_iq1_s, TensorType::Iq1S);
+    exact_row!(row_tq2_0, TensorType::Tq2_0);
+    exact_row!(row_tq1_0, TensorType::Tq1_0);
+    exact_row!(row_mxfp4, TensorType::Mxfp4);
 
     pub fn row_quant(ty: TensorType) -> DotQuant {
         match ty {
@@ -698,6 +731,17 @@ mod exact {
             TensorType::Q4K => row_q4_k,
             TensorType::Q5K => row_q5_k,
             TensorType::Q6K => row_q6_k,
+            TensorType::Iq4Xs => row_iq4_xs,
+            TensorType::Iq3S => row_iq3_s,
+            TensorType::Iq3Xxs => row_iq3_xxs,
+            TensorType::Iq2S => row_iq2_s,
+            TensorType::Iq2Xs => row_iq2_xs,
+            TensorType::Iq2Xxs => row_iq2_xxs,
+            TensorType::Iq1M => row_iq1_m,
+            TensorType::Iq1S => row_iq1_s,
+            TensorType::Tq2_0 => row_tq2_0,
+            TensorType::Tq1_0 => row_tq1_0,
+            TensorType::Mxfp4 => row_mxfp4,
             TensorType::F32 | TensorType::F16 | TensorType::BF16 => {
                 unreachable!("float types use the float row kernels")
             }
