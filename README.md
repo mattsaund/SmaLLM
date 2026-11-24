@@ -205,7 +205,7 @@ llama.cpp b11846 on an Intel Core i7-14700K with a 4,096-token context.
 The program (chat, server, downloader) is 0.82 to 1.26 MB depending on the
 platform. The engine as a shared library is 0.58 to 0.86 MB. llama.cpp
 b11846's CPU-only libraries total 7.7 MB on the same machine. llama.cpp has
-features SmaLLM lacks, listed under [To do](#to-do).
+features SmaLLM lacks, listed in [docs/TODO.md](docs/TODO.md).
 
 Release builds compile the standard library for size (`-Z build-std` with
 `optimize_for_size`), which saves about 20 percent. A source build with
@@ -289,91 +289,11 @@ static, with the header and the Python binding.
 [capi/README.md](capi/README.md) covers the C API, and
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) how the engine works.
 
-## Project status
+## Status
 
-- [x] GGUF loading by memory map, with every read bounds-checked
-- [x] Twenty-five architectures, including mixtures of experts, hybrids, and the state-space and RWKV families
-- [x] Twenty-five weight formats, float, quantized, i-quants, ternary and MXFP4, each expanding exactly as in ggml
-- [x] Kernels for AVX2, AVX-VNNI, NEON and the ARM dot product extension
-- [x] Prompt reading in packed tiles
-- [x] Anonymous memory in megabytes, with weights read in place from the mapped file
-- [x] SentencePiece and byte-level BPE tokenizers for every word splitting family llama.cpp knows, RWKV's, and
-      the encoder tokenizers WordPiece and Unigram, matching it token for token on its test texts
-- [x] Fifteen chat formats, recognized from the model file
-- [x] Embedding and reranking models, from the command line and the server
-- [x] Reasoning output separated from the answer in the chat, in pipes and in the server
-- [x] A context window that slides or keeps its start when it fills, chosen with `--overflow`
-- [x] One settings file for everything, with a reset to the defaults
-- [x] A context window with no built-in limit, tested at 262,144 tokens
-- [x] Chat, one-shot answers, model downloads and benchmarks from one program
-- [x] An OpenAI-compatible server with streaming
-- [x] A C API as a shared and a static library, and a Python binding
-- [x] One-line installers that bring what SmaLLM needs, a full uninstall, and static Linux binaries for x86-64,
-      ARM64, ARMv7 and RISC-V
-- [x] CI on Linux, macOS and Windows, on x86-64 and ARM, with ARMv7 and RISC-V under emulation
-- [ ] Speed and memory measured on ARM boards
-- [x] Tagged releases, the latest 0.3.0
-
-## To do
-
-Features llama.cpp, Ollama or other engines have and SmaLLM lacks. Heavy
-items are planned as optional parts of the build, so the default binary
-stays small. [docs/PARITY.md](docs/PARITY.md) compares the three engines
-area by area, with measurements.
-
-**Hardware**
-
-- [ ] GPUs, through Vulkan compute. It is the one API that reaches AMD, Intel and NVIDIA cards and the ARM GPUs in
-      phones and boards, so one backend covers them. The engine runs on the CPU only today.
-- [ ] Apple GPUs through Metal, and NVIDIA through CUDA, where they outperform Vulkan.
-- [ ] NPUs. Every vendor has its own toolkit (Rockchip RKNN, Qualcomm QNN, Intel OpenVINO, Apple Core ML), so each
-      one is a backend of its own. None exists yet.
-- [ ] TPUs. Google's Coral Edge TPU cannot hold a language model: it runs small, fully 8-bit TensorFlow Lite graphs
-      and keeps about 8 MB of weights. Support waits for hardware that can.
-- [ ] AVX-512 kernels, NEON kernels for 32-bit ARM, and vector kernels for RISC-V.
-- [x] A separate thread count for reading prompts, every core by default. Efficiency cores help there and not
-      in generation.
-
-**Models**
-
-- [x] Mixture-of-experts models: Mixtral, Qwen2-MoE, Qwen3-MoE, OLMoE, Granite MoE and LFM2-MoE.
-- [x] Hybrids of attention and short convolutions: LFM2, LFM2.5 and LFM3.
-- [x] More architectures: Phi, Gemma 2, the MoE models of DeepSeek and gpt-oss, and the families that are not
-      transformers (RWKV, Mamba).
-- [ ] The other hybrids and distillations: Falcon-H1, Jamba, Nemotron-H, Qwen3-Next, and RWKV's distillations of
-      Qwen (rwkv6qwen2, arwkv7).
-- [x] Encoder tokenizers (WordPiece and Unigram), which only the encoder models below use.
-- [x] Encoder models, for embeddings and reranking.
-- [ ] Images and audio as input.
-- [x] The remaining weight formats: IQ1, IQ2, IQ3, IQ4_XS, the ternary ones, and MXFP4.
-- [ ] LoRA adapters and control vectors.
-
-**Generation**
-
-- [ ] Grammar-constrained output, and JSON that follows a schema.
-- [ ] Jinja chat templates, for models whose format is not one of the fifteen built in.
-- [ ] More samplers: Mirostat, typical, DRY, XTC and dynamic temperature, and a bias on chosen tokens.
-- [ ] Token probabilities in the output.
-- [ ] Speculative decoding with a small draft model.
-- [ ] Saving a session's context to a file and loading it again.
-- [x] Sliding the context window when it fills, or keeping its start and dropping the middle.
-- [x] A half-precision key/value cache, to halve the memory of long contexts.
-
-**Server**
-
-- [ ] Several requests at once.
-- [x] Endpoints for embeddings and reranking.
-- [ ] An endpoint for code infill.
-- [ ] Tool calls.
-- [ ] The Ollama API next to the OpenAI one, and several models loaded and unloaded on demand.
-- [ ] A built-in web page, and metrics.
-
-**Tools**
-
-- [ ] Converting and quantizing models. Today the GGUF file comes from elsewhere.
-- [ ] Perplexity and the other evaluation tools.
-- [ ] Bindings beyond Python, starting with Node.js and Go.
-- [ ] A `no_std` core, for boards without an operating system.
+Version 0.3.0. [docs/TODO.md](docs/TODO.md) lists what is done and what is
+left, and [docs/PARITY.md](docs/PARITY.md) compares SmaLLM with llama.cpp
+and Ollama area by area, with measurements.
 
 ## Build from source
 

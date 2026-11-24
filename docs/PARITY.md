@@ -1,8 +1,9 @@
 # Parity with llama.cpp and Ollama
 
 Where SmaLLM stands against the engines it is measured against, area by
-area. This page tracks the work toward parity. Update it when a gap
-closes, and when the competitors move.
+area. This page tracks the work toward parity, and [TODO.md](TODO.md) turns
+its gaps into a list. Update it when a gap closes, and when the competitors
+move.
 
 State as of SmaLLM 0.3.0 (2026-11-24).
 
@@ -138,7 +139,7 @@ reranking, reasoning output, and full-context handling.
 
 ## Keeping this page current
 
-- **SmaLLM:** tick the README's To do list and change this page in the same
+- **SmaLLM:** tick [TODO.md](TODO.md) and change this page in the same
   commit when a gap closes.
 - **Speed and memory:** `smallm bench <model> -p 256 -n 64 -r 1 -t 8`
   against `ref bench <model> 256 64 8`, and
