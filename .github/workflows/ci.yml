@@ -290,7 +290,7 @@ jobs:
           cd "$RUNNER_TEMP"
           sh "$GITHUB_WORKSPACE/install.sh"
           "$SMALLM_PREFIX/smallm" version
-          sh "$GITHUB_WORKSPACE/install.sh" --uninstall
+          sh "$GITHUB_WORKSPACE/install.sh" --uninstall --yes
           test ! -e "$SMALLM_PREFIX/smallm"
 
       - name: Run install.ps1, then uninstall
@@ -304,7 +304,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
           & "$env:SMALLM_PREFIX\smallm.exe" version
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          & "$env:GITHUB_WORKSPACE\install.ps1" -Uninstall
+          & "$env:GITHUB_WORKSPACE\install.ps1" -Uninstall -Yes
           if (Test-Path "$env:SMALLM_PREFIX\smallm.exe") { throw 'smallm.exe is still there' }
           exit 0
 

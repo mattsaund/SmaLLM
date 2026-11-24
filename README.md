@@ -7,10 +7,10 @@ One program of under a megabyte, which holds a few megabytes of memory
 besides the model. No dependencies, and the defaults need no changes.
 
 **Full installation size:**\
-0.67 MB Linux (x86_64), 0.57 MB Linux (arm64)\
-0.54 MB Linux (armv7), 0.47 MB Linux (riscv64)\
-0.51 MB macOS (Intel), 0.47 MB macOS (Apple silicon)\
-0.70 MB Windows (x86_64), 0.61 MB Windows (arm64)
+0.87 MB Linux (x86_64), 0.74 MB Linux (arm64)\
+0.70 MB Linux (armv7), 0.60 MB Linux (riscv64)\
+0.70 MB macOS (Intel), 0.62 MB macOS (Apple silicon)\
+0.90 MB Windows (x86_64), 0.78 MB Windows (arm64)
 
 **Memory of its own, for Llama 3.2 1B with a 4,096-token context:**\
 7.7 MB, where llama.cpp holds 627 MB. [Memory](#memory) says how it was
@@ -141,15 +141,15 @@ scratch memory. `smallm bench` prints these numbers for any model on Linux.
 
 ## Size
 
-The whole program, with chat, server and downloader, is 0.47 to 0.70 MB
-depending on the platform. The engine as a shared library is 0.29 to
-0.43 MB. For scale, the CPU-only libraries of llama.cpp b11846 total 7.7 MB
+The whole program, with chat, server and downloader, is 0.60 to 0.90 MB
+depending on the platform. The engine as a shared library is 0.37 to
+0.55 MB. For scale, the CPU-only libraries of llama.cpp b11846 total 7.7 MB
 on the same machine. llama.cpp also does far more, as the to do list below
 shows.
 
 Released binaries are built with a standard library that is compiled for
 size, which takes a third off. Building from source with stable Rust gives
-the same program at about 0.9 MB.
+the same program at about 1.2 MB.
 
 ## Context
 

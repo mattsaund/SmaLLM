@@ -37,7 +37,7 @@ pub fn main(raw: impl Iterator<Item = String>) -> Result<(), String> {
     let args = Args::parse(raw, &SPECS)?;
     let program = std::env::current_exe()
         .map_err(|error| format!("cannot find this program's file: {error}"))?;
-    let program = program.canonicalize().unwrap_or(program);
+    let program = plain_path(program.canonicalize().unwrap_or(program));
     // A program that cargo built in a source checkout belongs to the
     // checkout, and `cargo clean` removes it.
     let in_checkout = program
@@ -102,6 +102,15 @@ pub fn main(raw: impl Iterator<Item = String>) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// A path as people write it. Windows gives canonical paths a `\\?\`
+/// prefix that neither `cmd` nor the PATH setting expects.
+fn plain_path(path: PathBuf) -> PathBuf {
+    match path.to_str().and_then(|text| text.strip_prefix(r"\\?\")) {
+        Some(rest) if !rest.starts_with("UNC\\") => PathBuf::from(rest),
+        _ => path,
+    }
 }
 
 /// The downloads, and the folders they are kept in.
@@ -226,16 +235,22 @@ fn remove_program(program: &Path) -> Result<(), String> {
 }
 
 /// Deletes the program's file. Windows does not let a running program
-/// delete itself, so a separate, hidden `cmd` waits for this one to exit
-/// and deletes it then.
+/// delete itself, but it does let it be renamed. So the file is renamed
+/// out of the way at once, and a separate, hidden `cmd` waits for this
+/// program to exit and deletes it then.
 #[cfg(windows)]
 fn remove_program(program: &Path) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let renamed = program.with_extension("exe.removed");
+    let doomed = match std::fs::rename(program, &renamed) {
+        Ok(()) => renamed,
+        Err(_) => program.to_path_buf(),
+    };
     let line = format!(
         "/d /c ping -n 3 127.0.0.1 >nul & del /f /q \"{}\"",
-        program.display()
+        doomed.display()
     );
     std::process::Command::new("cmd.exe")
         .raw_arg(line)
@@ -293,6 +308,18 @@ mod tests {
         data.remove().unwrap();
         assert!(!root.join("smallm").exists());
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn windows_paths_lose_their_prefix() {
+        let plain = plain_path(PathBuf::from(r"\\?\D:\a\smallm.exe"));
+        assert_eq!(plain, PathBuf::from(r"D:\a\smallm.exe"));
+        let shared = PathBuf::from(r"\\?\UNC\server\share\smallm.exe");
+        assert_eq!(plain_path(shared.clone()), shared);
+        assert_eq!(
+            plain_path(PathBuf::from("/usr/bin/smallm")),
+            PathBuf::from("/usr/bin/smallm")
+        );
     }
 
     #[test]

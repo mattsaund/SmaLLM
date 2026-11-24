@@ -31,7 +31,7 @@ Numbers from the desktop are in the README, measured against llama.cpp
 b11846 on Llama 3.2 1B: prompt reading is about 1.1 to 1.2 times as fast,
 generation level or slightly ahead, and the engine holds 7.7 MB of its own
 memory with a 4,096-token context where llama.cpp holds 627 MB. The
-program is 0.5 to 0.7 MB.
+program is 0.60 to 0.90 MB.
 
 Version 0.2.0 (2026-11-24) added, all tested on the desktop:
 

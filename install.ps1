@@ -15,7 +15,7 @@
 #
 #   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/mattsaund/SmaLLM/main/install.ps1))) -Uninstall
 #
-# `smallm uninstall` does the same.
+# `smallm uninstall` does the same. Add -Yes to remove without being asked.
 #
 # Override anything with the environment:
 #   $env:SMALLM_REPO         git URL (default: https://github.com/mattsaund/SmaLLM.git)
@@ -36,10 +36,10 @@
 #   * It never calls exit. Piped through iex, this runs in the caller's own
 #     session, and an exit there closes the window.
 
-param([switch]$Uninstall)
+param([switch]$Uninstall, [switch]$Yes)
 
 & {
-    param([bool]$Uninstall)
+    param([bool]$Uninstall, [bool]$Yes)
     $ErrorActionPreference = 'Continue'
 
     # GitHub only speaks TLS 1.2 and up, and Windows PowerShell 5.1 on an
@@ -452,7 +452,7 @@ param([switch]$Uninstall)
             # its models, after asking.
             $knows = (Test-Path $binary) -and ((& $binary help) -join ' ') -match 'uninstall'
             if ($knows) {
-                & $binary uninstall
+                if ($Yes) { & $binary uninstall --yes } else { & $binary uninstall }
             }
             elseif (Test-Path $binary) {
                 Remove-Item -Force $binary -ErrorAction Stop
@@ -514,4 +514,4 @@ param([switch]$Uninstall)
         Clear-Bar
         Remove-Item -Recurse -Force $screen.Work -ErrorAction SilentlyContinue
     }
-} $Uninstall.IsPresent
+} $Uninstall.IsPresent $Yes.IsPresent

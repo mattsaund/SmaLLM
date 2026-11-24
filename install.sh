@@ -20,7 +20,7 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/mattsaund/SmaLLM/main/install.sh | sh -s -- --uninstall
 #
-# `smallm uninstall` does the same.
+# `smallm uninstall` does the same. Add --yes to remove without being asked.
 #
 # Override anything with the environment:
 #   SMALLM_REPO=...         git URL to clone
