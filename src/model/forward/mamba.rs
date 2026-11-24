@@ -404,27 +404,26 @@ impl Scan<'_> {
 
 /// One step of a Mamba 2 state row: `row = row * decay + b * x_dt`, and
 /// returns the new `row . c`.
+///
+/// The update and the sum are two loops. As one, the compiler left the
+/// update unvectorized. The row is a few hundred bytes, so the second pass
+/// reads it from the core's own cache.
 #[inline(always)]
 fn decay_all(row: &mut [f32], b: &[f32], c: &[f32], decay: f32, x_dt: f32) -> f32 {
+    for (value, &b) in row.iter_mut().zip(b) {
+        *value = *value * decay + b * x_dt;
+    }
     let mut sums = [0.0f32; LANES];
-    let whole = row.len() / LANES * LANES;
-    let (head, tail) = row.split_at_mut(whole);
-    for ((row, b), c) in head
-        .chunks_exact_mut(LANES)
-        .zip(b.chunks_exact(LANES))
-        .zip(c.chunks_exact(LANES))
-    {
+    let mut rows = row.chunks_exact(LANES);
+    let mut cs = c.chunks_exact(LANES);
+    for (row, c) in (&mut rows).zip(&mut cs) {
         for lane in 0..LANES {
-            let value = row[lane] * decay + b[lane] * x_dt;
-            row[lane] = value;
-            sums[lane] += value * c[lane];
+            sums[lane] += row[lane] * c[lane];
         }
     }
     let mut sum: f32 = sums.iter().sum();
-    for (index, value) in tail.iter_mut().enumerate() {
-        let at = whole + index;
-        *value = *value * decay + b[at] * x_dt;
-        sum += *value * c[at];
+    for (value, c) in rows.remainder().iter().zip(cs.remainder()) {
+        sum += value * c;
     }
     sum
 }
