@@ -103,9 +103,10 @@ SmaLLM/
 │   └── bin/smallm/          the command line program
 │       ├── main.rs          command dispatch and help
 │       ├── args.rs          option parsing
-│       ├── commands/        run, serve, pull, info, bench
+│       ├── commands/        run, serve, pull, info, bench, config, uninstall
 │       ├── server/          HTTP and the OpenAI-compatible API
 │       ├── models.rs        where downloaded models live
+│       ├── config.rs        the settings file, smallm.conf
 │       ├── json.rs          JSON for the API and the downloader
 │       ├── screen.rs        the log and progress bar of downloads
 │       ├── sha256.rs        checks downloads against Hugging Face

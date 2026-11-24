@@ -3,20 +3,37 @@
 Each version is a `v` tag, with ready-made binaries and libraries on its
 [release page](https://github.com/mattsaund/SmaLLM/releases).
 
-## Unreleased
+## 0.2.0 - 2026-11-24
 
-- **Architectures.** `gemma4`, `lfm2` and `lfm3`. Layers can now differ in
-  how they mix positions, in their head count and width, in rotation and
-  window, and in feed-forward width. Layers that reuse an earlier layer's
-  keys and values (Gemma 4) cost no cache memory, and after the last layer
-  that keeps state, only the token whose logits are wanted is computed.
+- **Architectures.** Fourteen in all. New: `gemma4`, `lfm2`, `lfm3`,
+  `granite`, `olmoe`, `smollm3`, and the mixture-of-experts `qwen2moe`,
+  `qwen3moe`, `granitemoe` and `lfm2moe`, as well as Mixtral, which is a
+  `llama` with experts. Layers can differ in how they mix positions, in
+  their head count and width, rotation, window and feed-forward width.
+  Layers that reuse an earlier layer's keys and values (Gemma 4) cost no
+  cache memory, and after the last layer that keeps state, only the token
+  whose logits are wanted is computed.
+- **Mixtures of experts.** Every expert in use runs in one multiply over
+  the tokens routed to it, so a generated token wakes the threads twice
+  per layer, however many experts it uses.
 - **Hybrid models.** Short convolution blocks, as in LFM2 and LFM3, keep a
   few kilobytes of state. A rollback of up to eight tokens costs nothing,
   and a longer one goes back to a state saved every 256 tokens.
+- **A full context.** `--overflow middle` keeps the start (the system prompt
+  and first question) and drops the oldest tokens after it, `slide` drops
+  the oldest tokens, and `stop` ends the answer. The kept tokens are not
+  read again: their cached keys are rotated to their new positions.
+- **Settings.** One file, `smallm.conf`, holds every setting. `smallm config`
+  shows it, and `smallm config --reset` restores the defaults.
+- **Uninstall.** `smallm uninstall` removes the program, its models and its
+  settings, and the installers' uninstall options use it.
+- **Installers.** They install what SmaLLM needs, after asking: curl for
+  downloads, and Rust and a C compiler for a build from source. Without
+  git, the source comes as an archive.
 - **Tokenizers.** The word splitting rules of all 67 BPE families llama.cpp
   knows, run by a small regular expression engine, and Gemma 4's tokenizer.
   End tokens are found as llama.cpp finds them.
-- **Chat formats.** Gemma 4's.
+- **Chat formats.** Gemma 4's and Granite's.
 - **Readouts.** Speed and context use after each answer in a terminal, and
   in the server's responses as llama.cpp's `timings`.
 - **Downloads.** One progress bar under a log of every step, with resumed

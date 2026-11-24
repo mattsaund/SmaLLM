@@ -28,14 +28,40 @@ What exists:
     4 rows per tile on NEON.
 
 Numbers from the desktop are in the README, measured against llama.cpp
-b11846. In short: prompt reading is 1.0 to 2.0 times as fast as llama.cpp,
-generation is level with it on one thread and ahead on several, and the
-engine holds 2 to 8 MB of its own memory where llama.cpp holds 116 to 627.
-The program is 0.47 to 0.70 MB.
+b11846 on Llama 3.2 1B: prompt reading is about 1.1 to 1.2 times as fast,
+generation level or slightly ahead, and the engine holds 7.7 MB of its own
+memory with a 4,096-token context where llama.cpp holds 627 MB. The
+program is 0.5 to 0.7 MB.
+
+Version 0.2.0 (2026-11-24) added, all tested on the desktop:
+
+- **Fourteen architectures.** Each layer has its own `LayerSpec` in
+  `src/model/config.rs`: attention or a short convolution, heads, widths,
+  rotation, window, the layer whose cache it reads. Gemma 4, LFM2, LFM3,
+  Granite, OLMoE, SmolLM3 and mixtures of experts (Mixtral, Qwen2/3-MoE,
+  Granite MoE, LFM2-MoE) all run through one forward pass.
+- **Grouped expert multiplies.** `Target::inputs` in `src/model/matmul.rs`
+  lets every expert in use run in one multiply over its own rows.
+- **Convolution state with rollback** in `src/model/conv.rs`.
+- **Context overflow.** `--overflow middle|slide|stop`. `Session::shift`
+  drops a span of tokens and rotates the kept keys back. No re-reading.
+- **Settings file** `smallm.conf` (`src/bin/smallm/config.rs`), shown by
+  `smallm config`, reset by `smallm config --reset`. It fills in options
+  that are not on the command line.
+- **`smallm uninstall`**, which the installers' uninstall options call.
+- **Installers** install curl, and for source builds Rust and a C
+  compiler, through the system's package manager, after asking.
+- **Tokenizers** for all 67 BPE families llama.cpp knows, via a small regex
+  engine, and Gemma 4's.
+
+Test models live in `~/models` on the desktop. The golden tests cover 13
+models; `tests/compare.rs` compares logits with llama.cpp's for a new
+architecture (see its header). LFM3 has no llama.cpp reference in b11846,
+so it was checked against upstream llama.cpp's source and behaviorally.
 
 The owner also wants feature parity with llama.cpp and the other engines.
-The README's to do list is the full gap list, grouped by area. Nothing on
-it is started.
+The README's to do list is the full gap list, grouped by area, with what is
+done ticked.
 
 ## What to do first: measure
 
@@ -115,8 +141,8 @@ SMALLM_TEST_MODELS=~/.local/share/smallm cargo test --release --workspace
 - `smallm bench model.gguf -p 256 -n 96 -r 1 -t N`, and
   `ref bench model.gguf 256 96 N` for llama.cpp, three rounds, the two
   taking turns, best run of each.
-- Memory: `smallm bench model.gguf -c 4096 -p 256 -n 0 -r 1 -t 4` against
-  `ref mem model.gguf 4096 256 4`.
+- Memory: `smallm bench model.gguf -c 4096 -p 240 -n 16 -r 1 -t 4` (256
+  tokens in all, one cache chunk) against `ref mem model.gguf 4096 256 4`.
 - A busy machine only makes runs slower, so the best run is the honest
   one. Check `uptime` before trusting a number.
 

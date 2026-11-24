@@ -3,8 +3,8 @@
 SmaLLM is a small, fast engine that runs language models on your own
 hardware. It reads the same GGUF model files as llama.cpp and Ollama, and it
 is built for the low end: single-board computers, mini PCs and old laptops.
-One program of about half a megabyte, which holds a few megabytes of memory
-besides the model. No dependencies, nothing to configure.
+One program of under a megabyte, which holds a few megabytes of memory
+besides the model. No dependencies, and the defaults need no changes.
 
 **Full installation size:**\
 0.67 MB Linux (x86_64), 0.57 MB Linux (arm64)\
@@ -12,13 +12,9 @@ besides the model. No dependencies, nothing to configure.
 0.51 MB macOS (Intel), 0.47 MB macOS (Apple silicon)\
 0.70 MB Windows (x86_64), 0.61 MB Windows (arm64)
 
-**Memory of its own, with a model loaded and a 4,096-token context:**\
-2.2 MB for SmolLM2 135M, where llama.cpp holds 116 MB\
-6.5 MB for Qwen2.5 0.5B, where llama.cpp holds 124 MB\
-7.7 MB for Llama 3.2 1B, where llama.cpp holds 627 MB
-
-That is 19 to 81 times less. [Memory](#memory) has the full table and how it
-was measured.
+**Memory of its own, for Llama 3.2 1B with a 4,096-token context:**\
+7.7 MB, where llama.cpp holds 627 MB. [Memory](#memory) says how it was
+measured.
 
 ## Install
 
@@ -35,10 +31,13 @@ irm https://raw.githubusercontent.com/mattsaund/SmaLLM/main/install.ps1 | iex
 ```
 
 Downloads the newest [release](https://github.com/mattsaund/SmaLLM/releases)
-for your machine and checks it against the release's checksums. Where there
-is no release for the machine, it builds from source with cargo. One file
+for your machine and checks it against the release's checksums. One file
 lands in `~/.local/bin`. Linux binaries are static, so they run on any
-distribution. The top of each script says how to uninstall.
+distribution. Anything else SmaLLM needs is installed too, after asking:
+curl for downloading models, and when there is no release for the machine,
+Rust and a C compiler to build it from source.
+
+`smallm uninstall` removes SmaLLM again, with its models and settings.
 What changed: [CHANGELOG](CHANGELOG.md).
 
 ## Use
@@ -62,21 +61,32 @@ name is enough when it singles one out.
 | `info <model>` | Shows what a model is: size, layers, weight format, chat format |
 | `bench <model>` | Measures speed on this machine. `--profile` shows where the time goes |
 | `tokenize <model> <text>` | Shows how a model reads a text |
+| `config` | Shows the settings and where they are kept. `--reset` restores the defaults |
+| `uninstall` | Removes the program, its downloaded models and its settings |
 
 `smallm <command> --help` lists the options of a command: threads, context
-size, temperature and the other sampling settings, stop strings, system
-message. In a chat, `/clear` starts over, `/system` sets a system message and
-`/exit` leaves.
+size, what to do when the context is full, temperature and the other
+sampling settings, stop strings, system message. In a chat, `/clear` starts
+over, `/system` sets a system message and `/exit` leaves.
+
+**Settings.** Every setting has a line in one file, `smallm.conf`, named like
+its command-line option. `smallm config` shows the settings in effect and
+where the file is, and writes it with the defaults the first time.
+`smallm config --reset` puts the defaults back. An option on the command
+line wins over the file.
 
 ## What it runs
 
-**Models.** The Llama, Qwen2, Qwen3, Gemma 3, Gemma 4, LFM2 and LFM3
-architectures. That covers Llama 2 and 3, TinyLlama, SmolLM2, Mistral,
-Qwen2.5, Qwen3, the DeepSeek R1 distillations, Gemma 3, Gemma 4 and Liquid
-AI's LFM2, LFM2.5 and LFM3. The engine is tested against llama.cpp on eleven
-models. Tokens match exactly, and greedy output matches up to near ties
-between two candidates. LFM3 is newer than the llama.cpp it is tested
-against, so it is checked by hand against llama.cpp's source instead.
+**Models.** Fourteen architectures: Llama, Qwen2, Qwen3, Gemma 3, Gemma 4,
+LFM2, LFM3, Granite, OLMoE, SmolLM3, and the mixture-of-experts Qwen2-MoE,
+Qwen3-MoE, Granite MoE and LFM2-MoE. That covers Llama 2 and 3, Mistral,
+Mixtral, TinyLlama, SmolLM2 and 3, Qwen2.5, Qwen3, the DeepSeek R1
+distillations, Gemma 3 and 4, Granite 3, OLMoE, and Liquid AI's LFM2,
+LFM2.5 and LFM3, including the hybrids of attention and convolution. The
+engine is tested against llama.cpp on thirteen models. Tokens match
+exactly, and greedy output matches up to near ties between two candidates.
+LFM3 is newer than the llama.cpp it is tested against, so it is checked
+against llama.cpp's source instead.
 
 **Tokenizers.** SentencePiece, byte-level BPE with the word splitting rules
 of all 67 families llama.cpp knows, and Gemma 4's. llama.cpp's own tokenizer
@@ -91,109 +101,43 @@ file.
 get hand-written kernels, picked when the program starts. Everything else,
 including 32-bit ARM and RISC-V, runs portable code.
 
-**Chat formats.** ChatML, Llama 3, Llama 2, Mistral, Gemma, Gemma 4, Phi-3,
-Zephyr and DeepSeek, recognized from the model file.
+**Chat formats.** ChatML, Llama 3, Llama 2, Mistral, Gemma, Gemma 4, Granite,
+Phi-3, Zephyr and DeepSeek, recognized from the model file.
 
 ## Speed
 
-Tokens per second on an Intel Core i7-14700K, against llama.cpp b11846 with
-its `alderlake` CPU backend. Both ran on the CPU only, on the same Q4_K_M
-files.
+Llama 3.2 1B, Q4_K_M, in tokens per second:
 
-**Reading a prompt**
-
-| Model | Threads | SmaLLM | llama.cpp | |
+| Threads | Prompt, SmaLLM | Prompt, llama.cpp | Generation, SmaLLM | Generation, llama.cpp |
 |---|---|---|---|---|
-| SmolLM2 135M | 1 | **843** | 431 | 2.0x |
-| | 4 | **2780** | 1550 | 1.8x |
-| | 8 | **4263** | 2724 | 1.6x |
-| Gemma 3 270M | 1 | **896** | 484 | 1.9x |
-| | 4 | **3002** | 1731 | 1.7x |
-| | 8 | **4241** | 2548 | 1.7x |
-| Qwen2.5 0.5B | 1 | **267** | 147 | 1.8x |
-| | 4 | **964** | 539 | 1.8x |
-| | 8 | **1638** | 931 | 1.8x |
-| Llama 3.2 1B | 1 | **116** | 102 | 1.1x |
-| | 4 | **434** | 375 | 1.2x |
-| | 8 | **740** | 688 | 1.1x |
-| TinyLlama 1.1B | 1 | **115** | 99 | 1.2x |
-| | 4 | **420** | 367 | 1.1x |
-| | 8 | 696 | 706 | 1.0x |
+| 1 | **120** | 103 | **24.4** | 23.6 |
+| 4 | **427** | 383 | **46.7** | 45.2 |
+| 8 | **757** | 681 | **50.8** | 49.2 |
 
-**Generating**
-
-| Model | Threads | SmaLLM | llama.cpp | |
-|---|---|---|---|---|
-| SmolLM2 135M | 1 | **146** | 139 | 1.0x |
-| | 4 | **338** | 240 | 1.4x |
-| | 8 | **363** | 196 | 1.9x |
-| Gemma 3 270M | 1 | 68 | 67 | 1.0x |
-| | 4 | **146** | 131 | 1.1x |
-| | 8 | **157** | 129 | 1.2x |
-| Qwen2.5 0.5B | 1 | 41 | 41 | 1.0x |
-| | 4 | **96** | 87 | 1.1x |
-| | 8 | **104** | 87 | 1.2x |
-| Llama 3.2 1B | 1 | 23 | **24** | 1.0x |
-| | 4 | **49** | 46 | 1.1x |
-| | 8 | **52** | 47 | 1.1x |
-| TinyLlama 1.1B | 1 | 27 | **29** | 0.9x |
-| | 4 | **59** | 54 | 1.1x |
-| | 8 | **65** | 57 | 1.1x |
-
-Reading a prompt is up to twice as fast. A batch of tokens multiplies
-several rows of weights with one instruction, and the rows are unpacked once
-per batch. [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) has the details.
-
-Generating is level on one thread and ahead on several. One token at a time,
-both engines wait for memory to deliver the weights more than they compute,
-so neither can pull far ahead. On the 1B models llama.cpp is about 5 percent
-faster on a single thread.
-
-These are numbers from one x86 desktop. The ARM kernels pass the same tests
-but have not been timed on a board yet.
-
-How it was measured: a 256-token prompt, then 96 generated tokens, with the
-two engines taking turns. Each number is the engine's best run over three
-sessions, because the desktop was in use and a busy machine only makes a
-run slower. `smallm bench` measures SmaLLM.
-[tools/reference](tools/reference/README.md) has the program that measures
-llama.cpp.
+Measured on an Intel Core i7-14700K under Linux, against llama.cpp b11846
+with its `alderlake` CPU backend: a 256-token prompt and 96 generated
+tokens, the best of three runs, with the engines taking turns.
 
 ## Memory
 
 SmaLLM never copies weights out of the model file. The file is mapped into
 memory, and the system keeps as much of it there as it has room for. What
-the engine holds of its own is small:
+the engine holds of its own is small. For Llama 3.2 1B:
 
-| Model | | Model loaded | With a 4,096-token context | After reading 256 tokens |
-|---|---|---|---|---|
-| SmolLM2 135M | SmaLLM | **1.9 MB** | **2.2 MB** | **15 MB** |
-| | llama.cpp | 25 MB | 116 MB | 132 MB |
-| Qwen2.5 0.5B | SmaLLM | **6.1 MB** | **6.5 MB** | **15 MB** |
-| | llama.cpp | 76 MB | 124 MB | 142 MB |
-| Llama 3.2 1B | SmaLLM | **7.5 MB** | **7.7 MB** | **29 MB** |
-| | llama.cpp | 498 MB | 627 MB | 658 MB |
+| | Model loaded | With a 4,096-token context | After reading 256 tokens |
+|---|---|---|---|
+| SmaLLM | **7.5 MB** | **7.7 MB** | **29 MB** |
+| llama.cpp | 498 MB | 627 MB | 658 MB |
 
 This is memory the process allocated, which the system cannot take back.
-Both engines also have the model file in memory, 105, 491 and 808 MB for
-these three, and the system can drop those pages whenever it needs the room.
-
-With a session ready, SmaLLM holds 19 to 81 times less than llama.cpp. After
-reading 256 tokens it is still about 9 to 23 times less.
-
-These numbers are from an x86-64 desktop running Linux, against llama.cpp
-b11846. They come from how the engine is built and not from the processor,
-so ARM boards should show the same. Those measurements are next.
+Both engines also have the 808 MB model file in memory, and the system can
+drop those pages whenever it needs the room.
 
 Two things make the difference. llama.cpp reserves the cache for the whole
 context window when a session starts, and SmaLLM grows it as the
 conversation grows. llama.cpp also keeps a rearranged copy of most weights
 for speed, and SmaLLM rearranges a few rows at a time in a few kilobytes of
-scratch memory.
-
-`smallm bench` prints these numbers for any model on Linux, and
-`ref mem` in [tools/reference](tools/reference/README.md) does the same for
-llama.cpp.
+scratch memory. `smallm bench` prints these numbers for any model on Linux.
 
 ## Size
 
@@ -217,13 +161,21 @@ until it is used.
 smallm run model.gguf --ctx 262144
 ```
 
-A 262,144-token context has been run end to end: 336 MB of history on the
-smallest test model, read at 213 tokens per second and continued at 24. What
-limits the window in practice is memory, at
-`layers x key/value heads x head size x 8` bytes per token. That is 46 KB
-for SmolLM2 135M and 66 KB for Llama 3.2 1B. A model also only stays
-coherent as far as it was trained to. The default window is the model's own
-training length, up to 4,096 tokens.
+A 262,144-token context has been run end to end. What limits the window in
+practice is memory, 66 KB per token for Llama 3.2 1B. A model also only
+stays coherent as far as it was trained to. The default window is the
+model's own training length, up to 4,096 tokens.
+
+When the window is full, `--overflow` (or the `overflow` setting) decides:
+
+| Choice | Does |
+|---|---|
+| `middle` (default) | Keeps the start, the system prompt and the first question, and drops the oldest tokens after it |
+| `slide` | Drops the oldest tokens and slides forward |
+| `stop` | Ends the answer |
+
+Either way the kept tokens are not read again: their cached keys are moved
+to their new positions, which takes milliseconds.
 
 ## Use it from your code
 
@@ -280,23 +232,25 @@ static, with the header and the Python binding.
 ## Project status
 
 - [x] GGUF loading by memory map, with every read bounds-checked
-- [x] The Llama, Qwen2, Qwen3, Gemma 3, Gemma 4, LFM2 and LFM3 architectures, including hybrids of attention
-      and convolution layers
+- [x] Fourteen architectures, including mixtures of experts and hybrids of attention and convolution layers
 - [x] Fourteen weight formats, float and quantized
 - [x] Kernels for AVX2, AVX-VNNI, NEON and the ARM dot product extension
 - [x] Prompt reading in tiles, up to twice as fast as llama.cpp
 - [x] A few megabytes of memory besides the model file
 - [x] SentencePiece and byte-level BPE tokenizers for every word splitting family llama.cpp knows, matching it
       token for token on its test texts
-- [x] Nine chat formats, recognized from the model file
+- [x] Ten chat formats, recognized from the model file
+- [x] A context window that slides or keeps its start when it fills, chosen with `--overflow`
+- [x] One settings file for everything, with a reset to the defaults
 - [x] A context window with no built-in limit, tested at 262,144 tokens
 - [x] Chat, one-shot answers, model downloads and benchmarks from one program
 - [x] An OpenAI-compatible server with streaming
 - [x] A C API as a shared and a static library, and a Python binding
-- [x] One-line installers, and static Linux binaries for x86-64, ARM64, ARMv7 and RISC-V
+- [x] One-line installers that bring what SmaLLM needs, a full uninstall, and static Linux binaries for x86-64,
+      ARM64, ARMv7 and RISC-V
 - [x] CI on Linux, macOS and Windows, on x86-64 and ARM, with ARMv7 and RISC-V under emulation
 - [ ] Speed and memory measured on ARM boards
-- [ ] A first tagged release
+- [x] A first tagged release, 0.2.0
 
 ## To do
 
@@ -319,7 +273,9 @@ left out.
 
 **Models**
 
-- [ ] More architectures: Phi, Gemma 2, mixture-of-experts models such as Mixtral, and the families that are not
+- [x] Mixture-of-experts models: Mixtral, Qwen2-MoE, Qwen3-MoE, OLMoE, Granite MoE and LFM2-MoE.
+- [x] Hybrids of attention and short convolutions: LFM2, LFM2.5 and LFM3.
+- [ ] More architectures: Phi, Gemma 2, the MoE models of DeepSeek and gpt-oss, and the families that are not
       transformers (RWKV, Mamba).
 - [ ] Encoder tokenizers (WordPiece and Unigram), which only the encoder models below use.
 - [ ] Encoder models, for embeddings and reranking.
@@ -330,12 +286,12 @@ left out.
 **Generation**
 
 - [ ] Grammar-constrained output, and JSON that follows a schema.
-- [ ] Jinja chat templates, for models whose format is not one of the nine built in.
+- [ ] Jinja chat templates, for models whose format is not one of the ten built in.
 - [ ] More samplers: Mirostat, typical, DRY, XTC and dynamic temperature, and a bias on chosen tokens.
 - [ ] Token probabilities in the output.
 - [ ] Speculative decoding with a small draft model.
 - [ ] Saving a session's context to a file and loading it again.
-- [ ] Sliding the context window when it fills, instead of dropping whole turns.
+- [x] Sliding the context window when it fills, or keeping its start and dropping the middle.
 - [ ] A half-precision key/value cache, to halve the memory of long contexts.
 
 **Server**

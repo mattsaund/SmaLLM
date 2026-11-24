@@ -119,6 +119,13 @@ it reads another layer's keys and values. Layers can differ in all of
 these, which is what Gemma 4 and the LFM models need. Gemma 4 also gives
 each block a small input of its own, looked up per token.
 
+In a mixture of experts, the feed-forward network is many small networks.
+A router scores them for each token, the best few run, and their outputs
+are summed with the router's weights. The tokens of a batch are sorted by
+expert, so each expert multiplies all of its tokens at once, and every
+expert in use runs in the same multiply. A generated token wakes the
+threads twice per layer, whatever the number of experts it uses.
+
 Three choices keep it fast:
 
 - **Matrices that read the same input run together.** The query, key and
@@ -252,6 +259,13 @@ every layer's state each 256 positions. A short rollback costs nothing. A
 longer one restores the last saved state before the cut and reads the
 tokens after it again.
 
+When the window is full, the session drops the oldest tokens after a kept
+start: the first token, or the conversation's opening. The tokens after the
+gap move down, and their cached keys are rotated back by the size of the
+gap, which is all a rotary position embedding needs to place a key at a new
+position. Nothing is read again, and the kept tokens still carry what they
+took from the dropped ones, as in llama.cpp's context shift.
+
 ## Threads
 
 A forward pass runs a few hundred short parallel loops per token, so the
@@ -332,7 +346,7 @@ are nearly tied.
 ## What the engine does not do
 
 - It computes on the CPU. GPUs and NPUs are planned as further backends.
-- It runs text models of seven architectures. No images, audio or
-  embeddings, and no mixture-of-experts models yet.
-- It knows nine chat formats and does not interpret templates.
+- It runs text models of fourteen architectures. No images, audio or
+  embeddings.
+- It knows ten chat formats and does not interpret templates.
 - It is little-endian only, like the GGUF files themselves.
