@@ -9,6 +9,28 @@ Each version is a `v` tag, with ready-made binaries and libraries on its
   cores included, while generation stays on the performance cores.
   `--threads-batch` (and the `threads-batch` setting) chooses the count.
   Prompts read about 28 percent faster on an Intel Core i7-14700K.
+- **Embeddings and reranking.** BERT and nomic-bert models run with
+  `smallm embed` and `smallm rerank`, and the server answers
+  `/v1/embeddings` and `/v1/rerank`. Their vectors and scores match
+  llama.cpp's (cosine similarity 0.9999996 or better).
+- **Encoder tokenizers.** WordPiece (BERT) and Unigram (T5, XLM-RoBERTa),
+  both matching llama.cpp token for token on its test texts.
+- **Weight formats.** The i-quants IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S,
+  IQ3_XXS, IQ3_S and IQ4_XS, the ternary TQ1_0 and TQ2_0, and MXFP4. Each
+  expands to exactly ggml's numbers, which a test checks for every format.
+- **Gemma 2 and Phi.** `gemma2` caps attention scores and windows every
+  other layer. `phi3` covers Phi-3, Phi-3.5 and Phi-4-mini, with LongRoPE's
+  two sets of rotary divisors chosen by the context length. `phi2` covers
+  Phi-2 and Phi-1.5: LayerNorm, and attention and the feed-forward network
+  side by side.
+- **gpt-oss.** Attention sinks, biased experts, OpenAI's clamped SwiGLU and
+  the Harmony chat format.
+- **YaRN** position scaling, which gpt-oss and DeepSeek use and some Qwen
+  files ask for.
+- **Reasoning.** What thinking models write before their answer (between
+  `<think>` tags, or on Harmony's analysis channel) is shown faint in a
+  chat and kept out of the conversation. The server returns it as
+  `reasoning_content`, as llama.cpp does.
 
 ## 0.2.0 - 2026-11-24
 

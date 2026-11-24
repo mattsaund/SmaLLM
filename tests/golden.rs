@@ -253,6 +253,16 @@ fn phi_4_mini_q4_k_m() {
 }
 
 #[test]
+fn phi_2_q4_k_m() {
+    check("phi-2.Q4_K_M");
+}
+
+#[test]
+fn gpt_oss_20b_mxfp4() {
+    check("gpt-oss-20b-MXFP4");
+}
+
+#[test]
 fn rwkv7_g1d_0_1b_q8_0() {
     check("rwkv7-g1d-0.1b-Q8_0");
 }
@@ -265,6 +275,8 @@ fn rwkv_6_world_1_6b_q4_k() {
 #[test]
 fn every_golden_file_has_a_test() {
     let tested = [
+        "gpt-oss-20b-MXFP4",
+        "phi-2.Q4_K_M",
         "gemma-2-2b-it-Q4_K_M",
         "microsoft_Phi-4-mini-instruct-Q4_K_M",
         "LFM2-8B-A1B-Q4_K_M",

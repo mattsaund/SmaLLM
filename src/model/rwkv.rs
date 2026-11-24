@@ -145,10 +145,14 @@ impl Pass<'_> {
         let config = self.config;
         let (d, eps, count) = (config.n_embd, config.norm_eps, self.count);
         let rows = count * d;
+        let bias = layer
+            .attn_norm_bias
+            .as_deref()
+            .expect("RWKV blocks are bound with layer norms");
         layer_norm_rows(
             &x[..rows],
             &layer.attn_norm,
-            &time_mix.norm_bias,
+            bias,
             eps,
             &mut s.normed[..rows],
         );

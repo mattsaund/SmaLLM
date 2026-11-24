@@ -291,6 +291,9 @@ impl Encoder {
             rope_attn_factor: 1.0,
             long_context_after: 0,
             yarn: None,
+            layer_norm: true,
+            parallel: false,
+            ungated: false,
             routing: None,
             rwkv: None,
         };

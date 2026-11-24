@@ -58,6 +58,10 @@ pub struct AttentionWeights {
     /// One gate per head on the attention output, when the model has it:
     /// each head's output is scaled by the sigmoid of its gate.
     pub gate: Option<Linear>,
+    /// One learned score per head that joins every softmax as if it were
+    /// another position with no value (gpt-oss). It lets a head attend to
+    /// nothing.
+    pub sinks: Option<Vec<f32>>,
     pub out: Linear,
 }
 
@@ -83,8 +87,6 @@ pub struct ConvWeights {
 /// called token shift. A recurrent state per head takes the place of
 /// attention. See `rwkv.rs`.
 pub struct TimeMix {
-    /// The bias of the block's first norm, which makes it a layer norm.
-    pub norm_bias: Vec<f32>,
     pub receptance: Linear,
     pub key: Linear,
     pub value: Linear,
@@ -211,9 +213,18 @@ pub struct Experts {
     pub gate: ExpertMatrix,
     pub up: ExpertMatrix,
     pub down: ExpertMatrix,
+    /// Each expert's biases on its gate, up and down projections (gpt-oss):
+    /// one row per expert. They stay in the file until a row is used.
+    pub biases: Option<[Matrix; 3]>,
     /// A network that every token goes through as well (Qwen2 MoE), with
     /// an optional gate: one score per token, through a sigmoid.
     pub shared: Option<(Dense, Option<Linear>)>,
+}
+
+/// An ungated feed-forward network: `down(act(up(x)))`.
+pub struct Plain {
+    pub up: Linear,
+    pub down: Linear,
 }
 
 /// RWKV's channel mixing, its feed-forward network:
@@ -235,6 +246,7 @@ pub struct ChannelMix {
 pub enum FeedForward {
     Dense(Box<Dense>),
     Experts(Box<Experts>),
+    Plain(Box<Plain>),
     /// RWKV blocks run a path of their own, in `rwkv.rs`.
     ChannelMix(Box<ChannelMix>),
 }
@@ -242,9 +254,12 @@ pub enum FeedForward {
 /// The weights of one block.
 pub struct Layer {
     pub attn_norm: Vec<f32>,
+    /// The bias of a LayerNorm (Phi-2).
+    pub attn_norm_bias: Option<Vec<f32>>,
     pub mixer: MixerWeights,
     /// Normalization of the mixer's output, when the model has it.
     pub attn_post_norm: Option<Vec<f32>>,
+    /// Empty when attention and the feed-forward network share one norm.
     pub ffn_norm: Vec<f32>,
     pub ffn: FeedForward,
     /// Normalization of the feed-forward output, when the model has it.
@@ -272,6 +287,8 @@ pub struct Weights {
     /// model ties them.
     pub output: Linear,
     pub output_norm: Vec<f32>,
+    /// The bias of a final LayerNorm (Phi-2).
+    pub output_norm_bias: Option<Vec<f32>>,
     /// Per-frequency divisors for rotary angles, when the model has them.
     pub rope_factors: Option<Vec<f32>>,
     /// The divisors a LongRoPE model uses past its original context. Its
@@ -281,8 +298,6 @@ pub struct Weights {
     pub per_layer_inputs: Option<PerLayerInputs>,
     /// Weight and bias of a layer norm of the token embeddings (RWKV).
     pub embd_norm: Option<(Vec<f32>, Vec<f32>)>,
-    /// The bias of the final norm, which makes it a layer norm (RWKV).
-    pub output_norm_bias: Option<Vec<f32>>,
 }
 
 impl Weights {
@@ -306,6 +321,11 @@ impl Weights {
         let output_norm = match file.tensor("output_norm.weight") {
             Some(_) => vector(file, "output_norm.weight", d)?,
             None => vector(file, "token_embd_norm.weight", d)?,
+        };
+        let output_norm_bias = if config.layer_norm {
+            Some(vector(file, "output_norm.bias", d)?)
+        } else {
+            None
         };
         // One table of rotary divisors serves every layer that uses one, so
         // those layers must rotate the same number of elements.
@@ -346,17 +366,14 @@ impl Weights {
         } else {
             None
         };
-        // RWKV normalizes the embeddings, and ends with a layer norm.
-        let (embd_norm, output_norm_bias) = if config.rwkv.is_some() {
-            (
-                Some((
-                    vector(file, "token_embd_norm.weight", d)?,
-                    vector(file, "token_embd_norm.bias", d)?,
-                )),
-                Some(vector(file, "output_norm.bias", d)?),
-            )
+        // RWKV normalizes the embeddings.
+        let embd_norm = if config.rwkv.is_some() {
+            Some((
+                vector(file, "token_embd_norm.weight", d)?,
+                vector(file, "token_embd_norm.bias", d)?,
+            ))
         } else {
-            (None, None)
+            None
         };
 
         let mut layers = Vec::with_capacity(config.n_layer);
@@ -418,6 +435,7 @@ impl Weights {
                             Some(_) => Some(layer_whole("attn_gate", spec.n_head, d)?),
                             None => None,
                         },
+                        sinks: optional_vector(file, &name("attn_sinks.weight"), spec.n_head)?,
                         out: layer_whole("attn_output", d, q_dim)?,
                     })
                 }
@@ -483,7 +501,14 @@ impl Weights {
                                 ))
                             })?;
                     }
-                    FeedForward::Dense(Box::new(dense(file, &name("ffn"), "", d, spec.n_ff)?))
+                    if config.ungated {
+                        FeedForward::Plain(Box::new(Plain {
+                            up: layer_whole("ffn_up", spec.n_ff, d)?,
+                            down: layer_whole("ffn_down", d, spec.n_ff)?,
+                        }))
+                    } else {
+                        FeedForward::Dense(Box::new(dense(file, &name("ffn"), "", d, spec.n_ff)?))
+                    }
                 }
             };
 
@@ -497,16 +522,31 @@ impl Weights {
                 None
             };
 
-            // RWKV names the norm before its channel mix after attention.
-            let ffn_norm = match ffn {
-                FeedForward::ChannelMix(_) => "attn_norm_2.weight",
-                _ => "ffn_norm.weight",
+            // gpt-oss names its feed-forward norm "post_attention_norm",
+            // which elsewhere normalizes the attention output. RWKV names
+            // the norm before its channel mix after attention.
+            let (attn_post_norm, ffn_norm) = if config.arch == "gpt-oss" {
+                (None, vector(file, &name("post_attention_norm.weight"), d)?)
+            } else if matches!(ffn, FeedForward::ChannelMix(_)) {
+                (None, vector(file, &name("attn_norm_2.weight"), d)?)
+            } else if config.parallel {
+                (None, Vec::new())
+            } else {
+                (
+                    optional_vector(file, &name("post_attention_norm.weight"), d)?,
+                    vector(file, &name("ffn_norm.weight"), d)?,
+                )
             };
             layers.push(Layer {
                 attn_norm: vector(file, &name("attn_norm.weight"), d)?,
+                attn_norm_bias: if config.layer_norm {
+                    Some(vector(file, &name("attn_norm.bias"), d)?)
+                } else {
+                    None
+                },
                 mixer,
-                attn_post_norm: optional_vector(file, &name("post_attention_norm.weight"), d)?,
-                ffn_norm: vector(file, &name(ffn_norm), d)?,
+                attn_post_norm,
+                ffn_norm,
                 ffn,
                 ffn_post_norm: optional_vector(file, &name("post_ffw_norm.weight"), d)?,
                 per_layer: per_layer_weights,
@@ -518,12 +558,12 @@ impl Weights {
             token_embd,
             output,
             output_norm,
+            output_norm_bias,
             rope_factors,
             rope_factors_long,
             layers,
             per_layer_inputs,
             embd_norm,
-            output_norm_bias,
         })
     }
 }
@@ -541,12 +581,12 @@ impl Weights {
                 bias: None,
             },
             output_norm: Vec::new(),
+            output_norm_bias: None,
             rope_factors: None,
             rope_factors_long: None,
             layers: Vec::new(),
             per_layer_inputs: None,
             embd_norm: None,
-            output_norm_bias: None,
         }
     }
 }
@@ -561,7 +601,6 @@ fn time_mix(file: &Gguf, index: usize, mixer: Mixer, d: usize) -> Result<TimeMix
         TimeMixVersion::V7(time_mix7(file, index, d)?)
     };
     Ok(TimeMix {
-        norm_bias: vector(file, &name("attn_norm.bias"), d)?,
         receptance: square("time_mix_receptance")?,
         key: square("time_mix_key")?,
         value: square("time_mix_value")?,
@@ -759,11 +798,22 @@ fn experts(file: &Gguf, index: usize, d: usize, count: usize) -> Result<Experts>
         }
         None => None,
     };
+    let biases = if file.tensor(&name("ffn_down_exps.bias")).is_some() {
+        Some([
+            matrix(file, &name("ffn_gate_exps.bias"), count, n_ff)?,
+            matrix(file, &name("ffn_up_exps.bias"), count, n_ff)?,
+            matrix(file, &name("ffn_down_exps.bias"), count, d)?,
+        ])
+    } else {
+        None
+    };
     Ok(Experts {
+        // The router's bias, when it has one, is added to every score.
         router: whole(file, &name("ffn_gate_inp"), count, d)?,
         choice_bias: optional_vector(file, &name("exp_probs_b.bias"), count)?,
         gate,
         up,
+        biases,
         down: ExpertMatrix {
             matrix: stacked(file, &name("ffn_down_exps.weight"), count, d, n_ff)?,
             rows: d,

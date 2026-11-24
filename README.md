@@ -55,7 +55,9 @@ name is enough when it singles one out.
 | Command | Does |
 |---|---|
 | `run <model> [prompt]` | Answers a prompt, or opens a chat when none is given |
-| `serve <model>` | Serves `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/tokenize` and `/detokenize` |
+| `serve <model>` | Serves `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/tokenize` and `/detokenize`, or for an embedding model `/v1/embeddings` and `/v1/rerank` |
+| `embed <model> [text...]` | Prints the embedding of each text, one JSON array per line |
+| `rerank <model> <query> <document>...` | Scores how well each document answers the query, best first |
 | `pull <user/repo>` | Downloads a model from Hugging Face. `user/repo:q8_0` picks a quantization |
 | `list`, `rm <model>` | Lists downloaded models, deletes one |
 | `info <model>` | Shows what a model is: size, layers, weight format, chat format |
@@ -68,6 +70,11 @@ name is enough when it singles one out.
 size, what to do when the context is full, temperature and the other
 sampling settings, stop strings, system message. In a chat, `/clear` starts
 over, `/system` sets a system message and `/exit` leaves.
+
+**Reasoning.** Models that think before they answer (Qwen3, DeepSeek R1,
+gpt-oss) show their reasoning faint in a chat, and it is left out of the
+conversation. An answer sent to a file or a pipe leaves it out entirely.
+The server returns it as `reasoning_content`, as llama.cpp does.
 
 **Settings.** Every setting has a line in one file, `smallm.conf`, named like
 its command-line option. `smallm config` shows the settings in effect and
@@ -89,20 +96,24 @@ LFM3 is newer than the llama.cpp it is tested against, so it is checked
 against llama.cpp's source instead.
 
 **Tokenizers.** SentencePiece, byte-level BPE with the word splitting rules
-of all 67 families llama.cpp knows, and Gemma 4's. llama.cpp's own tokenizer
+of all 67 families llama.cpp knows, Gemma 4's, and the encoder tokenizers
+WordPiece (BERT) and Unigram (T5, XLM-RoBERTa). llama.cpp's own tokenizer
 test texts pass on every vocabulary it ships that uses one of these.
 
 **Weights.** F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K,
-Q5_K, Q6_K and IQ4_NL. Weights stay in the file's format and are memory
-mapped, so a model loads in milliseconds and costs no memory beyond the
-file.
+Q5_K, Q6_K, the i-quants IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS,
+IQ3_S, IQ4_NL and IQ4_XS, the ternary TQ1_0 and TQ2_0, and MXFP4. Every
+format expands to exactly the numbers ggml's does. Weights stay in the
+file's format and are memory mapped, so a model loads in milliseconds and
+costs no memory beyond the file.
 
 **Machines.** Linux, macOS and Windows. x86-64 with AVX2 and ARM64 with NEON
 get hand-written kernels, picked when the program starts. Everything else,
 including 32-bit ARM and RISC-V, runs portable code.
 
 **Chat formats.** ChatML, Llama 3, Llama 2, Mistral, Gemma, Gemma 4, Granite,
-Phi-3, Zephyr and DeepSeek, recognized from the model file.
+Phi-3, Phi-4-mini, Zephyr, DeepSeek and OpenAI's Harmony (gpt-oss),
+recognized from the model file.
 
 ## Speed
 
@@ -233,13 +244,15 @@ static, with the header and the Python binding.
 
 - [x] GGUF loading by memory map, with every read bounds-checked
 - [x] Fourteen architectures, including mixtures of experts and hybrids of attention and convolution layers
-- [x] Fourteen weight formats, float and quantized
+- [x] Twenty-five weight formats, float, quantized, i-quants, ternary and MXFP4, each expanding exactly as in ggml
 - [x] Kernels for AVX2, AVX-VNNI, NEON and the ARM dot product extension
 - [x] Prompt reading in tiles, up to twice as fast as llama.cpp
 - [x] A few megabytes of memory besides the model file
-- [x] SentencePiece and byte-level BPE tokenizers for every word splitting family llama.cpp knows, matching it
-      token for token on its test texts
-- [x] Ten chat formats, recognized from the model file
+- [x] SentencePiece and byte-level BPE tokenizers for every word splitting family llama.cpp knows, and the
+      encoder tokenizers WordPiece and Unigram, matching it token for token on its test texts
+- [x] Twelve chat formats, recognized from the model file
+- [x] Embedding and reranking models, from the command line and the server
+- [x] Reasoning kept apart from the answer, for models that think first
 - [x] A context window that slides or keeps its start when it fills, chosen with `--overflow`
 - [x] One settings file for everything, with a reset to the defaults
 - [x] A context window with no built-in limit, tested at 262,144 tokens
@@ -278,16 +291,16 @@ left out.
 - [x] Hybrids of attention and short convolutions: LFM2, LFM2.5 and LFM3.
 - [ ] More architectures: Phi, Gemma 2, the MoE models of DeepSeek and gpt-oss, and the families that are not
       transformers (RWKV, Mamba).
-- [ ] Encoder tokenizers (WordPiece and Unigram), which only the encoder models below use.
-- [ ] Encoder models, for embeddings and reranking.
+- [x] Encoder tokenizers (WordPiece and Unigram), which only the encoder models below use.
+- [x] Encoder models, for embeddings and reranking.
 - [ ] Images and audio as input.
-- [ ] The remaining weight formats: IQ1, IQ2, IQ3, IQ4_XS and the ternary ones.
+- [x] The remaining weight formats: IQ1, IQ2, IQ3, IQ4_XS, the ternary ones, and MXFP4.
 - [ ] LoRA adapters and control vectors.
 
 **Generation**
 
 - [ ] Grammar-constrained output, and JSON that follows a schema.
-- [ ] Jinja chat templates, for models whose format is not one of the ten built in.
+- [ ] Jinja chat templates, for models whose format is not one of the twelve built in.
 - [ ] More samplers: Mirostat, typical, DRY, XTC and dynamic temperature, and a bias on chosen tokens.
 - [ ] Token probabilities in the output.
 - [ ] Speculative decoding with a small draft model.
@@ -298,7 +311,8 @@ left out.
 **Server**
 
 - [ ] Several requests at once.
-- [ ] Endpoints for embeddings, reranking and code infill.
+- [x] Endpoints for embeddings and reranking.
+- [ ] An endpoint for code infill.
 - [ ] Tool calls.
 - [ ] The Ollama API next to the OpenAI one, and several models loaded and unloaded on demand.
 - [ ] A built-in web page, and metrics.

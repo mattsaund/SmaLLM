@@ -65,11 +65,22 @@ pub struct Options {
     pub stop: Vec<String>,
     /// Show control tokens in the output instead of hiding them.
     pub show_special: bool,
+    /// Tell the model's reasoning from its answer, and leave out the
+    /// markers between them. See [`run_tokens_with`].
+    pub reasoning: bool,
     /// What to do when the context window is full.
     pub overflow: Overflow,
     /// Tokens at the start of the context that [`Overflow::Middle`] keeps.
     /// `None` keeps the prompt. At most half the window is kept either way.
     pub keep: Option<usize>,
+}
+
+/// A piece of generated text, and whether it belongs to the model's
+/// reasoning rather than its answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Piece<'a> {
+    pub text: &'a str,
+    pub reasoning: bool,
 }
 
 /// Why a generation ended.
@@ -270,6 +281,25 @@ pub fn run_tokens(
     options: &Options,
     mut on_text: impl FnMut(&str) -> bool,
 ) -> Result<Stats> {
+    run_tokens_with(session, prompt, options, |piece| {
+        piece.reasoning || on_text(piece.text)
+    })
+}
+
+/// Like [`run_tokens`], but `on_piece` receives the model's reasoning as
+/// well as its answer, each piece marked with which it is.
+///
+/// With [`Options::reasoning`] set, reasoning is what a model writes
+/// between `<think>` and `</think>` (Qwen3, DeepSeek R1), or outside the
+/// final channel in OpenAI's Harmony format (gpt-oss). The markers are not
+/// output, and stop strings apply to the answer only. Otherwise, or with
+/// `show_special` set, nothing is taken apart and everything is answer.
+pub fn run_tokens_with(
+    session: &mut Session,
+    prompt: &[u32],
+    options: &Options,
+    mut on_piece: impl FnMut(Piece<'_>) -> bool,
+) -> Result<Stats> {
     if prompt.is_empty() {
         return Err(Error::invalid("the prompt is empty"));
     }
@@ -313,7 +343,15 @@ pub fn run_tokens(
 
     let start = Instant::now();
     let mut sampler = Sampler::new(options.sampler.clone());
-    let mut text = TextStream::new(&options.stop);
+    let mut channels = Channels::new(
+        tokenizer,
+        prompt,
+        options.reasoning && !options.show_special,
+    );
+    // Reasoning has no stop strings, so its stream only joins characters
+    // split across tokens.
+    let mut answer = TextStream::new(&options.stop);
+    let mut thoughts = TextStream::new(&[]);
     let mut generated = 0;
     // A sampled token is evaluated only when another one is wanted, so the
     // last token of an answer costs nothing.
@@ -347,14 +385,27 @@ pub fn run_tokens(
 
         let mut piece = Vec::new();
         tokenizer.append_piece(token, options.show_special, &mut piece);
-        match text.push(&piece, &mut on_text) {
+        let flow = match channels.route(token, &piece) {
+            None => Flow::Continue,
+            Some((text, reasoning)) => {
+                let stream = if reasoning {
+                    &mut thoughts
+                } else {
+                    &mut answer
+                };
+                stream.push(text, &mut |text: &str| on_piece(Piece { text, reasoning }))
+            }
+        };
+        match flow {
             Flow::Continue => {}
             Flow::Stop => break Finish::Stop,
             Flow::Cancel => break Finish::Canceled,
         }
     };
     if !matches!(finish, Finish::Stop | Finish::Canceled) {
-        text.finish(&mut on_text);
+        for (stream, reasoning) in [(&mut thoughts, true), (&mut answer, false)] {
+            stream.finish(&mut |text: &str| on_piece(Piece { text, reasoning }));
+        }
     }
 
     Ok(Stats {
@@ -370,6 +421,118 @@ pub fn run_tokens(
         context_size: session.n_ctx(),
         dropped_tokens: dropped,
         context_bytes: session.cache_bytes(),
+    })
+}
+
+/// Follows which part of its output a model is writing: its reasoning or
+/// its answer. Two conventions are known.
+///
+/// - `<think>` and `</think>` around the reasoning (Qwen3, DeepSeek R1).
+///   A prompt may open the reasoning itself, and then the model starts
+///   inside it.
+/// - OpenAI's Harmony format (gpt-oss). Each message starts with a header,
+///   `<|start|>assistant<|channel|>final<|message|>`, and ends with
+///   `<|end|>`. The final channel is the answer and the others (analysis,
+///   commentary) are reasoning. Headers are not output.
+struct Channels {
+    /// `<think>` and `</think>`.
+    think: Option<(u32, u32)>,
+    /// Harmony's `<|start|>`, `<|channel|>`, `<|message|>` and `<|end|>`.
+    harmony: Option<[u32; 4]>,
+    /// Harmony's `<|constrain|>`, which can sit in a header.
+    constrain: Option<u32>,
+    /// Whether the text now is reasoning.
+    reasoning: bool,
+    /// The header being read, in Harmony.
+    header: Option<Vec<u8>>,
+    /// Whitespace that starts the next part is dropped, such as the blank
+    /// line after `</think>`.
+    fresh: bool,
+}
+
+impl Channels {
+    /// Finds the markers in `tokenizer`. `prompt` tells whether the model
+    /// starts inside its reasoning. A disabled router passes all text on
+    /// as answer.
+    fn new(tokenizer: &Tokenizer, prompt: &[u32], enabled: bool) -> Channels {
+        let find = |text: &str| tokenizer.find(text.as_bytes()).filter(|_| enabled);
+        let think = find("<think>").zip(find("</think>"));
+        let harmony = match (
+            find("<|start|>"),
+            find("<|channel|>"),
+            find("<|message|>"),
+            find("<|end|>"),
+        ) {
+            (Some(start), Some(channel), Some(message), Some(end)) => {
+                Some([start, channel, message, end])
+            }
+            _ => None,
+        };
+        Channels {
+            think,
+            harmony,
+            constrain: find("<|constrain|>"),
+            reasoning: opens_thought(think, prompt),
+            header: None,
+            fresh: false,
+        }
+    }
+
+    /// Where the text of `token`, `piece`, goes: `None` to drop it, or the
+    /// text to show and whether it is reasoning.
+    fn route<'p>(&mut self, token: u32, piece: &'p [u8]) -> Option<(&'p [u8], bool)> {
+        if let Some([start, channel, message, end]) = self.harmony {
+            if token == start || token == channel {
+                // A header, or the channel part of one: read it afresh.
+                self.header = Some(Vec::new());
+                return None;
+            }
+            if token == message {
+                if let Some(header) = self.header.take() {
+                    let name = String::from_utf8_lossy(&header);
+                    self.switch(!name.trim_start().starts_with("final"));
+                }
+                return None;
+            }
+            if token == end || Some(token) == self.constrain {
+                return None;
+            }
+            if let Some(header) = &mut self.header {
+                header.extend_from_slice(piece);
+                return None;
+            }
+        }
+        if let Some((open, close)) = self.think {
+            if token == open || token == close {
+                self.switch(token == open);
+                return None;
+            }
+        }
+        let text = if self.fresh {
+            piece.trim_ascii_start()
+        } else {
+            piece
+        };
+        if text.is_empty() {
+            return None;
+        }
+        self.fresh = false;
+        Some((text, self.reasoning))
+    }
+
+    /// Starts a part of the output.
+    fn switch(&mut self, reasoning: bool) {
+        self.reasoning = reasoning;
+        self.fresh = true;
+    }
+}
+
+/// True when `prompt` ends inside a `<think>` block, as DeepSeek R1's
+/// prompts do: its last `<think>` is not closed.
+fn opens_thought(think: Option<(u32, u32)>, prompt: &[u32]) -> bool {
+    think.is_some_and(|(open, close)| {
+        let last = |id: u32| prompt.iter().rposition(|&token| token == id);
+        last(open).is_some_and(|opened| last(close).is_none_or(|closed| closed < opened))
     })
 }
 
@@ -601,6 +764,94 @@ mod tests {
         // Empty stop strings are ignored.
         let (out, stopped) = stream(&[""], &[b"abc"]);
         assert_eq!((out.concat().as_str(), stopped), ("abc", false));
+    }
+
+    /// Routes `(token, text)` pairs and joins what comes out, as
+    /// `(answer, reasoning)`.
+    fn route(channels: &mut Channels, tokens: &[(u32, &str)]) -> (String, String) {
+        let (mut answer, mut reasoning) = (String::new(), String::new());
+        for &(token, text) in tokens {
+            match channels.route(token, text.as_bytes()) {
+                Some((text, true)) => reasoning.push_str(std::str::from_utf8(text).unwrap()),
+                Some((text, false)) => answer.push_str(std::str::from_utf8(text).unwrap()),
+                None => {}
+            }
+        }
+        (answer, reasoning)
+    }
+
+    fn channels(think: Option<(u32, u32)>, harmony: Option<[u32; 4]>) -> Channels {
+        Channels {
+            think,
+            harmony,
+            constrain: Some(5),
+            reasoning: false,
+            header: None,
+            fresh: false,
+        }
+    }
+
+    #[test]
+    fn thoughts_between_think_tags_are_reasoning() {
+        let mut router = channels(Some((10, 11)), None);
+        let (answer, reasoning) = route(
+            &mut router,
+            &[
+                (10, "<think>"),
+                (20, "\nplan"),
+                (21, " it"),
+                (11, "</think>"),
+                (22, "\n\n"),
+                (23, "Done."),
+            ],
+        );
+        assert_eq!((answer.as_str(), reasoning.as_str()), ("Done.", "plan it"));
+        // Without tags, everything is answer, leading space included.
+        let mut router = channels(Some((10, 11)), None);
+        assert_eq!(route(&mut router, &[(20, " Hi")]).0, " Hi");
+    }
+
+    #[test]
+    fn a_prompt_can_open_the_reasoning() {
+        let think = Some((10, 11));
+        assert!(opens_thought(think, &[1, 10, 12]));
+        assert!(!opens_thought(think, &[1, 10, 12, 11]));
+        assert!(opens_thought(think, &[10, 11, 10]));
+        assert!(!opens_thought(think, &[1, 2]));
+        assert!(!opens_thought(None, &[10]));
+    }
+
+    #[test]
+    fn harmony_channels_split_reasoning_from_the_answer() {
+        let mut router = channels(None, Some([1, 2, 3, 4]));
+        let (answer, reasoning) = route(
+            &mut router,
+            &[
+                (2, ""),
+                (20, "analysis"),
+                (3, ""),
+                (21, "Think"),
+                (22, " more."),
+                (4, ""),
+                (1, ""),
+                (23, "assistant"),
+                (2, ""),
+                (24, "commentary to=functions.f "),
+                (5, ""),
+                (25, "json"),
+                (3, ""),
+                (26, "{}"),
+                (4, ""),
+                (1, ""),
+                (23, "assistant"),
+                (2, ""),
+                (27, "final"),
+                (3, ""),
+                (28, "Hello"),
+            ],
+        );
+        assert_eq!(answer, "Hello");
+        assert_eq!(reasoning, "Think more.{}");
     }
 
     #[test]
