@@ -47,6 +47,8 @@ class _SamplerParams(ctypes.Structure):
         ("repeat_penalty", ctypes.c_float),
         ("repeat_last_n", ctypes.c_int32),
         ("seed", ctypes.c_uint64),
+        ("frequency_penalty", ctypes.c_float),
+        ("presence_penalty", ctypes.c_float),
     ]
 
 

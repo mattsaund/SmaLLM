@@ -48,7 +48,7 @@ name is enough when it singles one out.
 | Command | Does |
 |---|---|
 | `run <model> [prompt]` | Answers a prompt, or opens a chat when none is given |
-| `serve <model>` | Serves `/v1/chat/completions`, `/v1/completions` and `/v1/models` |
+| `serve <model>` | Serves `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/tokenize` and `/detokenize` |
 | `pull <user/repo>` | Downloads a model from Hugging Face. `user/repo:q8_0` picks a quantization |
 | `list`, `rm <model>` | Lists downloaded models, deletes one |
 | `info <model>` | Shows what a model is: size, layers, weight format, chat format |
@@ -307,8 +307,7 @@ left out.
 
 - [ ] Grammar-constrained output, and JSON that follows a schema.
 - [ ] Jinja chat templates, for models whose format is not one of the eight built in.
-- [ ] More samplers: Mirostat, typical, DRY, XTC and dynamic temperature. Frequency and presence penalties, and a
-      bias on chosen tokens.
+- [ ] More samplers: Mirostat, typical, DRY, XTC and dynamic temperature, and a bias on chosen tokens.
 - [ ] Token probabilities in the output.
 - [ ] Speculative decoding with a small draft model.
 - [ ] Saving a session's context to a file and loading it again.
@@ -318,7 +317,7 @@ left out.
 **Server**
 
 - [ ] Several requests at once.
-- [ ] Endpoints for embeddings, reranking, tokenizing and code infill.
+- [ ] Endpoints for embeddings, reranking and code infill.
 - [ ] Tool calls.
 - [ ] The Ollama API next to the OpenAI one, and several models loaded and unloaded on demand.
 - [ ] A built-in web page, and metrics.

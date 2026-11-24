@@ -6,6 +6,8 @@
 //! | GET    | `/v1/models`           | Names the loaded model.           |
 //! | POST   | `/v1/chat/completions` | Answers a conversation.           |
 //! | POST   | `/v1/completions`      | Completes a plain text prompt.    |
+//! | POST   | `/tokenize`            | Text to token ids.                |
+//! | POST   | `/detokenize`          | Token ids to text.                |
 //!
 //! One model is loaded and requests take turns with it. The session keeps
 //! its context between requests, so a chat that grows by one message only
@@ -131,15 +133,65 @@ impl Server {
             }
             ("POST", "/v1/chat/completions") => self.generate(request, out, Kind::Chat),
             ("POST", "/v1/completions") => self.generate(request, out, Kind::Text),
+            ("POST", "/tokenize") => self.tokens(request, out, true),
+            ("POST", "/detokenize") => self.tokens(request, out, false),
             (
                 _,
                 "/health"
                 | "/v1/health"
                 | "/v1/models"
                 | "/v1/chat/completions"
-                | "/v1/completions",
+                | "/v1/completions"
+                | "/tokenize"
+                | "/detokenize",
             ) => send_error(out, 405, "method not allowed"),
             _ => send_error(out, 404, "no such endpoint"),
+        }
+    }
+
+    /// Handles `/tokenize` and `/detokenize`, in the shape llama.cpp's
+    /// server gave them.
+    ///
+    /// - Tokenize: `{"content": text}` to `{"tokens": [ids]}`. `add_special`
+    ///   adds the tokens the model starts with, and `parse_special` reads
+    ///   control tokens in the text. Both are off unless asked for.
+    /// - Detokenize: `{"tokens": [ids]}` to `{"content": text}`.
+    fn tokens(&self, request: &Request, out: &mut impl Write, encode: bool) -> std::io::Result<()> {
+        let body = match std::str::from_utf8(&request.body)
+            .map_err(|_| "the body is not UTF-8".to_string())
+            .and_then(Json::parse)
+        {
+            Ok(body) => body,
+            Err(message) => return send_error(out, 400, &message),
+        };
+        // The model is shared, so this does not wait for a generation.
+        let model = match self.session.lock() {
+            Ok(session) => session.model().clone(),
+            Err(poisoned) => poisoned.into_inner().model().clone(),
+        };
+        let tokenizer = model.tokenizer();
+        if encode {
+            let Some(text) = body.get("content").and_then(Json::as_str) else {
+                return send_error(out, 400, "'content' must be a string");
+            };
+            let flag = |name: &str| body.get(name).and_then(Json::as_bool).unwrap_or(false);
+            let ids = tokenizer.encode(text, flag("add_special"), flag("parse_special"));
+            let ids = ids.into_iter().map(|id| Json::Number(id as f64)).collect();
+            send_json(out, 200, &Json::object([("tokens", Json::Array(ids))]))
+        } else {
+            let Some(ids) = body.get("tokens").and_then(Json::as_array) else {
+                return send_error(out, 400, "'tokens' must be an array of token ids");
+            };
+            let mut bytes = Vec::new();
+            for id in ids {
+                let known = id.as_usize().filter(|id| *id < tokenizer.n_tokens());
+                let Some(id) = known else {
+                    return send_error(out, 400, "'tokens' holds something that is not a token id");
+                };
+                tokenizer.append_piece(id as u32, true, &mut bytes);
+            }
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            send_json(out, 200, &Json::object([("content", Json::string(text))]))
         }
     }
 
@@ -316,6 +368,10 @@ impl Job {
             repeat_penalty: number("repeat_penalty")
                 .map_or(defaults.repeat_penalty, |value| value as f32),
             repeat_last_n: whole("repeat_last_n").unwrap_or(defaults.repeat_last_n),
+            frequency_penalty: number("frequency_penalty")
+                .map_or(defaults.frequency_penalty, |value| value as f32),
+            presence_penalty: number("presence_penalty")
+                .map_or(defaults.presence_penalty, |value| value as f32),
             seed: whole("seed").map_or(clock_seed, |seed| seed as u64),
         };
         let stop = match body.get("stop") {
@@ -524,6 +580,7 @@ mod tests {
         let job = job(
             r#"{"model":"x","messages":[{"role":"system","content":"s"},{"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}],
                 "max_tokens":32,"temperature":0,"top_p":0.5,"seed":7,"stop":["END","X"],"stream":true,
+                "frequency_penalty":0.5,"presence_penalty":0.25,
                 "stream_options":{"include_usage":true},"unknown":1}"#,
             Kind::Chat,
         )
@@ -537,6 +594,8 @@ mod tests {
         assert_eq!(job.options.sampler.temperature, 0.0);
         assert_eq!(job.options.sampler.top_p, 0.5);
         assert_eq!(job.options.sampler.seed, 7);
+        assert_eq!(job.options.sampler.frequency_penalty, 0.5);
+        assert_eq!(job.options.sampler.presence_penalty, 0.25);
         assert_eq!(job.options.stop, ["END", "X"]);
         assert!(job.stream && job.include_usage);
     }

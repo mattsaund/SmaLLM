@@ -2,7 +2,8 @@
 //!
 //! The steps run in a fixed order, each narrowing the candidates:
 //!
-//! 1. Repetition penalty: lowers the logits of recently used tokens.
+//! 1. Penalties: lower the logits of recently used tokens, by a factor,
+//!    by an amount per use, and by an amount per token.
 //! 2. Top-k: keeps the `k` most likely tokens.
 //! 3. Top-p: keeps the smallest set whose probabilities sum to `p`.
 //! 4. Min-p: drops tokens less likely than `min_p` times the best one.
@@ -24,8 +25,14 @@ pub struct SamplerConfig {
     pub min_p: f32,
     /// Divide the logits of recent tokens by this. One changes nothing.
     pub repeat_penalty: f32,
-    /// How many recent tokens the penalty looks at.
+    /// How many recent tokens the penalties look at.
     pub repeat_last_n: usize,
+    /// Subtract this from a token's logit for every time it was used
+    /// recently. Zero changes nothing.
+    pub frequency_penalty: f32,
+    /// Subtract this from the logit of every token that was used recently,
+    /// however often. Zero changes nothing.
+    pub presence_penalty: f32,
     /// Seed of the random draw. The same seed repeats the same choices.
     pub seed: u64,
 }
@@ -39,6 +46,8 @@ impl Default for SamplerConfig {
             min_p: 0.05,
             repeat_penalty: 1.0,
             repeat_last_n: 64,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
             seed: 0,
         }
     }
@@ -101,6 +110,8 @@ pub struct Sampler {
     /// Reused between calls to avoid allocating per token.
     candidates: Vec<Candidate>,
     probabilities: Vec<f32>,
+    /// The recent tokens, sorted, for counting how often each was used.
+    recent: Vec<u32>,
 }
 
 impl Sampler {
@@ -112,6 +123,7 @@ impl Sampler {
             rng,
             candidates: Vec::new(),
             probabilities: Vec::new(),
+            recent: Vec::new(),
         }
     }
 
@@ -121,11 +133,13 @@ impl Sampler {
     }
 
     /// Picks a token from `logits`. `history` is the context so far, used by
-    /// the repetition penalty.
+    /// the penalties on recent tokens.
     pub fn sample(&mut self, logits: &[f32], history: &[u32]) -> u32 {
         let config = &self.config;
-        let penalize =
-            config.repeat_penalty != 1.0 && config.repeat_last_n > 0 && !history.is_empty();
+        let any_penalty = config.repeat_penalty != 1.0
+            || config.frequency_penalty != 0.0
+            || config.presence_penalty != 0.0;
+        let penalize = any_penalty && config.repeat_last_n > 0 && !history.is_empty();
 
         // The common greedy case needs no candidate list at all.
         if config.temperature <= 0.0 && !penalize {
@@ -143,17 +157,26 @@ impl Sampler {
         }
 
         if penalize {
-            let recent = &history[history.len().saturating_sub(config.repeat_last_n)..];
-            for &token in recent {
-                if let Some(candidate) = candidates.get_mut(token as usize) {
-                    // Dividing a negative logit would raise it, so those
-                    // are multiplied instead.
-                    if candidate.logit > 0.0 {
-                        candidate.logit /= config.repeat_penalty;
-                    } else {
-                        candidate.logit *= config.repeat_penalty;
-                    }
+            // Sorting the recent tokens puts equal ones next to each other,
+            // so each distinct token is handled once, with its count.
+            let recent = &mut self.recent;
+            recent.clear();
+            recent
+                .extend_from_slice(&history[history.len().saturating_sub(config.repeat_last_n)..]);
+            recent.sort_unstable();
+            for uses in recent.chunk_by(|a, b| a == b) {
+                let Some(candidate) = candidates.get_mut(uses[0] as usize) else {
+                    continue;
+                };
+                // Dividing a negative logit would raise it, so those are
+                // multiplied instead.
+                if candidate.logit > 0.0 {
+                    candidate.logit /= config.repeat_penalty;
+                } else {
+                    candidate.logit *= config.repeat_penalty;
                 }
+                candidate.logit -=
+                    uses.len() as f32 * config.frequency_penalty + config.presence_penalty;
             }
         }
         if config.temperature <= 0.0 {
@@ -252,6 +275,51 @@ fn softmax(candidates: &[Candidate], temperature: f32, out: &mut Vec<f32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frequency_and_presence_penalties_count_recent_uses() {
+        // Four equal logits. Token 1 was used three times, token 2 once.
+        let logits = [2.0f32, 2.0, 2.0, 2.0];
+        let history = [1, 2, 1, 1];
+        let greedy = |frequency_penalty: f32, presence_penalty: f32| {
+            let config = SamplerConfig {
+                temperature: 0.0,
+                frequency_penalty,
+                presence_penalty,
+                ..SamplerConfig::default()
+            };
+            let mut sampler = Sampler::new(config);
+            sampler.sample(&logits, &history);
+            sampler
+                .candidates
+                .iter()
+                .map(|candidate| candidate.logit)
+                .collect::<Vec<f32>>()
+        };
+        // Per use: three uses cost three times as much as one.
+        assert_eq!(greedy(0.5, 0.0), [2.0, 0.5, 1.5, 2.0]);
+        // Per token: any number of uses costs the same.
+        assert_eq!(greedy(0.0, 0.5), [2.0, 1.5, 1.5, 2.0]);
+        assert_eq!(greedy(0.5, 0.25), [2.0, 0.25, 1.25, 2.0]);
+    }
+
+    #[test]
+    fn the_repeat_penalty_applies_once_per_token() {
+        let config = SamplerConfig {
+            temperature: 0.0,
+            repeat_penalty: 2.0,
+            ..SamplerConfig::default()
+        };
+        let mut sampler = Sampler::new(config);
+        // Token 0 was used twice and still pays the penalty once.
+        assert_eq!(sampler.sample(&[4.0, 3.0, -1.0], &[0, 0, 2]), 1);
+        let logits: Vec<f32> = sampler
+            .candidates
+            .iter()
+            .map(|candidate| candidate.logit)
+            .collect();
+        assert_eq!(logits, [2.0, 3.0, -2.0]);
+    }
 
     fn config() -> SamplerConfig {
         SamplerConfig {

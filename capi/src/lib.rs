@@ -135,6 +135,8 @@ pub struct SmallmSamplerParams {
     pub repeat_penalty: f32,
     pub repeat_last_n: i32,
     pub seed: u64,
+    pub frequency_penalty: f32,
+    pub presence_penalty: f32,
 }
 
 impl SmallmSamplerParams {
@@ -146,6 +148,8 @@ impl SmallmSamplerParams {
             min_p: self.min_p,
             repeat_penalty: self.repeat_penalty,
             repeat_last_n: self.repeat_last_n.max(0) as usize,
+            frequency_penalty: self.frequency_penalty,
+            presence_penalty: self.presence_penalty,
             seed: self.seed,
         }
     }
@@ -573,6 +577,8 @@ pub extern "C" fn smallm_sampler_default_params() -> SmallmSamplerParams {
         repeat_penalty: defaults.repeat_penalty,
         repeat_last_n: defaults.repeat_last_n as i32,
         seed: defaults.seed,
+        frequency_penalty: defaults.frequency_penalty,
+        presence_penalty: defaults.presence_penalty,
     }
 }
 

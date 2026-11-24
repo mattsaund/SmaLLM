@@ -27,6 +27,9 @@ The first version.
   the window has no built-in limit. Tested with 262,144 tokens.
 - **The program.** `smallm run`, `serve`, `pull`, `list`, `rm`, `info`,
   `bench` and `tokenize`.
-- **The server.** An OpenAI-compatible API with streaming.
+- **The server.** An OpenAI-compatible API with streaming, and the
+  tokenize and detokenize endpoints of llama.cpp's server.
+- **Sampling.** Temperature, top-k, top-p, min-p, and repetition, frequency
+  and presence penalties.
 - **Libraries.** A C API as a shared and a static library, with a header,
   and a Python binding built on it.

@@ -31,7 +31,8 @@ pub fn help() -> String {
     format!(
         "Usage: smallm serve <model> [options]\n\n\
          Serves the model over HTTP, in the API that OpenAI clients speak:\n\
-         /v1/chat/completions, /v1/completions and /v1/models.\n\n\
+         /v1/chat/completions, /v1/completions and /v1/models.\n\
+         Also /tokenize and /detokenize.\n\n\
          Options:\n{}",
         args::describe(&specs())
     )

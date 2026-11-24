@@ -71,8 +71,10 @@ typedef struct smallm_sampler_params {
     float top_p;           /* Keep tokens within this probability mass. */
     float min_p;           /* Drop tokens below this share of the best. */
     float repeat_penalty;  /* Penalty on recent tokens. 1 for none. */
-    int32_t repeat_last_n; /* Tokens the penalty looks back. */
+    int32_t repeat_last_n; /* Tokens the penalties look back. */
     uint64_t seed;         /* The same seed repeats the same choices. */
+    float frequency_penalty; /* Taken off a score per recent use. 0 for none. */
+    float presence_penalty;  /* Taken off the score of any recent token. */
 } smallm_sampler_params;
 
 /* Options for smallm_generate and smallm_chat. */

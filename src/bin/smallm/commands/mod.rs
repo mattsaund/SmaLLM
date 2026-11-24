@@ -37,7 +37,7 @@ pub const SESSION_SPECS: [Spec; 3] = [
 ];
 
 /// Options of every command that generates text.
-pub const SAMPLER_SPECS: [Spec; 7] = [
+pub const SAMPLER_SPECS: [Spec; 9] = [
     value("temp", None, "Randomness, 0 for none (default: 0.8)"),
     value(
         "top-k",
@@ -62,7 +62,17 @@ pub const SAMPLER_SPECS: [Spec; 7] = [
     value(
         "repeat-last-n",
         None,
-        "Tokens the penalty looks back (default: 64)",
+        "Tokens the penalties look back (default: 64)",
+    ),
+    value(
+        "frequency-penalty",
+        None,
+        "Lower a token's score for each recent use (default: 0)",
+    ),
+    value(
+        "presence-penalty",
+        None,
+        "Lower the score of every recently used token (default: 0)",
     ),
     value("seed", None, "Seed of the random draw (default: random)"),
 ];
@@ -131,6 +141,12 @@ pub fn sampler_config(args: &Args) -> Result<SamplerConfig, String> {
         repeat_last_n: args
             .number("repeat-last-n")?
             .unwrap_or(defaults.repeat_last_n),
+        frequency_penalty: args
+            .number("frequency-penalty")?
+            .unwrap_or(defaults.frequency_penalty),
+        presence_penalty: args
+            .number("presence-penalty")?
+            .unwrap_or(defaults.presence_penalty),
         seed: args.number("seed")?.unwrap_or(clock_seed),
     })
 }
