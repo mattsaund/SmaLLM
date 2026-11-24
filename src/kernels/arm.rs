@@ -23,7 +23,7 @@ use std::arch::asm;
 use super::scalar;
 use super::{ActRef, DotQuant, Kernels, TileDot};
 use crate::tensor::TensorType;
-use crate::tensor::quant::Tile;
+use crate::tensor::quant::{self, Tile};
 
 /// Kernels for every AArch64 CPU.
 pub static KERNELS: Kernels = kernels("neon", row_quant_widening, tile_dot);
@@ -69,9 +69,12 @@ fn row_quant_widening(ty: TensorType) -> DotQuant {
         TensorType::Q5_0 => row_q5_0,
         TensorType::Q5_1 => row_q5_1,
         TensorType::Q8_0 => row_q8_0,
+        TensorType::Iq4Nl => row_iq4_nl,
+        TensorType::Mxfp4 => row_mxfp4,
         TensorType::Q4K => row_q4_k,
         TensorType::Q5K => row_q5_k,
         TensorType::Q6K => row_q6_k,
+        TensorType::Iq4Xs => row_iq4_xs,
         _ => scalar::row_quant(ty),
     }
 }
@@ -84,9 +87,12 @@ fn row_quant_sdot(ty: TensorType) -> DotQuant {
         TensorType::Q5_0 => row_q5_0_sdot,
         TensorType::Q5_1 => row_q5_1_sdot,
         TensorType::Q8_0 => row_q8_0_sdot,
+        TensorType::Iq4Nl => row_iq4_nl_sdot,
+        TensorType::Mxfp4 => row_mxfp4_sdot,
         TensorType::Q4K => row_q4_k_sdot,
         TensorType::Q5K => row_q5_k_sdot,
         TensorType::Q6K => row_q6_k_sdot,
+        TensorType::Iq4Xs => row_iq4_xs_sdot,
         _ => scalar::row_quant(ty),
     }
 }
@@ -488,6 +494,52 @@ struct Q4_1;
 struct Q5_0;
 struct Q5_1;
 struct Q8_0;
+struct Iq4Nl;
+struct Mxfp4;
+
+/// Looks 16 four-bit indices up in a table of 16 signed bytes, with one
+/// `tbl` instruction.
+#[inline(always)]
+unsafe fn lookup(table: &[i8; 16], indices: uint8x16_t) -> int8x16_t {
+    // SAFETY: the table is 16 readable bytes, and every index is below 16.
+    unsafe { vqtbl1q_s8(vld1q_s8(table.as_ptr()), indices) }
+}
+
+impl Block32 for Iq4Nl {
+    const BYTES: usize = 18;
+    const HAS_OFFSET: bool = false;
+    #[inline(always)]
+    unsafe fn load(p: *const u8) -> Block {
+        // SAFETY: the caller guarantees an 18-byte block at `p`.
+        unsafe {
+            let (low, high) = nibbles(p.add(2));
+            Block {
+                low: lookup(&quant::IQ4_NL_LEVELS, low),
+                high: lookup(&quant::IQ4_NL_LEVELS, high),
+                scale: half(p),
+                offset: 0.0,
+            }
+        }
+    }
+}
+
+impl Block32 for Mxfp4 {
+    const BYTES: usize = 17;
+    const HAS_OFFSET: bool = false;
+    #[inline(always)]
+    unsafe fn load(p: *const u8) -> Block {
+        // SAFETY: the caller guarantees a 17-byte block at `p`.
+        unsafe {
+            let (low, high) = nibbles(p.add(1));
+            Block {
+                low: lookup(&quant::MXFP4_LEVELS, low),
+                high: lookup(&quant::MXFP4_LEVELS, high),
+                scale: quant::e8m0_half(*p),
+                offset: 0.0,
+            }
+        }
+    }
+}
 
 impl Block32 for Q4_0 {
     const BYTES: usize = 18;
@@ -854,6 +906,53 @@ unsafe fn q6_k_row<D: ByteDot>(row: *const u8, n: usize, act: ActRef) -> f32 {
     total
 }
 
+/// The eight 6-bit scales of the IQ4_XS super-block at `p`, less 32, one
+/// per run of 32 weights. A scale has 4 low bits in a nibble of the bytes
+/// at `p + 4`, low nibble first, and 2 high bits in the 16-bit word at
+/// `p + 2`.
+#[inline(always)]
+unsafe fn iq4_xs_scales(p: *const u8) -> [i32; 8] {
+    // SAFETY: the caller guarantees 8 readable bytes at `p`.
+    let (high, low) = unsafe {
+        let high = u16::from_le((p.add(2) as *const u16).read_unaligned());
+        (high as u32, word(p.add(4)))
+    };
+    std::array::from_fn(|run| {
+        let bits = ((low >> (4 * run)) & 0x0f) | (((high >> (2 * run)) & 3) << 4);
+        bits as i32 - 32
+    })
+}
+
+/// Row kernel for IQ4_XS: super-blocks of eight runs of 32 weights, each
+/// laid out like an IQ4_NL block, with a 6-bit scale per run.
+/// `weight = d * (scale - 32) * level[nibble]`.
+#[inline(always)]
+unsafe fn iq4_xs_row<D: ByteDot>(row: *const u8, n: usize, act: ActRef) -> f32 {
+    const BLOCK_BYTES: usize = 136;
+    let mut total = 0.0f32;
+    // SAFETY: the caller guarantees `row` holds `n / 256` super-blocks and
+    // `act` describes `n` quantized activations.
+    unsafe {
+        for sb in 0..n / 256 {
+            let p = row.add(sb * BLOCK_BYTES);
+            let acts = act.q.add(sb * 256);
+            let d = half(p) * *act.scale.add(sb);
+            let mut sum = vdupq_n_s32(0);
+            for (run, scale) in iq4_xs_scales(p).into_iter().enumerate() {
+                let (low, high) = nibbles(p.add(8 + run * 16));
+                let a = acts.add(run * 32);
+                let low = lookup(&quant::IQ4_NL_LEVELS, low);
+                let high = lookup(&quant::IQ4_NL_LEVELS, high);
+                let products = D::add_products(vdupq_n_s32(0), low, vld1q_s8(a));
+                let products = D::add_products(products, high, vld1q_s8(a.add(16)));
+                sum = vmlaq_n_s32(sum, products, scale);
+            }
+            total += d * vaddvq_s32(sum) as f32;
+        }
+    }
+    total
+}
+
 // ---------------------------------------------------------------------------
 // Filling tiles
 // ---------------------------------------------------------------------------
@@ -868,9 +967,12 @@ unsafe fn tile_fill(tile: &mut Tile, ty: TensorType, height: usize, data: &[u8],
         TensorType::Q4_0 => fill_block32::<Q4_0>,
         TensorType::Q5_0 => fill_block32::<Q5_0>,
         TensorType::Q8_0 => fill_block32::<Q8_0>,
+        TensorType::Iq4Nl => fill_block32::<Iq4Nl>,
+        TensorType::Mxfp4 => fill_block32::<Mxfp4>,
         TensorType::Q4K => fill_k4::<false>,
         TensorType::Q5K => fill_k4::<true>,
         TensorType::Q6K => fill_q6_k,
+        TensorType::Iq4Xs => fill_iq4_xs,
         _ => return tile.fill(ty, height, data, row_bytes),
     };
     if height != 4 {
@@ -878,15 +980,19 @@ unsafe fn tile_fill(tile: &mut Tile, ty: TensorType, height: usize, data: &[u8],
     }
     tile.prepare(ty, 4, row_bytes);
     // Rows the tile lacks are read from a row of zeros, which decodes to
-    // weights of zero in each of these formats.
+    // weights of zero in each of these formats, and then cleared: in some
+    // formats zeros stand for other integers times a scale of zero.
     let blank = tile.blank_row(row_bytes).as_ptr();
     let mut rows = [blank; 4];
+    let mut given = 0;
     for (row, bytes) in rows.iter_mut().zip(data.chunks_exact(row_bytes)) {
         *row = bytes.as_ptr();
+        given += 1;
     }
     // SAFETY: every pointer in `rows` is valid for `row_bytes` bytes, which
     // is a whole number of blocks, and `prepare` sized the tile for them.
     tile.has_offset = unsafe { fill(tile, rows) };
+    tile.clear_rows(given);
 }
 
 /// Turns four registers of four 32-bit lanes into their transpose: lane `r`
@@ -956,6 +1062,50 @@ trait TileBlock {
     const BIAS: f32;
     /// The first and the last 16 weights of the block at `p`.
     unsafe fn weights(p: *const u8) -> (uint8x16_t, uint8x16_t);
+    /// The scale of the block at `p`. Most formats start with a half float.
+    #[inline(always)]
+    unsafe fn scale(p: *const u8) -> f32 {
+        // SAFETY: the caller guarantees a whole block at `p`.
+        unsafe { half(p) }
+    }
+}
+
+impl TileBlock for Iq4Nl {
+    const BYTES: usize = 18;
+    const BIAS: f32 = 0.0;
+    #[inline(always)]
+    unsafe fn weights(p: *const u8) -> (uint8x16_t, uint8x16_t) {
+        // SAFETY: the caller guarantees an 18-byte block at `p`.
+        unsafe {
+            let (low, high) = nibbles(p.add(2));
+            (
+                vreinterpretq_u8_s8(lookup(&quant::IQ4_NL_LEVELS, low)),
+                vreinterpretq_u8_s8(lookup(&quant::IQ4_NL_LEVELS, high)),
+            )
+        }
+    }
+}
+
+impl TileBlock for Mxfp4 {
+    const BYTES: usize = 17;
+    const BIAS: f32 = 0.0;
+    #[inline(always)]
+    unsafe fn weights(p: *const u8) -> (uint8x16_t, uint8x16_t) {
+        // SAFETY: the caller guarantees a 17-byte block at `p`.
+        unsafe {
+            let (low, high) = nibbles(p.add(1));
+            (
+                vreinterpretq_u8_s8(lookup(&quant::MXFP4_LEVELS, low)),
+                vreinterpretq_u8_s8(lookup(&quant::MXFP4_LEVELS, high)),
+            )
+        }
+    }
+    #[inline(always)]
+    unsafe fn scale(p: *const u8) -> f32 {
+        // SAFETY: the caller guarantees a 17-byte block at `p`, which starts
+        // with its exponent.
+        quant::e8m0_half(unsafe { *p })
+    }
 }
 
 impl TileBlock for Q4_0 {
@@ -1013,7 +1163,7 @@ unsafe fn fill_block32<F: TileBlock>(tile: &mut Tile, rows: [*const u8; 4]) -> b
                 let p = rows[r].add(block * F::BYTES);
                 (low[r], high[r]) = F::weights(p);
                 // One scale per row, shared by both sub-blocks.
-                let d = half(p);
+                let d = F::scale(p);
                 let shift = 0.0 - F::BIAS * d;
                 for sub in block * 2..block * 2 + 2 {
                     *scale.add(sub * 4 + r) = d;
@@ -1094,6 +1244,60 @@ unsafe fn fill_k4<const FIVE: bool>(tile: &mut Tile, rows: [*const u8; 4]) -> bo
                 for (run, weights) in runs.into_iter().enumerate() {
                     store_columns(q.add((block * 16 + pair * 4 + run) * 64), weights);
                 }
+            }
+        }
+        vmaxvq_u32(any) != 0
+    }
+}
+
+/// The fill of IQ4_XS: runs of 32 weights laid out like IQ4_NL blocks, with
+/// a 6-bit scale each, and signed levels, which the tile keeps as they are.
+///
+/// The format has no offsets, but the portable fill writes
+/// `0 - 0 * scale`, which is not zero when the scale is not a number, so
+/// that is what is written here too.
+unsafe fn fill_iq4_xs(tile: &mut Tile, rows: [*const u8; 4]) -> bool {
+    const BYTES: usize = 136;
+    let (q, scale, offset) = (
+        tile.q.as_mut_ptr(),
+        tile.scale.as_mut_ptr(),
+        tile.offset.as_mut_ptr(),
+    );
+    // SAFETY: the caller guarantees `tile.cols / 256` super-blocks behind
+    // every row pointer and a tile sized for them.
+    unsafe {
+        let zero = vdupq_n_f32(0.0);
+        let mut any = vdupq_n_u32(0);
+        for block in 0..tile.cols / 256 {
+            // Eight scales per row, each for a run of 32 weights, which is
+            // two sub-blocks of 16. They are written four runs at a time.
+            for part in 0..2 {
+                let mut scales = [zero; 4];
+                let mut offsets = [zero; 4];
+                for r in 0..4 {
+                    let p = rows[r].add(block * BYTES);
+                    let integers = iq4_xs_scales(p);
+                    let integers = vcvtq_f32_s32(vld1q_s32(integers.as_ptr().add(part * 4)));
+                    scales[r] = vmulq_n_f32(integers, half(p));
+                    offsets[r] = vsubq_f32(zero, vmulq_n_f32(scales[r], 0.0));
+                    any = vorrq_u32(any, nonzero(offsets[r]));
+                }
+                store_affine(scale.add((block * 16 + part * 8) * 4), scales, 2);
+                store_affine(offset.add((block * 16 + part * 8) * 4), offsets, 2);
+            }
+            // Each run is 16 bytes: the low nibbles are its first 16
+            // weights, the high nibbles its last 16.
+            for run in 0..8 {
+                let mut low = [vdupq_n_u8(0); 4];
+                let mut high = [vdupq_n_u8(0); 4];
+                for r in 0..4 {
+                    let p = rows[r].add(block * BYTES);
+                    let (first, second) = nibbles(p.add(8 + run * 16));
+                    low[r] = vreinterpretq_u8_s8(lookup(&quant::IQ4_NL_LEVELS, first));
+                    high[r] = vreinterpretq_u8_s8(lookup(&quant::IQ4_NL_LEVELS, second));
+                }
+                store_columns(q.add((block * 16 + run * 2) * 64), low);
+                store_columns(q.add((block * 16 + run * 2 + 1) * 64), high);
             }
         }
         vmaxvq_u32(any) != 0
@@ -1193,6 +1397,9 @@ variants!(row_q4_1, row_q4_1_sdot, block_row, Q4_1);
 variants!(row_q5_0, row_q5_0_sdot, block_row, Q5_0);
 variants!(row_q5_1, row_q5_1_sdot, block_row, Q5_1);
 variants!(row_q8_0, row_q8_0_sdot, block_row, Q8_0);
+variants!(row_iq4_nl, row_iq4_nl_sdot, block_row, Iq4Nl);
+variants!(row_mxfp4, row_mxfp4_sdot, block_row, Mxfp4);
+variants!(row_iq4_xs, row_iq4_xs_sdot, iq4_xs_row);
 variants!(row_q4_k, row_q4_k_sdot, q4_k_row);
 variants!(row_q5_k, row_q5_k_sdot, q5_k_row);
 variants!(row_q6_k, row_q6_k_sdot, q6_k_row);
