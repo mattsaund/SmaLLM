@@ -12,7 +12,7 @@ use std::sync::OnceLock;
 
 /// Every setting the file can hold: its name, its default and what it
 /// does. The names are those of the command-line options they stand for.
-pub const SETTINGS: [(&str, &str, &str); 21] = [
+pub const SETTINGS: [(&str, &str, &str); 22] = [
     (
         "ctx",
         "auto",
@@ -21,7 +21,12 @@ pub const SETTINGS: [(&str, &str, &str); 21] = [
     (
         "threads",
         "auto",
-        "Threads to compute with. auto: one per performance core.",
+        "Threads to generate with. auto: one per performance core.",
+    ),
+    (
+        "threads-batch",
+        "auto",
+        "Threads to read prompts with. auto: every physical core, or threads when set.",
     ),
     (
         "batch",

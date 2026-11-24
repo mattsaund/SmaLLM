@@ -20,8 +20,11 @@ mod pretok;
 mod pretok_table;
 mod regex;
 mod unicode;
+mod unicode_maps;
 mod unicode_tables;
+mod unigram;
 mod vocab;
+mod wordpiece;
 
 use std::ops::Range;
 
@@ -37,6 +40,11 @@ pub enum Kind {
     SentencePiece,
     /// Pairs merge in the order of the model's merge list.
     Bpe,
+    /// The longest tokens cover each word from the left (BERT).
+    WordPiece,
+    /// The tokens whose scores add up highest cover the text (T5 and
+    /// XLM-RoBERTa).
+    Unigram,
 }
 
 /// What a token is for, as bit flags.
@@ -45,6 +53,7 @@ mod attr {
     pub const UNKNOWN: u8 = 2;
     pub const CONTROL: u8 = 4;
     pub const USER_DEFINED: u8 = 8;
+    pub const UNUSED: u8 = 16;
     pub const BYTE: u8 = 32;
     /// Tokens matched as whole strings before any other tokenization.
     pub const SPECIAL: u8 = CONTROL | USER_DEFINED | UNKNOWN;
@@ -113,6 +122,17 @@ pub struct Tokenizer {
     add_space_prefix: bool,
     /// Tokens that end generation.
     end_tokens: Vec<u32>,
+    /// The unknown token, and the separator that ends a WordPiece input.
+    unk: Option<u32>,
+    sep: Option<u32>,
+    /// Whether a pair of texts is joined with the separator.
+    add_sep: bool,
+    /// Bytes in the longest token, which bounds the search for one.
+    max_token_len: usize,
+    /// How WordPiece cleans text.
+    normalizer: wordpiece::Normalizer,
+    /// The normalization map and settings of a Unigram tokenizer.
+    unigram: Option<unigram::Unigram>,
 }
 
 impl Tokenizer {
@@ -122,7 +142,9 @@ impl Tokenizer {
         let kind = match model {
             "llama" => Kind::SentencePiece,
             "gpt2" | "gemma4" => Kind::Bpe,
-            "bert" | "t5" | "rwkv" | "plamo2" | "plamo3" => {
+            "bert" => Kind::WordPiece,
+            "t5" => Kind::Unigram,
+            "rwkv" | "plamo2" | "plamo3" => {
                 return Err(Error::unsupported(format!(
                     "tokenizer type '{model}', which only models this engine cannot run yet use"
                 )));
@@ -154,6 +176,7 @@ impl Tokenizer {
                     2 => attr::UNKNOWN,
                     3 => attr::CONTROL,
                     4 => attr::USER_DEFINED,
+                    5 => attr::UNUSED,
                     6 => attr::BYTE,
                     _ => 0,
                 };
@@ -169,7 +192,7 @@ impl Tokenizer {
         };
         let mut pre = PreTokenizer::for_name("default")?;
         match kind {
-            Kind::SentencePiece => {
+            Kind::SentencePiece | Kind::Unigram => {
                 if let Some(array) = file.get_array("tokenizer.ggml.scores") {
                     if array.len() < n_tokens {
                         return Err(Error::format(
@@ -192,6 +215,7 @@ impl Tokenizer {
                 merges = Some((table, index));
                 pre = PreTokenizer::for_name(&pre_name)?;
             }
+            Kind::WordPiece => {}
         }
 
         // Special token ids: defaults by kind, then the file's own values.
@@ -205,13 +229,15 @@ impl Tokenizer {
         let (default_bos, default_eos) = match kind {
             Kind::SentencePiece => (Some(1), Some(2)),
             Kind::Bpe => (None, None),
+            Kind::WordPiece => (Some(101), None),
+            Kind::Unigram => (None, Some(1)),
         };
         let bos = read_id("tokenizer.ggml.bos_token_id", default_bos).filter(|_| !pre.no_bos);
         let eos = read_id("tokenizer.ggml.eos_token_id", default_eos);
         let mut eot = read_id("tokenizer.ggml.eot_token_id", None);
         let eom = read_id("tokenizer.ggml.eom_token_id", None);
 
-        let default_add_bos = kind == Kind::SentencePiece || pre.add_bos;
+        let default_add_bos = matches!(kind, Kind::SentencePiece | Kind::WordPiece) || pre.add_bos;
         // Gemma 4 files can say not to add BOS, but the model needs it, so
         // llama.cpp adds it anyway.
         let add_bos = (file
@@ -221,8 +247,32 @@ impl Tokenizer {
             && bos.is_some();
         let add_eos = file
             .get_bool("tokenizer.ggml.add_eos_token")
-            .unwrap_or(false)
+            .unwrap_or(kind == Kind::Unigram)
             && eos.is_some();
+        let default_unk = match kind {
+            Kind::WordPiece => Some(100),
+            Kind::Unigram => Some(2),
+            _ => None,
+        };
+        let unk = read_id("tokenizer.ggml.unknown_token_id", default_unk);
+        let sep = read_id(
+            "tokenizer.ggml.seperator_token_id",
+            (kind == Kind::WordPiece).then_some(102),
+        );
+        let lowercase = file
+            .get_bool("tokenizer.ggml.normalizer.lowercase")
+            .unwrap_or(true);
+        let normalizer = wordpiece::Normalizer {
+            lowercase,
+            strip_accents: file
+                .get_bool("tokenizer.ggml.normalizer.strip_accents")
+                .unwrap_or(lowercase),
+        };
+        if file.get_bool("tokenizer.ggml.normalizer.nfc") == Some(true) {
+            return Err(Error::unsupported(
+                "tokenizers that compose characters (NFC)",
+            ));
+        }
         let add_space_prefix = file
             .get_bool("tokenizer.ggml.add_space_prefix")
             .unwrap_or(kind == Kind::SentencePiece);
@@ -245,7 +295,39 @@ impl Tokenizer {
             add_eos,
             add_space_prefix,
             end_tokens: Vec::new(),
+            unk,
+            sep,
+            add_sep: file
+                .get_bool("tokenizer.ggml.add_sep_token")
+                .unwrap_or(kind == Kind::WordPiece),
+            max_token_len: 0,
+            normalizer,
+            unigram: None,
         };
+        if matches!(kind, Kind::WordPiece | Kind::Unigram) {
+            tokenizer.max_token_len = (0..n_tokens)
+                .map(|id| tokenizer.tokens.get(id).len())
+                .max()
+                .unwrap_or(0);
+        }
+        if kind == Kind::Unigram {
+            let charsmap = file
+                .get_array("tokenizer.ggml.precompiled_charsmap")
+                .filter(|array| !array.is_empty())
+                .map(|array| {
+                    unigram::Charsmap::new(file.mapping(), array.file_offset(), array.raw().len())
+                });
+            let texts = (0..n_tokens).map(|id| tokenizer.tokens.get(id).to_vec());
+            let mut settings =
+                unigram::Unigram::new(texts, &tokenizer.attrs, &tokenizer.scores, charsmap);
+            let flag = |key: &str, default: bool| file.get_bool(key).unwrap_or(default);
+            settings.add_space_prefix = flag("tokenizer.ggml.add_space_prefix", false);
+            settings.remove_extra_whitespaces =
+                flag("tokenizer.ggml.remove_extra_whitespaces", false);
+            settings.treat_whitespace_as_suffix =
+                flag("tokenizer.ggml.treat_whitespace_as_suffix", false);
+            tokenizer.unigram = Some(settings);
+        }
 
         // Generation stops at the model's own end tokens and at any token
         // whose text is a known end marker. Those are control tokens even
@@ -425,6 +507,16 @@ impl Tokenizer {
                         Kind::Bpe => {
                             self.encode_bpe(&String::from_utf8_lossy(&bytes[range]), &mut out)
                         }
+                        Kind::WordPiece => self.encode_wordpiece(
+                            &String::from_utf8_lossy(&bytes[range]),
+                            self.normalizer,
+                            &mut out,
+                        ),
+                        Kind::Unigram => {
+                            if let Some(unigram) = &self.unigram {
+                                self.encode_unigram(unigram, &bytes[range], &mut out);
+                            }
+                        }
                     }
                     after_special = false;
                 }
@@ -432,6 +524,34 @@ impl Tokenizer {
         }
         if add_special && self.add_eos {
             out.extend(self.eos);
+        }
+        // WordPiece inputs always end with the separator.
+        if add_special && self.kind == Kind::WordPiece {
+            out.extend(self.sep);
+        }
+        out
+    }
+
+    /// The tokens of a pair of texts, such as a query and a document for a
+    /// reranker, laid out as llama.cpp's server lays them out: the start
+    /// token, the first text, the end token, the separator, the second
+    /// text and the end token, each token where the model asks for it.
+    pub fn encode_pair(&self, first: &str, second: &str) -> Vec<u32> {
+        let end = self.eos.or(self.sep);
+        let mut out = Vec::new();
+        if self.add_bos {
+            out.extend(self.bos);
+        }
+        out.extend(self.encode(first, false, false));
+        if self.add_eos {
+            out.extend(end);
+        }
+        if self.add_sep {
+            out.extend(self.sep);
+        }
+        out.extend(self.encode(second, false, false));
+        if self.add_eos {
+            out.extend(end);
         }
         out
     }
@@ -451,7 +571,11 @@ impl Tokenizer {
         if flags & attr::SPECIAL != 0 {
             out.extend_from_slice(text);
         } else if flags & attr::NORMAL != 0 {
-            if self.kind == Kind::SentencePiece || self.pre.escape_spaces {
+            if matches!(
+                self.kind,
+                Kind::SentencePiece | Kind::WordPiece | Kind::Unigram
+            ) || self.pre.escape_spaces
+            {
                 append_unmarked(text, out);
             } else if self.pre.raw_bytes {
                 out.extend_from_slice(text);

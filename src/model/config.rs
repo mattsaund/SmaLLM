@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 use crate::gguf::Gguf;
 
 /// Architectures this engine runs, as named in `general.architecture`.
-pub const ARCHITECTURES: [&str; 14] = [
+pub const ARCHITECTURES: [&str; 18] = [
     "llama",
     "qwen2",
     "qwen3",
@@ -26,6 +26,10 @@ pub const ARCHITECTURES: [&str; 14] = [
     "granitemoe",
     "olmoe",
     "smollm3",
+    "gemma2",
+    "phi3",
+    "gpt-oss",
+    "phi2",
 ];
 
 /// Which two elements of an attention head a rotary embedding rotates
@@ -43,6 +47,10 @@ pub enum Rope {
 pub enum Activation {
     Silu,
     Gelu,
+    /// OpenAI's SwiGLU (gpt-oss): the gate is capped at 7 and goes through
+    /// `x * sigmoid(1.702 * x)`, and the up projection is clamped to
+    /// `[-7, 7]` and has one added.
+    SwigluOai,
 }
 
 /// How a mixture of experts turns the router's scores into weights.
@@ -68,6 +76,23 @@ pub struct Routing {
     pub normalize: bool,
     /// Multiplier on the weights. One for none.
     pub scale: f32,
+}
+
+/// YaRN, a way to stretch rotary positions over a longer context than the
+/// model was trained with. Low frequencies are scaled down to fit the
+/// longer context, high ones are kept as they are, and a ramp blends the
+/// two in between. Rotated values are also scaled up a little.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Yarn {
+    /// The context length the model was trained with before stretching.
+    pub original_context: usize,
+    /// Rotations over the original context below which a pair is kept as
+    /// it is. Pairs that turn fewer times than `beta_slow` are scaled.
+    pub beta_fast: f32,
+    pub beta_slow: f32,
+    /// Multiplier on rotated values, before the part each layer's scaling
+    /// adds. One for most models: see `RopeTables::new`.
+    pub attn_factor: f32,
 }
 
 /// How a block mixes information across positions.
@@ -175,6 +200,26 @@ pub struct Config {
     pub residual_scale: f32,
     /// The logits are divided by this (Granite). One for none.
     pub logit_scale: f32,
+    /// Soft cap on attention scores, `cap * tanh(score / cap)` (Gemma 2).
+    /// Zero for none.
+    pub attention_softcap: f32,
+    /// Multiplier on rotated queries and keys, which LongRoPE models such as
+    /// Phi-3 use to keep attention sharp at long context. One for none.
+    pub rope_attn_factor: f32,
+    /// The context length a LongRoPE model was trained with before its
+    /// context was extended. Longer sessions use its long rotary divisors.
+    /// Zero for models without them.
+    pub long_context_after: usize,
+    /// YaRN's settings, for models that stretch their positions that way.
+    pub yarn: Option<Yarn>,
+    /// LayerNorm with a bias, where most models use RMS norm (Phi-2).
+    pub layer_norm: bool,
+    /// Attention and the feed-forward network read the same normalized
+    /// input, and both add to the hidden state (Phi-2).
+    pub parallel: bool,
+    /// The feed-forward network is `down(act(up(x)))`, without a gate
+    /// (Phi-2).
+    pub ungated: bool,
     /// The expert settings, for models with mixture-of-experts layers.
     pub routing: Option<Routing>,
 }
@@ -242,7 +287,14 @@ impl Config {
             .usize("rope.dimension_count_swa")
             .unwrap_or(head_dim_local.min(rope_dims));
         let rope_base = meta.f32("rope.freq_base").unwrap_or(10000.0);
-        let rope_base_local = meta.f32("rope.freq_base_swa").unwrap_or(10000.0);
+        // Gemma 2's windowed layers rotate like its others, unless the file
+        // says otherwise. Elsewhere they default to a base of 10000.
+        let default_local_base = if matches!(arch.as_str(), "gemma2" | "gpt-oss") {
+            rope_base
+        } else {
+            10000.0
+        };
+        let rope_base_local = meta.f32("rope.freq_base_swa").unwrap_or(default_local_base);
         let rope_scale = meta.rope_scale()?;
         let window = meta.usize("attention.sliding_window").unwrap_or(0);
 
@@ -279,6 +331,13 @@ impl Config {
             per_layer_embd: 0,
             residual_scale: 1.0,
             logit_scale: 1.0,
+            attention_softcap: 0.0,
+            rope_attn_factor: meta.f32("rope.scaling.attn_factor").unwrap_or(1.0),
+            long_context_after: 0,
+            yarn: meta.yarn(n_ctx_train),
+            layer_norm: false,
+            parallel: false,
+            ungated: false,
             routing,
             arch: arch.clone(),
         };
@@ -318,19 +377,77 @@ impl Config {
                     }
                 }
             }
-            "gemma3" => {
+            "gemma2" => {
                 config.activation = Activation::Gelu;
                 config.embedding_scale = (n_embd as f32).sqrt();
-                config.logit_softcap = meta.f32("final_logit_softcapping").unwrap_or(0.0);
-                // The largest Gemma 3 scales attention by its nominal head
-                // width, which differs from the stored key width.
-                if n_layer == 62 {
+                config.logit_softcap = meta.f32("final_logit_softcapping").unwrap_or(30.0);
+                config.attention_softcap = meta.f32("attn_logit_softcapping").unwrap_or(50.0);
+                // Every other layer looks back over a window, by default
+                // 4096 positions.
+                let window = if window > 0 { window } else { 4096 };
+                for (layer, local) in config
+                    .layers
+                    .iter_mut()
+                    .zip(meta.window_pattern(n_layer, 2))
+                {
+                    if local {
+                        make_local(layer);
+                        layer.window = window;
+                        layer.rope_scale = rope_scale;
+                    }
+                }
+                // The largest Gemma 2 scales attention by its nominal head
+                // width, which differs from the stored key width, in every
+                // layer. So this comes after the windowed layers are set.
+                if n_layer == 46 {
                     let scale = 1.0 / ((n_embd / n_head[0]) as f32).sqrt();
                     config
                         .layers
                         .iter_mut()
                         .for_each(|layer| layer.attention_scale = scale);
                 }
+            }
+            // gpt-oss: every other layer looks back over a short window, and
+            // rotates like the others, YaRN included. Its experts are
+            // weighed by a softmax over the chosen ones, and their gate is
+            // OpenAI's clamped SwiGLU.
+            "gpt-oss" => {
+                config.activation = Activation::SwigluOai;
+                for (layer, local) in config
+                    .layers
+                    .iter_mut()
+                    .zip(meta.window_pattern(n_layer, 2))
+                {
+                    if local {
+                        make_local(layer);
+                        layer.rope_scale = rope_scale;
+                    }
+                }
+                if let Some(routing) = &mut config.routing {
+                    routing.gating = Gating::SoftmaxChosen;
+                }
+            }
+            // Phi-2 (and Phi-1.5) is built like GPT-J: LayerNorm, attention
+            // and an ungated GELU network side by side, part of each head
+            // rotated.
+            "phi2" => {
+                config.layer_norm = true;
+                config.parallel = true;
+                config.ungated = true;
+                config.activation = Activation::Gelu;
+                config.norm_eps = meta.f32("attention.layer_norm_epsilon").unwrap_or(1e-5);
+            }
+            // Phi-3 rotates halves. Its long-context versions bring two sets
+            // of rotary divisors, chosen by the length of the session.
+            "phi3" => {
+                config.long_context_after = meta
+                    .usize("rope.scaling.original_context_length")
+                    .unwrap_or(n_ctx_train);
+            }
+            "gemma3" => {
+                config.activation = Activation::Gelu;
+                config.embedding_scale = (n_embd as f32).sqrt();
+                config.logit_softcap = meta.f32("final_logit_softcapping").unwrap_or(0.0);
                 if window > 0 {
                     for (layer, local) in config
                         .layers
@@ -341,6 +458,16 @@ impl Config {
                             make_local(layer);
                         }
                     }
+                }
+                // The largest Gemma 3 scales attention by its nominal head
+                // width, which differs from the stored key width, in every
+                // layer. So this comes after the windowed layers are set.
+                if n_layer == 62 {
+                    let scale = 1.0 / ((n_embd / n_head[0]) as f32).sqrt();
+                    config
+                        .layers
+                        .iter_mut()
+                        .for_each(|layer| layer.attention_scale = scale);
                 }
             }
             "gemma4" => {
@@ -597,7 +724,7 @@ impl Meta<'_> {
         let normalize = self
             .file
             .get_bool(&self.key("expert_weights_norm"))
-            .unwrap_or(!matches!(self.arch, "qwen2moe" | "olmoe"));
+            .unwrap_or(!matches!(self.arch, "qwen2moe" | "olmoe" | "gpt-oss"));
         Ok(Some(Routing {
             count,
             used,
@@ -610,15 +737,31 @@ impl Meta<'_> {
         }))
     }
 
-    /// The linear position scaling, as a multiplier on rotary angles. Other
-    /// kinds of scaling change the rotary formula, which is not done here.
-    fn rope_scale(&self) -> Result<f32> {
-        match self
-            .file
+    /// The rotary scaling type the file names, linear by default.
+    fn rope_scaling(&self) -> &str {
+        self.file
             .get_str(&self.key("rope.scaling.type"))
             .unwrap_or("linear")
-        {
-            "none" | "linear" => {
+    }
+
+    /// YaRN's settings, when the file asks for it. `n_ctx_train` is the
+    /// original context when the file does not give one.
+    fn yarn(&self, n_ctx_train: usize) -> Option<Yarn> {
+        (self.rope_scaling() == "yarn").then(|| Yarn {
+            original_context: self
+                .usize("rope.scaling.original_context_length")
+                .unwrap_or(n_ctx_train),
+            beta_fast: self.f32("rope.scaling.yarn_beta_fast").unwrap_or(32.0),
+            beta_slow: self.f32("rope.scaling.yarn_beta_slow").unwrap_or(1.0),
+            attn_factor: 1.0,
+        })
+    }
+
+    /// The position scaling, as a multiplier on rotary angles. YaRN scales
+    /// angles too, and adds a ramp that `yarn` describes.
+    fn rope_scale(&self) -> Result<f32> {
+        match self.rope_scaling() {
+            "none" | "linear" | "yarn" => {
                 let factor = self
                     .f32("rope.scaling.factor")
                     .or_else(|| self.f32("rope.scale_linear"))
@@ -708,6 +851,30 @@ mod tests {
     }
 
     #[test]
+    fn the_largest_gemmas_scale_every_layer_alike() {
+        for (arch, n_layer) in [("gemma3", 62), ("gemma2", 46)] {
+            let mut builder = Builder::new();
+            builder
+                .string("general.architecture", arch)
+                .u32(&format!("{arch}.context_length"), 2048)
+                .u32(&format!("{arch}.embedding_length"), 96)
+                .u32(&format!("{arch}.block_count"), n_layer)
+                .u32(&format!("{arch}.attention.head_count"), 4)
+                .u32(&format!("{arch}.attention.head_count_kv"), 2)
+                .u32(&format!("{arch}.attention.key_length"), 32)
+                .u32(&format!("{arch}.attention.sliding_window"), 64);
+            let c = config(&builder).unwrap();
+            // The nominal head width is 96 / 4 = 24, not the stored 32.
+            let scale = 1.0 / 24f32.sqrt();
+            assert!(
+                c.layers.iter().all(|layer| layer.attention_scale == scale),
+                "{arch}"
+            );
+            assert!(c.layers.iter().any(|layer| layer.window > 0), "{arch}");
+        }
+    }
+
+    #[test]
     fn lfm_models_mix_convolution_and_attention() {
         let mut builder = Builder::new();
         builder
@@ -769,7 +936,7 @@ mod tests {
         assert!(config(&builder).is_err(), "more used than there are");
 
         let mut builder = base("llama");
-        builder.string("llama.rope.scaling.type", "yarn");
+        builder.string("llama.rope.scaling.type", "dynamic");
         assert!(config(&builder).is_err());
     }
 
@@ -797,5 +964,22 @@ mod tests {
         let mut builder = base("llama");
         builder.f32("llama.rope.scaling.factor", 4.0);
         assert_eq!(config(&builder).unwrap().layers[0].rope_scale, 0.25);
+        assert_eq!(config(&builder).unwrap().yarn, None);
+    }
+
+    #[test]
+    fn yarn_settings_are_read() {
+        let mut builder = base("llama");
+        builder
+            .string("llama.rope.scaling.type", "yarn")
+            .f32("llama.rope.scaling.factor", 4.0)
+            .f32("llama.rope.scaling.yarn_beta_fast", 16.0);
+        let c = config(&builder).unwrap();
+        assert_eq!(c.layers[0].rope_scale, 0.25);
+        let yarn = c.yarn.unwrap();
+        assert_eq!(yarn.original_context, c.n_ctx_train);
+        assert_eq!((yarn.beta_fast, yarn.beta_slow), (16.0, 1.0));
+        builder.u32("llama.rope.scaling.original_context_length", 64);
+        assert_eq!(config(&builder).unwrap().yarn.unwrap().original_context, 64);
     }
 }

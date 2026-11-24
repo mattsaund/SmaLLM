@@ -269,7 +269,8 @@ left out.
 - [ ] TPUs. Google's Coral Edge TPU cannot hold a language model: it runs small, fully 8-bit TensorFlow Lite graphs
       and keeps about 8 MB of weights. Support waits for hardware that can.
 - [ ] AVX-512 kernels, NEON kernels for 32-bit ARM, and vector kernels for RISC-V.
-- [ ] A separate thread count for reading prompts. Efficiency cores help there and not in generation.
+- [x] A separate thread count for reading prompts, every core by default. Efficiency cores help there and not
+      in generation.
 
 **Models**
 

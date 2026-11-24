@@ -122,6 +122,8 @@ pub fn main(raw: impl Iterator<Item = String>) -> Result<(), String> {
     let kind = match tokenizer.kind() {
         Kind::SentencePiece => "SentencePiece".to_string(),
         Kind::Bpe => format!("BPE ({})", tokenizer.pre_tokenizer().0),
+        Kind::WordPiece => "WordPiece".to_string(),
+        Kind::Unigram => "Unigram".to_string(),
     };
     row(
         "tokenizer",

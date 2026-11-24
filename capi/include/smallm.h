@@ -59,9 +59,11 @@ typedef enum smallm_status {
 /* Options for a new session. Zero means "choose for me" in every field. */
 typedef struct smallm_session_params {
     uint32_t n_ctx;     /* Context window in tokens. Any size is accepted. */
-    uint32_t n_threads; /* Threads to compute with. */
+    uint32_t n_threads; /* Threads to generate with. */
     uint32_t n_batch;   /* Prompt tokens evaluated together. */
     uint32_t device;    /* Where to compute. 0 is the CPU, the only device. */
+    uint32_t n_threads_batch; /* Threads to read prompts with. 0 picks every
+                                 physical core, or n_threads when that is set. */
 } smallm_session_params;
 
 /* Options for choosing tokens. */

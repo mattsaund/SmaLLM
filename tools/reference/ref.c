@@ -2,10 +2,14 @@
 // on this machine, to produce ground truth for SmaLLM tests and benchmarks.
 //
 //   ref tok    MODEL TEXTFILE [special]        token ids of the text
+//   ref tokraw MODEL TEXTFILE                  the same, without start and end tokens
 //   ref gen    MODEL TEXTFILE N [threads]      greedy generation: ids and text
 //   ref logits MODEL TEXTFILE OUTFILE          raw f32 logits after the prompt
 //   ref ids    MODEL IDSFILE OUTFILE           raw f32 logits after the token
 //                                              ids listed in IDSFILE
+//   ref embed  MODEL TEXTFILE OUTFILE [rank]   an encoder's pooled output as
+//                                              raw f32: an embedding, or with
+//                                              rank, a reranker's scores
 //   ref bench  MODEL N_PROMPT N_GEN THREADS    prompt and generation speed
 //   ref mem    MODEL N_CTX N_TOKENS THREADS    memory in use after loading,
 //                                              with a context, and after
@@ -80,6 +84,9 @@ int main(int argc, char ** argv) {
 
     struct llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = 0;
+    /* Tokenizing needs only the vocabulary, so a vocabulary file will do. */
+    const int tokenize_only = strcmp(mode, "tok") == 0 || strcmp(mode, "tokraw") == 0;
+    mp.vocab_only = tokenize_only;
     struct llama_model * model = llama_model_load_from_file(model_path, mp);
     if (!model) { fprintf(stderr, "cannot load model\n"); return 1; }
     const struct llama_vocab * vocab = llama_model_get_vocab(model);
@@ -140,6 +147,40 @@ int main(int argc, char ** argv) {
         return 0;
     }
 
+    if (strcmp(mode, "embed") == 0) {
+        if (argc < 5) { fprintf(stderr, "embed MODEL TEXTFILE OUTFILE\n"); return 2; }
+        size_t len;
+        char * text = read_file(argv[3], &len);
+        int cap = (int) len + 16;
+        llama_token * toks = malloc(sizeof(llama_token) * cap);
+        int n = llama_tokenize(vocab, text, (int) len, toks, cap, true, true);
+        if (n < 0) { fprintf(stderr, "tokenize failed\n"); return 1; }
+        struct llama_context_params cp = llama_context_default_params();
+        cp.n_ctx = n + 8;
+        cp.n_batch = n + 8;
+        cp.n_ubatch = n + 8;
+        cp.n_threads = 4;
+        cp.n_threads_batch = 4;
+        cp.embeddings = true;
+        cp.no_perf = true;
+        /* A reranker is only ranked when asked, as llama-server's --reranking does. */
+        if (argc > 5 && strcmp(argv[5], "rank") == 0) cp.pooling_type = LLAMA_POOLING_TYPE_RANK;
+        struct llama_context * ctx = llama_init_from_model(model, cp);
+        if (!ctx) { fprintf(stderr, "cannot make context\n"); return 1; }
+        if (llama_encode(ctx, llama_batch_get_one(toks, n))) { fprintf(stderr, "encode failed\n"); return 1; }
+        const float * embedding = llama_get_embeddings_seq(ctx, 0);
+        if (!embedding) { fprintf(stderr, "no pooled output\n"); return 1; }
+        int width = llama_pooling_type(ctx) == LLAMA_POOLING_TYPE_RANK
+            ? (int) llama_model_n_cls_out(model) : llama_model_n_embd(model);
+        FILE * out = fopen(argv[4], "wb");
+        fwrite(embedding, sizeof(float), width, out);
+        fclose(out);
+        printf("tokens:");
+        for (int i = 0; i < n; i++) printf(" %d", toks[i]);
+        printf("\n%d values\n", width);
+        return 0;
+    }
+
     if (strcmp(mode, "ids") == 0) {
         if (argc < 5) { fprintf(stderr, "ids MODEL IDSFILE OUTFILE\n"); return 2; }
         size_t len;
@@ -165,15 +206,18 @@ int main(int argc, char ** argv) {
 
     size_t text_len;
     char * text = read_file(argv[3], &text_len);
-    const int special = (argc > 4 && strcmp(argv[4], "special") == 0) || strcmp(mode, "tok") != 0;
+    const int special = (argc > 4 && strcmp(argv[4], "special") == 0) || !tokenize_only;
+    /* tokraw adds no start and end tokens, like the tokenizer test files. */
+    const int add_special = strcmp(mode, "tokraw") != 0;
 
     int cap = (int) text_len + 16;
     llama_token * toks = malloc(sizeof(llama_token) * cap);
-    int n = llama_tokenize(vocab, text, (int) text_len, toks, cap, true, special);
+    int n = llama_tokenize(vocab, text, (int) text_len, toks, cap, add_special, special);
     if (n < 0) { fprintf(stderr, "tokenize failed\n"); return 1; }
 
-    if (strcmp(mode, "tok") == 0) {
+    if (tokenize_only) {
         for (int i = 0; i < n; i++) printf("%d%c", toks[i], i + 1 < n ? ' ' : '\n');
+        if (n == 0) printf("\n");
         return 0;
     }
 

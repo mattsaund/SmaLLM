@@ -81,10 +81,15 @@ pub enum Template {
     Granite,
     /// `<|role|> ... <|end|>`
     Phi3,
+    /// `<|role|>...<|end|>` without newlines (Phi-4-mini)
+    Phi4Mini,
     /// `<|role|> ... ` then the model's end-of-text token.
     Zephyr,
     /// Fullwidth `<|User|>` and `<|Assistant|>` markers.
     DeepSeek,
+    /// OpenAI's Harmony (gpt-oss): `<|start|>role<|message|> ... <|end|>`,
+    /// with the model's answers on the final channel.
+    Harmony,
 }
 
 /// Fullwidth vertical bar and the SentencePiece space mark, which DeepSeek's
@@ -95,7 +100,7 @@ const DEEPSEEK_END: &str = "<\u{ff5c}end\u{2581}of\u{2581}sentence\u{ff5c}>";
 
 impl Template {
     /// Every template, for listings.
-    pub const ALL: [Template; 10] = [
+    pub const ALL: [Template; 12] = [
         Template::ChatMl,
         Template::Llama3,
         Template::Llama2,
@@ -104,14 +109,18 @@ impl Template {
         Template::Gemma4,
         Template::Granite,
         Template::Phi3,
+        Template::Phi4Mini,
         Template::Zephyr,
         Template::DeepSeek,
+        Template::Harmony,
     ];
 
     /// Recognizes the format a model's Jinja chat template implements.
     pub fn detect(jinja: &str) -> Option<Template> {
         let has = |needle: &str| jinja.contains(needle);
-        if has("<|im_start|>") {
+        if has("<|start|>") && has("<|channel|>") {
+            Some(Template::Harmony)
+        } else if has("<|im_start|>") {
             Some(Template::ChatMl)
         } else if has("<|start_header_id|>") {
             Some(Template::Llama3)
@@ -130,7 +139,12 @@ impl Template {
                 Template::Mistral
             })
         } else if has("<|assistant|>") && has("<|end|>") {
-            Some(Template::Phi3)
+            // Phi-4-mini writes the content right after the role.
+            if has("|>' + message['content']") {
+                Some(Template::Phi4Mini)
+            } else {
+                Some(Template::Phi3)
+            }
         } else if has("<|assistant|>") && has("<|user|>") {
             Some(Template::Zephyr)
         } else {
@@ -156,8 +170,10 @@ impl Template {
             Template::Gemma4 => "gemma4",
             Template::Granite => "granite",
             Template::Phi3 => "phi3",
+            Template::Phi4Mini => "phi4-mini",
             Template::Zephyr => "zephyr",
             Template::DeepSeek => "deepseek",
+            Template::Harmony => "harmony",
         }
     }
 
@@ -288,6 +304,16 @@ impl Template {
                     out.markup("<|start_of_role|>assistant<|end_of_role|>");
                 }
             }
+            Template::Phi4Mini => {
+                for message in messages {
+                    out.markup(&format!("<|{}|>", message.role.name()));
+                    out.content(&message.content);
+                    out.markup("<|end|>");
+                }
+                if add_assistant {
+                    out.markup("<|assistant|>");
+                }
+            }
             Template::Phi3 | Template::Zephyr => {
                 let end = if self == Template::Phi3 {
                     "<|end|>"
@@ -323,6 +349,45 @@ impl Template {
                 }
                 if add_assistant {
                     out.markup(DEEPSEEK_ASSISTANT);
+                }
+            }
+            Template::Harmony => {
+                // The system message is the model's own, as gpt-oss's
+                // template writes it. A system prompt from the user goes
+                // in a developer message. Earlier answers are written to
+                // the final channel, without their reasoning.
+                out.markup("<|start|>system<|message|>");
+                out.markup(&format!(
+                    "You are ChatGPT, a large language model trained by OpenAI.\n\
+                     Knowledge cutoff: 2024-06\n\
+                     Current date: {}\n\n\
+                     Reasoning: medium\n\n\
+                     # Valid channels: analysis, commentary, final. \
+                     Channel must be included for every message.",
+                    today()
+                ));
+                out.markup("<|end|>");
+                for message in messages {
+                    match message.role {
+                        Role::System => {
+                            out.markup("<|start|>developer<|message|># Instructions\n\n");
+                            out.content(&message.content);
+                            out.markup("\n\n<|end|>");
+                        }
+                        Role::User => {
+                            out.markup("<|start|>user<|message|>");
+                            out.content(&message.content);
+                            out.markup("<|end|>");
+                        }
+                        Role::Assistant => {
+                            out.markup("<|start|>assistant<|channel|>final<|message|>");
+                            out.content(&message.content);
+                            out.markup("<|end|>");
+                        }
+                    }
+                }
+                if add_assistant {
+                    out.markup("<|start|>assistant");
                 }
             }
         }
@@ -367,9 +432,65 @@ impl Prompt {
     }
 }
 
+/// Today's date in UTC, as `YYYY-MM-DD`, for templates that state it.
+fn today() -> String {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |time| time.as_secs());
+    let (year, month, day) = civil_date((seconds / 86_400) as i64);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// The calendar date of a day counted from 1970-01-01, in the proleptic
+/// Gregorian calendar. This is Howard Hinnant's `civil_from_days`, which
+/// works in 400-year eras that start on March 1.
+fn civil_date(days: i64) -> (i64, u32, u32) {
+    let days = days + 719_468;
+    let era = days.div_euclid(146_097);
+    let day_of_era = days.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = (day_of_year - (153 * shifted_month + 2) / 5 + 1) as u32;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    } as u32;
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    (year, month, day)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn harmony() {
+        let text = Template::Harmony.render_text(&conversation(), true, "");
+        let date = today();
+        assert_eq!(
+            text,
+            format!(
+                "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\n\
+                 Knowledge cutoff: 2024-06\nCurrent date: {date}\n\nReasoning: medium\n\n\
+                 # Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|>\
+                 <|start|>developer<|message|># Instructions\n\nBe brief.\n\n<|end|>\
+                 <|start|>user<|message|>Hi<|end|>\
+                 <|start|>assistant<|channel|>final<|message|>Hello!<|end|>\
+                 <|start|>user<|message|>Bye<|end|><|start|>assistant"
+            )
+        );
+    }
+
+    #[test]
+    fn dates_are_counted_from_1970() {
+        assert_eq!(civil_date(0), (1970, 1, 1));
+        assert_eq!(civil_date(11_016), (2000, 2, 29));
+        assert_eq!(civil_date(20_416), (2025, 11, 24));
+        assert_eq!(civil_date(-1), (1969, 12, 31));
+    }
 
     fn conversation() -> Vec<Message> {
         vec![
@@ -451,6 +572,8 @@ mod tests {
     fn phi3_and_zephyr() {
         let text = Template::Phi3.render_text(&conversation()[1..2], true, "");
         assert_eq!(text, "<|user|>\nHi<|end|>\n<|assistant|>\n");
+        let text = Template::Phi4Mini.render_text(&conversation()[1..2], true, "");
+        assert_eq!(text, "<|user|>Hi<|end|><|assistant|>");
         let text = Template::Zephyr.render_text(&conversation()[1..2], true, "</s>");
         assert_eq!(text, "<|user|>\nHi</s>\n<|assistant|>\n");
     }
@@ -509,8 +632,16 @@ mod tests {
                 Some(Template::Phi3),
             ),
             (
+                "{{ '<|' + message['role'] + '|>' + message['content'] + '<|end|>' }}{{ '<|assistant|>' }}",
+                Some(Template::Phi4Mini),
+            ),
+            (
                 "<|user|>\n{{ c }}{{ eos_token }}\n<|assistant|>",
                 Some(Template::Zephyr),
+            ),
+            (
+                "{{- \"<|start|>system<|message|>\" }}{{- \"<|start|>assistant<|channel|>final<|message|>\" }}",
+                Some(Template::Harmony),
             ),
             (
                 "{{ '<\u{ff5c}User\u{ff5c}>' }}{{ '<\u{ff5c}Assistant\u{ff5c}>' }}",

@@ -10,6 +10,10 @@
 //! folder and every vocabulary with test files is checked. Without it the
 //! test is skipped. `SMALLM_TEST_REQUIRE_VOCABS=1` turns a missing folder
 //! into a failure, which is how CI makes sure the test ran.
+//!
+//! Some vocabularies come without test files. For those,
+//! `tests/golden/vocab` holds the tokens llama.cpp gives the BERT test
+//! texts, made with `ref tokraw` from `tools/reference`.
 
 use std::path::{Path, PathBuf};
 
@@ -19,9 +23,8 @@ use smallm::gguf::Gguf;
 /// What separates the texts in a `.inp` file.
 const SEPARATOR: &str = "\n__ggml_vocab_test__\n";
 
-/// Tokenizer types that only encoder models use: WordPiece for BERT, and
-/// Unigram for T5. The engine runs decoder models, so these are skipped.
-const ENCODER_TOKENIZERS: [&str; 2] = ["bert", "t5"];
+/// The vocabulary whose test texts serve the ones that have none.
+const SHARED_TEXTS: &str = "ggml-vocab-bert-bge.gguf.inp";
 
 /// One vocabulary and its test cases.
 struct Suite {
@@ -44,8 +47,14 @@ fn suites(dir: &Path) -> Vec<Suite> {
         else {
             continue;
         };
-        let input = path.with_extension("gguf.inp");
-        let output = path.with_extension("gguf.out");
+        let mut input = path.with_extension("gguf.inp");
+        let mut output = path.with_extension("gguf.out");
+        if !output.exists() {
+            input = dir.join(SHARED_TEXTS);
+            output = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/golden/vocab")
+                .join(format!("{file_name}.out"));
+        }
         let (Ok(input), Ok(output)) = (
             std::fs::read_to_string(&input),
             std::fs::read_to_string(&output),
@@ -102,15 +111,6 @@ fn every_reference_vocabulary_tokenizes_like_its_original() {
     let mut failures = Vec::new();
     for suite in &suites {
         let file = Gguf::open(&suite.vocab).unwrap();
-        // The tokenizers of encoder models come with those models.
-        let kind = file.get_str("tokenizer.ggml.model").unwrap_or_default();
-        if ENCODER_TOKENIZERS.contains(&kind) {
-            eprintln!(
-                "{:<16} skipped: '{kind}' tokenizers are for encoder models",
-                suite.name
-            );
-            continue;
-        }
         let tokenizer = match Tokenizer::from_gguf(&file) {
             Ok(tokenizer) => tokenizer,
             Err(error) => {

@@ -208,6 +208,18 @@ pub(crate) struct TinyModel {
     pub wide_qk_norm: bool,
     /// Granite's multipliers on embeddings, residuals, scores and logits.
     pub granite_scales: bool,
+    /// Phi-3's LongRoPE: short and long rotary divisors, a short original
+    /// context, and a rotary attention factor.
+    pub longrope: bool,
+    /// YaRN position scaling, with a short original context so that its
+    /// ramp falls inside the small heads.
+    pub yarn: bool,
+    /// gpt-oss: attention sinks, an output bias, biases on the router and
+    /// on every expert, and the feed-forward norm under another name.
+    pub gpt_oss: bool,
+    /// Phi-2: LayerNorm with biases, attention and an ungated network side
+    /// by side, biases on every projection and on the output.
+    pub phi2: bool,
     pub seed: u64,
 }
 
@@ -229,8 +241,8 @@ impl TinyModel {
                 arch,
                 "qwen3" | "qwen3moe" | "gemma3" | "gemma4" | "lfm2" | "lfm2moe" | "lfm3" | "olmoe"
             ),
-            post_norm: matches!(arch, "gemma3" | "gemma4" | "lfm3"),
-            bias: matches!(arch, "qwen2" | "qwen2moe"),
+            post_norm: matches!(arch, "gemma2" | "gemma3" | "gemma4" | "lfm3"),
+            bias: matches!(arch, "qwen2" | "qwen2moe" | "gpt-oss" | "phi2"),
             fused: false,
             window: 0,
             rope_factors: false,
@@ -252,11 +264,15 @@ impl TinyModel {
             fused_experts: false,
             wide_qk_norm: arch == "olmoe",
             granite_scales: matches!(arch, "granite" | "granitemoe"),
+            longrope: arch == "phi3",
+            yarn: matches!(arch, "qwen3" | "gpt-oss"),
+            gpt_oss: arch == "gpt-oss",
+            phi2: arch == "phi2",
             seed: 1,
         };
         if matches!(
             arch,
-            "qwen2moe" | "qwen3moe" | "olmoe" | "granitemoe" | "lfm2moe"
+            "qwen2moe" | "qwen3moe" | "olmoe" | "granitemoe" | "lfm2moe" | "gpt-oss"
         ) {
             model.experts = 4;
             model.experts_used = 2;
@@ -274,6 +290,16 @@ impl TinyModel {
                 model.choice_bias = true;
             }
             "qwen2moe" => model.shared_expert = true,
+            // Phi-3 stores query, key and value together, and the gate
+            // with `up`.
+            "phi3" => model.fused = true,
+            // Phi-2 rotates part of each head.
+            "phi2" => model.rope_dims = model.head_dim() / 2,
+            // Every other layer of Gemma 2 and gpt-oss is windowed.
+            "gemma2" | "gpt-oss" => {
+                model.n_layer = 4;
+                model.window = 3;
+            }
             // Every fourth layer is left unrotated.
             "smollm3" => model.n_layer = 4,
             "lfm3" => {
@@ -365,6 +391,7 @@ impl TinyModel {
             .u32(&format!("{arch}.block_count"), self.n_layer as u32)
             .u32(&format!("{arch}.attention.head_count"), self.n_head as u32)
             .f32(&format!("{arch}.attention.layer_norm_rms_epsilon"), 1e-5)
+            .f32(&format!("{arch}.attention.layer_norm_epsilon"), 1e-5)
             .f32(&format!("{arch}.rope.freq_base"), 10000.0);
         let layers = 0..self.n_layer;
         if self.wide_late_ff {
@@ -451,6 +478,23 @@ impl TinyModel {
                     &format!("{arch}.expert_feed_forward_length"),
                     self.n_ff as u32,
                 );
+        }
+        if arch == "gemma2" {
+            // Small caps, so that they matter for random weights.
+            builder
+                .f32(&format!("{arch}.attn_logit_softcapping"), 5.0)
+                .f32(&format!("{arch}.final_logit_softcapping"), 10.0);
+        }
+        if self.longrope {
+            builder
+                .u32(&format!("{arch}.rope.scaling.original_context_length"), 256)
+                .f32(&format!("{arch}.rope.scaling.attn_factor"), 1.1);
+        }
+        if self.yarn {
+            builder
+                .string(&format!("{arch}.rope.scaling.type"), "yarn")
+                .f32(&format!("{arch}.rope.scaling.factor"), 4.0)
+                .u32(&format!("{arch}.rope.scaling.original_context_length"), 64);
         }
         if self.granite_scales {
             builder
@@ -620,6 +664,15 @@ impl TinyModel {
                         weight_scale,
                     );
                 }
+            } else if self.phi2 {
+                matrix(&mut builder, &name("ffn_up.weight"), n_ff, d, weight_scale);
+                matrix(
+                    &mut builder,
+                    &name("ffn_down.weight"),
+                    d,
+                    n_ff,
+                    weight_scale,
+                );
             } else if self.fused {
                 matrix(
                     &mut builder,
@@ -671,6 +724,10 @@ impl TinyModel {
             "output_norm.weight"
         };
         vector(&mut builder, output_norm, d, 0.5, 1.5);
+        if self.phi2 {
+            vector(&mut builder, "output_norm.bias", d, -0.2, 0.2);
+            vector(&mut builder, "output.bias", self.n_vocab, -0.2, 0.2);
+        }
         if self.rope_factors {
             // Divisors for the full-attention layers' rotation.
             let full = (0..self.n_layer)
@@ -692,12 +749,66 @@ impl TinyModel {
                 1.5,
             );
         }
+        if self.longrope {
+            let pairs = if self.rope_dims > 0 {
+                self.rope_dims
+            } else {
+                self.head_dim()
+            } / 2;
+            vector(&mut builder, "rope_factors_short.weight", pairs, 1.0, 2.0);
+            vector(&mut builder, "rope_factors_long.weight", pairs, 2.0, 16.0);
+        }
         for layer in layers {
             let name = |part: &str| format!("blk.{layer}.{part}");
             let head_dim = self.layer_head_dim(layer);
             let (q_dim, kv_dim) = (self.n_head * head_dim, self.n_head_kv * head_dim);
             vector(&mut builder, &name("attn_norm.weight"), d, 0.5, 1.5);
-            vector(&mut builder, &name("ffn_norm.weight"), d, 0.5, 1.5);
+            if self.phi2 {
+                // One LayerNorm, before attention and the network both.
+                let n_ff = self.layer_n_ff(layer);
+                vector(&mut builder, &name("attn_norm.bias"), d, -0.2, 0.2);
+                vector(&mut builder, &name("attn_output.bias"), d, -0.2, 0.2);
+                vector(&mut builder, &name("ffn_up.bias"), n_ff, -0.2, 0.2);
+                vector(&mut builder, &name("ffn_down.bias"), d, -0.2, 0.2);
+            } else {
+                // gpt-oss calls its feed-forward norm the post-attention
+                // norm.
+                let ffn_norm = if self.gpt_oss {
+                    "post_attention_norm.weight"
+                } else {
+                    "ffn_norm.weight"
+                };
+                vector(&mut builder, &name(ffn_norm), d, 0.5, 1.5);
+            }
+            if self.gpt_oss {
+                let n_ff = self.layer_n_ff(layer);
+                vector(
+                    &mut builder,
+                    &name("attn_sinks.weight"),
+                    self.n_head,
+                    -1.0,
+                    2.0,
+                );
+                vector(&mut builder, &name("attn_output.bias"), d, -0.2, 0.2);
+                vector(
+                    &mut builder,
+                    &name("ffn_gate_inp.bias"),
+                    self.experts,
+                    -0.5,
+                    0.5,
+                );
+                // One bias row per expert.
+                let count = self.experts as u64;
+                let mut bias_rng = Rng(self.seed ^ (0xb0 + layer as u64));
+                for (part, width) in [
+                    ("ffn_gate_exps.bias", n_ff),
+                    ("ffn_up_exps.bias", n_ff),
+                    ("ffn_down_exps.bias", d),
+                ] {
+                    let values = bias_rng.floats(width * self.experts, -0.3, 0.3);
+                    builder.tensor_f32(&name(part), &[width as u64, count], &values);
+                }
+            }
             if self.is_conv(layer) {
                 let taps = self.conv_kernel as u64;
                 let mut taps_rng = Rng(self.seed ^ (0xc0 + layer as u64));

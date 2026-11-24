@@ -38,6 +38,8 @@ Commands:
   info <model>           Show what a model is
   bench <model>          Measure speed on this machine
   tokenize <model> <text>  Show how a model reads a text
+  embed <model> [text]   Print the embedding of a text, with an embedding model
+  rerank <model> <query> <doc>...  Score documents against a query
   config                 Show the settings file, or reset it with --reset
   uninstall              Remove SmaLLM and the models it downloaded
   version                Print the version
@@ -69,6 +71,8 @@ fn main() -> ExitCode {
         ("bench", true) => show(commands::bench::help()),
         ("tokenize", true) => show(commands::info::tokenize_help()),
         ("uninstall", true) => show(commands::uninstall::help()),
+        ("embed", true) => show(commands::embed::embed_help()),
+        ("rerank", true) => show(commands::embed::rerank_help()),
         ("config", true) => show(commands::config::help()),
         ("run", false) => commands::run::main(rest),
         ("serve", false) => commands::serve::main(rest),
@@ -79,6 +83,8 @@ fn main() -> ExitCode {
         ("bench", false) => commands::bench::main(rest),
         ("tokenize", false) => commands::info::tokenize(rest),
         ("uninstall", false) => commands::uninstall::main(rest),
+        ("embed", false) => commands::embed::embed(rest),
+        ("rerank", false) => commands::embed::rerank(rest),
         ("config", false) => commands::config::main(rest),
         (other, _) => Err(format!(
             "unknown command '{other}'. Run 'smallm help' for the list."

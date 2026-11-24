@@ -21,7 +21,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use smallm::chat::{Message, Role, Template};
 use smallm::generate::{self, Finish, Options, Overflow, Stats};
-use smallm::{SamplerConfig, Session};
+use smallm::model::{Embedder, Pooling, normalize};
+use smallm::{Model, SamplerConfig, Session};
 
 use super::http::{self, Request};
 use crate::json::Json;
@@ -38,7 +39,12 @@ const ANSWER_RESERVE: usize = 256;
 
 /// Everything the request handlers share.
 pub struct Server {
-    pub session: Mutex<Session>,
+    /// The session of a model that generates text. `None` for an encoder.
+    pub session: Option<Mutex<Session>>,
+    /// The embedder of an embedding or reranking model.
+    pub embedder: Option<Mutex<Embedder>>,
+    /// The model either of them runs.
+    model: Arc<Model>,
     pub template: Option<Template>,
     /// The name clients see for the loaded model.
     pub model_id: String,
@@ -61,7 +67,9 @@ impl Server {
         api_key: Option<String>,
     ) -> Server {
         Server {
-            session: Mutex::new(session),
+            model: Arc::clone(session.model()),
+            session: Some(Mutex::new(session)),
+            embedder: None,
             template,
             model_id,
             api_key,
@@ -142,6 +150,8 @@ impl Server {
             ("POST", "/v1/completions") => self.generate(request, out, Kind::Text),
             ("POST", "/tokenize") => self.tokens(request, out, true),
             ("POST", "/detokenize") => self.tokens(request, out, false),
+            ("POST", "/v1/embeddings" | "/embeddings") => self.embeddings(request, out),
+            ("POST", "/v1/rerank" | "/rerank" | "/v1/reranking") => self.rerank(request, out),
             (
                 _,
                 "/health"
@@ -150,10 +160,176 @@ impl Server {
                 | "/v1/chat/completions"
                 | "/v1/completions"
                 | "/tokenize"
-                | "/detokenize",
+                | "/detokenize"
+                | "/v1/embeddings"
+                | "/embeddings"
+                | "/v1/rerank"
+                | "/rerank"
+                | "/v1/reranking",
             ) => send_error(out, 405, "method not allowed"),
             _ => send_error(out, 404, "no such endpoint"),
         }
+    }
+
+    /// A server for an embedding or reranking model.
+    pub fn for_encoder(embedder: Embedder, model_id: String, api_key: Option<String>) -> Server {
+        Server {
+            model: Arc::clone(embedder.model()),
+            session: None,
+            embedder: Some(Mutex::new(embedder)),
+            template: None,
+            model_id,
+            api_key,
+            overflow: Overflow::default(),
+            keep: None,
+            connections: AtomicUsize::new(0),
+            next_id: AtomicU64::new(1),
+        }
+    }
+
+    /// The embedder, or the error a request for one gets.
+    fn embedder(
+        &self,
+        out: &mut impl Write,
+    ) -> std::io::Result<Option<std::sync::MutexGuard<'_, Embedder>>> {
+        match &self.embedder {
+            Some(embedder) => Ok(Some(
+                embedder.lock().unwrap_or_else(|poison| poison.into_inner()),
+            )),
+            None => {
+                send_error(
+                    out,
+                    400,
+                    "this model generates text: serve an embedding or reranking model",
+                )?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Handles `/v1/embeddings` in OpenAI's shape: `{"input": text}` or a
+    /// list of texts, to one embedding of length one per text.
+    fn embeddings(&self, request: &Request, out: &mut impl Write) -> std::io::Result<()> {
+        let body = match std::str::from_utf8(&request.body)
+            .map_err(|_| "the body is not UTF-8".to_string())
+            .and_then(Json::parse)
+        {
+            Ok(body) => body,
+            Err(message) => return send_error(out, 400, &message),
+        };
+        let texts: Vec<String> = match body.get("input") {
+            Some(Json::String(text)) => vec![text.clone()],
+            Some(Json::Array(items)) if items.iter().all(|item| item.as_str().is_some()) => items
+                .iter()
+                .filter_map(Json::as_str)
+                .map(str::to_string)
+                .collect(),
+            _ => return send_error(out, 400, "'input' must be a string or a list of strings"),
+        };
+        let Some(mut embedder) = self.embedder(out)? else {
+            return Ok(());
+        };
+        if embedder.pooling() == Pooling::Rank {
+            return send_error(out, 400, "this is a reranking model: use /v1/rerank");
+        }
+        let mut data = Vec::with_capacity(texts.len());
+        let mut used = 0;
+        for (index, text) in texts.iter().enumerate() {
+            let tokens = self.model.tokenizer().encode(text, true, true);
+            used += tokens.len();
+            let mut vector = match embedder.embed(&tokens) {
+                Ok(vector) => vector,
+                Err(error) => return send_error(out, 400, &error.to_string()),
+            };
+            normalize(&mut vector);
+            let numbers = vector.iter().map(|&v| Json::Number(v as f64)).collect();
+            data.push(Json::object([
+                ("object", Json::string("embedding")),
+                ("index", Json::Number(index as f64)),
+                ("embedding", Json::Array(numbers)),
+            ]));
+        }
+        let usage = Json::object([
+            ("prompt_tokens", Json::Number(used as f64)),
+            ("total_tokens", Json::Number(used as f64)),
+        ]);
+        send_json(
+            out,
+            200,
+            &Json::object([
+                ("object", Json::string("list")),
+                ("data", Json::Array(data)),
+                ("model", Json::string(&self.model_id)),
+                ("usage", usage),
+            ]),
+        )
+    }
+
+    /// Handles `/v1/rerank` in the shape llama.cpp's server and Jina use:
+    /// `{"query": text, "documents": [texts], "top_n": n}` to the
+    /// documents' indexes and scores, best first.
+    fn rerank(&self, request: &Request, out: &mut impl Write) -> std::io::Result<()> {
+        let body = match std::str::from_utf8(&request.body)
+            .map_err(|_| "the body is not UTF-8".to_string())
+            .and_then(Json::parse)
+        {
+            Ok(body) => body,
+            Err(message) => return send_error(out, 400, &message),
+        };
+        let Some(query) = body.get("query").and_then(Json::as_str) else {
+            return send_error(out, 400, "'query' must be a string");
+        };
+        let documents: Vec<&str> = match body.get("documents").and_then(Json::as_array) {
+            Some(items) if items.iter().all(|item| item.as_str().is_some()) => {
+                items.iter().filter_map(Json::as_str).collect()
+            }
+            _ => return send_error(out, 400, "'documents' must be a list of strings"),
+        };
+        let Some(mut embedder) = self.embedder(out)? else {
+            return Ok(());
+        };
+        if embedder.pooling() != Pooling::Rank {
+            return send_error(out, 400, "this model makes embeddings: use /v1/embeddings");
+        }
+        let mut scored = Vec::with_capacity(documents.len());
+        let mut used = 0;
+        for (index, document) in documents.iter().enumerate() {
+            let tokens = self.model.tokenizer().encode_pair(query, document);
+            used += tokens.len();
+            match embedder.embed(&tokens) {
+                Ok(scores) => scored.push((index, scores.first().copied().unwrap_or(0.0))),
+                Err(error) => return send_error(out, 400, &error.to_string()),
+            }
+        }
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let top = body
+            .get("top_n")
+            .and_then(Json::as_usize)
+            .unwrap_or(scored.len());
+        let results = scored
+            .into_iter()
+            .take(top)
+            .map(|(index, score)| {
+                Json::object([
+                    ("index", Json::Number(index as f64)),
+                    ("relevance_score", Json::Number(score as f64)),
+                ])
+            })
+            .collect();
+        let usage = Json::object([
+            ("prompt_tokens", Json::Number(used as f64)),
+            ("total_tokens", Json::Number(used as f64)),
+        ]);
+        send_json(
+            out,
+            200,
+            &Json::object([
+                ("model", Json::string(&self.model_id)),
+                ("object", Json::string("list")),
+                ("usage", usage),
+                ("results", Json::Array(results)),
+            ]),
+        )
     }
 
     /// Handles `/tokenize` and `/detokenize`, in the shape llama.cpp's
@@ -172,11 +348,7 @@ impl Server {
             Err(message) => return send_error(out, 400, &message),
         };
         // The model is shared, so this does not wait for a generation.
-        let model = match self.session.lock() {
-            Ok(session) => session.model().clone(),
-            Err(poisoned) => poisoned.into_inner().model().clone(),
-        };
-        let tokenizer = model.tokenizer();
+        let tokenizer = self.model.tokenizer();
         if encode {
             let Some(text) = body.get("content").and_then(Json::as_str) else {
                 return send_error(out, 400, "'content' must be a string");
@@ -213,11 +385,15 @@ impl Server {
             Err(message) => return send_error(out, 400, &message),
         };
 
+        let Some(session) = &self.session else {
+            return send_error(
+                out,
+                400,
+                "this model makes embeddings or scores: use /v1/embeddings or /v1/rerank",
+            );
+        };
         // Requests take turns with the one session.
-        let mut session = self
-            .session
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let mut session = session.lock().unwrap_or_else(|poison| poison.into_inner());
         let (tokens, system) = match &job.input {
             Input::Text(prompt) => (session.model().tokenizer().encode(prompt, true, true), None),
             Input::Chat(messages) => {
@@ -274,8 +450,13 @@ impl Server {
                     &envelope.chunk(Some("assistant"), Some(""), None).to_text(),
                 )?;
             }
-            let result = generate::run_tokens(&mut session, &tokens, &job.options, |piece| {
-                http::send_event(out, &envelope.chunk(None, Some(piece), None).to_text()).is_ok()
+            let result = generate::run_tokens_with(&mut session, &tokens, &job.options, |piece| {
+                let chunk = if piece.reasoning {
+                    envelope.reasoning_chunk(piece.text)
+                } else {
+                    envelope.chunk(None, Some(piece.text), None)
+                };
+                http::send_event(out, &chunk.to_text()).is_ok()
             });
             match result {
                 Ok(stats) => {
@@ -293,15 +474,20 @@ impl Server {
                 Err(error) => http::send_event(out, &error_json(&error.to_string()).to_text()),
             }
         } else {
-            let mut text = String::new();
-            let result = generate::run_tokens(&mut session, &tokens, &job.options, |piece| {
-                text.push_str(piece);
+            let (mut text, mut reasoning) = (String::new(), String::new());
+            let result = generate::run_tokens_with(&mut session, &tokens, &job.options, |piece| {
+                let into = if piece.reasoning {
+                    &mut reasoning
+                } else {
+                    &mut text
+                };
+                into.push_str(piece.text);
                 true
             });
             match result {
                 Ok(stats) => {
                     log_request(&id, &stats);
-                    send_json(out, 200, &envelope.complete(&text, &stats))
+                    send_json(out, 200, &envelope.complete(&text, &reasoning, &stats))
                 }
                 Err(error) => send_error(out, 500, &error.to_string()),
             }
@@ -405,6 +591,9 @@ impl Job {
             sampler,
             stop,
             show_special: false,
+            // A chat answer keeps the model's reasoning apart, as
+            // `reasoning_content`. A plain completion is raw text.
+            reasoning: kind == Kind::Chat,
             overflow: Overflow::default(),
             keep: None,
         };
@@ -473,14 +662,19 @@ impl Envelope<'_> {
     }
 
     /// A whole, unstreamed response.
-    fn complete(&self, text: &str, stats: &Stats) -> Json {
+    fn complete(&self, text: &str, reasoning: &str, stats: &Stats) -> Json {
         let finish = ("finish_reason", Json::string(finish_reason(stats.finish)));
         let (object, choice) = match self.kind {
             Kind::Chat => {
-                let message = Json::object([
-                    ("role", Json::string("assistant")),
-                    ("content", Json::string(text)),
-                ]);
+                let mut message = vec![
+                    ("role".to_string(), Json::string("assistant")),
+                    ("content".to_string(), Json::string(text)),
+                ];
+                // The field llama.cpp and DeepSeek's API use.
+                if !reasoning.is_empty() {
+                    message.push(("reasoning_content".to_string(), Json::string(reasoning)));
+                }
+                let message = Json::Object(message);
                 (
                     "chat.completion",
                     Json::object([("index", Json::Number(0.0)), ("message", message), finish]),
@@ -529,6 +723,19 @@ impl Envelope<'_> {
             }
         };
         let mut members = self.base(object);
+        members.push(("choices".to_string(), Json::Array(vec![choice])));
+        Json::Object(members)
+    }
+
+    /// One event of a streamed chat answer that carries reasoning.
+    fn reasoning_chunk(&self, text: &str) -> Json {
+        let delta = Json::object([("reasoning_content", Json::string(text))]);
+        let choice = Json::object([
+            ("index", Json::Number(0.0)),
+            ("delta", delta),
+            ("finish_reason", Json::Null),
+        ]);
+        let mut members = self.base("chat.completion.chunk");
         members.push(("choices".to_string(), Json::Array(vec![choice])));
         Json::Object(members)
     }
@@ -722,12 +929,36 @@ mod tests {
             model: "m",
             kind: Kind::Chat,
         };
-        let full = chat.complete("hi", &stats());
+        let full = chat.complete("hi", "", &stats());
         assert_eq!(
             full.get("object").unwrap().as_str(),
             Some("chat.completion")
         );
         let choice = &full.get("choices").unwrap().as_array().unwrap()[0];
+        // Reasoning appears only when there was some.
+        assert!(
+            choice
+                .get("message")
+                .unwrap()
+                .get("reasoning_content")
+                .is_none()
+        );
+        let thought = chat.complete("hi", "plan", &stats());
+        let message = thought.get("choices").unwrap().as_array().unwrap()[0]
+            .get("message")
+            .unwrap();
+        assert_eq!(
+            message.get("reasoning_content").unwrap().as_str(),
+            Some("plan")
+        );
+        let delta = chat.reasoning_chunk("step");
+        let delta = delta.get("choices").unwrap().as_array().unwrap()[0]
+            .get("delta")
+            .unwrap();
+        assert_eq!(
+            delta.get("reasoning_content").unwrap().as_str(),
+            Some("step")
+        );
         assert_eq!(
             choice
                 .get("message")
@@ -775,7 +1006,7 @@ mod tests {
             model: "m",
             kind: Kind::Text,
         };
-        let full = text.complete("out", &stats());
+        let full = text.complete("out", "", &stats());
         assert_eq!(
             full.get("choices").unwrap().as_array().unwrap()[0]
                 .get("text")

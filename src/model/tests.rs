@@ -13,7 +13,7 @@ use crate::kernels::{self, Kernels};
 use crate::tensor::TensorType;
 use crate::testing::TinyModel;
 
-const ARCHS: [&str; 14] = [
+const ARCHS: [&str; 18] = [
     "llama",
     "qwen2",
     "qwen3",
@@ -28,6 +28,10 @@ const ARCHS: [&str; 14] = [
     "granitemoe",
     "olmoe",
     "smollm3",
+    "gemma2",
+    "phi3",
+    "gpt-oss",
+    "phi2",
 ];
 
 const QUANT_TYPES: [TensorType; 22] = [
@@ -78,6 +82,7 @@ fn session(
         threads,
         batch,
         kernels,
+        ..Default::default()
     };
     Session::new(Arc::clone(model), config).unwrap()
 }
@@ -149,49 +154,128 @@ mod oracle {
             .collect()
     }
 
+    /// LayerNorm when there is a bias, RMS norm otherwise.
+    fn norm(x: &[f64], weight: &[f32], bias: Option<&[f32]>, eps: f32) -> Vec<f64> {
+        let Some(bias) = bias else {
+            return rms_norm(x, Some(weight), eps);
+        };
+        let n = x.len() as f64;
+        let mean = x.iter().sum::<f64>() / n;
+        let variance = x.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n;
+        x.iter()
+            .enumerate()
+            .map(|(i, v)| {
+                (v - mean) / (variance + eps as f64).sqrt() * weight[i] as f64 + bias[i] as f64
+            })
+            .collect()
+    }
+
     fn rotate(
         head: &mut [f64],
         position: usize,
         spec: &LayerSpec,
-        rope: Rope,
+        config: &Config,
         factors: Option<&[f32]>,
     ) {
         let n = spec.rope_dims;
+        let mut scale = config.rope_attn_factor as f64;
+        // YaRN as Hugging Face's transformers writes it: the correction
+        // range, then a linear ramp between interpolated and extrapolated
+        // frequencies.
+        let ramp = config.yarn.map(|yarn| {
+            let correction_dim = |rotations: f32| {
+                let context = yarn.original_context as f64;
+                n as f64 * (context / (rotations as f64 * 2.0 * std::f64::consts::PI)).ln()
+                    / (2.0 * (spec.rope_base as f64).ln())
+            };
+            let factor = 1.0 / spec.rope_scale as f64;
+            scale *= yarn.attn_factor as f64 * (0.1 * factor.ln() + 1.0);
+            let low = correction_dim(yarn.beta_fast).floor().max(0.0);
+            let high = correction_dim(yarn.beta_slow).ceil().min(n as f64 - 1.0);
+            (low, if low == high { high + 0.001 } else { high })
+        });
         for i in 0..n / 2 {
             let frequency = (spec.rope_base as f64).powf(-2.0 * i as f64 / n as f64);
             let divisor = factors.map_or(1.0, |f| f[i] as f64);
-            let angle = position as f64 * frequency * spec.rope_scale as f64 / divisor;
-            let (a, b) = match rope {
+            let extrapolation = frequency / divisor;
+            let interpolation = extrapolation * spec.rope_scale as f64;
+            let inv_freq = match ramp {
+                Some((low, high)) => {
+                    let linear = ((i as f64 - low) / (high - low)).clamp(0.0, 1.0);
+                    let extrapolation_factor = 1.0 - linear;
+                    interpolation * (1.0 - extrapolation_factor)
+                        + extrapolation * extrapolation_factor
+                }
+                None => interpolation,
+            };
+            let angle = position as f64 * inv_freq;
+            let (a, b) = match config.rope {
                 Rope::Pairs => (2 * i, 2 * i + 1),
                 Rope::Halves => (i, i + n / 2),
             };
             let (x0, x1) = (head[a], head[b]);
-            head[a] = x0 * angle.cos() - x1 * angle.sin();
-            head[b] = x0 * angle.sin() + x1 * angle.cos();
+            head[a] = (x0 * angle.cos() - x1 * angle.sin()) * scale;
+            head[b] = (x0 * angle.sin() + x1 * angle.cos()) * scale;
         }
     }
 
-    fn activate(x: f64, activation: Activation) -> f64 {
+    /// The rotary divisors of a layer. The tests' sessions hold 2048
+    /// tokens, past every synthetic model's original context, so a
+    /// LongRoPE model uses its long ones.
+    fn factors_of<'a>(model: &'a Model, spec: &LayerSpec) -> Option<&'a [f32]> {
+        let w = model.weights();
+        let factors = match &w.rope_factors_long {
+            Some(long) if 2048 > model.config().long_context_after => Some(long.as_slice()),
+            _ => w.rope_factors.as_deref(),
+        };
+        factors.filter(|_| spec.rope_factors)
+    }
+
+    /// The gate's activation times the up projection.
+    fn activate(gate: f64, up: f64, activation: Activation) -> f64 {
         match activation {
-            Activation::Silu => x / (1.0 + (-x).exp()),
+            Activation::Silu => gate / (1.0 + (-gate).exp()) * up,
             Activation::Gelu => {
-                let z = (2.0 / std::f64::consts::PI).sqrt() * (x + 0.044715 * x * x * x);
-                0.5 * x * (1.0 + z.tanh())
+                let z = (2.0 / std::f64::consts::PI).sqrt() * (gate + 0.044715 * gate.powi(3));
+                0.5 * gate * (1.0 + z.tanh()) * up
+            }
+            Activation::SwigluOai => {
+                let (gate, up) = (gate.min(7.0), up.clamp(-7.0, 7.0));
+                gate / (1.0 + (-1.702 * gate).exp()) * (up + 1.0)
             }
         }
     }
 
-    /// A gated feed-forward network.
+    /// A gated feed-forward network, with each projection's bias when it
+    /// has one (gpt-oss experts).
     fn feed_forward(model: &Model, w: &Dense, h: &[f64]) -> Vec<f64> {
+        feed_forward_biased(model, w, h, None)
+    }
+
+    fn feed_forward_biased(
+        model: &Model,
+        w: &Dense,
+        h: &[f64],
+        biases: Option<[Vec<f64>; 3]>,
+    ) -> Vec<f64> {
         let activation = model.config().activation;
-        let gate = apply(model, &w.gate, h);
-        let up = apply(model, &w.up, h);
+        let add = |mut values: Vec<f64>, index: usize| {
+            if let Some(biases) = &biases {
+                values
+                    .iter_mut()
+                    .zip(&biases[index])
+                    .for_each(|(v, b)| *v += b);
+            }
+            values
+        };
+        let gate = add(apply(model, &w.gate, h), 0);
+        let up = add(apply(model, &w.up, h), 1);
         let mixed: Vec<f64> = gate
             .iter()
             .zip(&up)
-            .map(|(g, u)| activate(*g, activation) * u)
+            .map(|(g, u)| activate(*g, *u, activation))
             .collect();
-        apply(model, &w.down, &mixed)
+        add(apply(model, &w.down, &mixed), 2)
     }
 
     /// A mixture of experts, following llama.cpp's routing step by step.
@@ -232,7 +316,11 @@ mod oracle {
                 up: w.up.expert(expert),
                 down: w.down.expert(expert),
             };
-            let result = feed_forward(model, &dense, h);
+            let biases = w
+                .biases
+                .as_ref()
+                .map(|matrices| matrices.each_ref().map(|m| row_of(model, m, expert)));
+            let result = feed_forward_biased(model, &dense, h, biases);
             out.iter_mut()
                 .zip(result)
                 .for_each(|(o, r)| *o += weight * r);
@@ -264,10 +352,10 @@ mod oracle {
         inputs: &[Vec<f64>],
         caches: &mut Caches,
     ) -> Vec<Vec<f64>> {
-        let (c, w) = (model.config(), model.weights());
+        let c = model.config();
         let spec = &c.layers[index];
         let hd = spec.head_dim;
-        let factors = w.rope_factors.as_deref().filter(|_| spec.rope_factors);
+        let factors = factors_of(model, spec);
         if let Some((wk, wv)) = &a.kv {
             let mut keys = Vec::new();
             let mut values = Vec::new();
@@ -285,7 +373,7 @@ mod oracle {
                     if let Some(weight) = a.k_norm.as_deref().filter(|w| w.len() == hd) {
                         head.copy_from_slice(&rms_norm(head, Some(weight), c.norm_eps));
                     }
-                    rotate(head, position, spec, c.rope, factors);
+                    rotate(head, position, spec, c, factors);
                 }
                 if c.value_norm {
                     for head in v.chunks_exact_mut(hd) {
@@ -313,7 +401,7 @@ mod oracle {
                     if let Some(weight) = a.q_norm.as_deref().filter(|w| w.len() == hd) {
                         head.copy_from_slice(&rms_norm(head, Some(weight), c.norm_eps));
                     }
-                    rotate(head, position, spec, c.rope, factors);
+                    rotate(head, position, spec, c, factors);
                 }
                 let first = match spec.window {
                     0 => 0,
@@ -327,12 +415,23 @@ mod oracle {
                     let scores: Vec<f64> = (first..=position)
                         .map(|j| {
                             let k = &keys[j][kv_head..kv_head + hd];
-                            q.iter().zip(k).map(|(a, b)| a * b).sum::<f64>()
-                                * spec.attention_scale as f64
+                            let score = q.iter().zip(k).map(|(a, b)| a * b).sum::<f64>()
+                                * spec.attention_scale as f64;
+                            match c.attention_softcap as f64 {
+                                0.0 => score,
+                                cap => cap * (score / cap).tanh(),
+                            }
                         })
                         .collect();
-                    let max = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                    let total: f64 = scores.iter().map(|s| (s - max).exp()).sum();
+                    // A sink counts in the softmax's total as one more
+                    // score, with no value.
+                    let sink = a.sinks.as_ref().map(|sinks| sinks[head] as f64);
+                    let max = scores
+                        .iter()
+                        .chain(&sink)
+                        .cloned()
+                        .fold(f64::NEG_INFINITY, f64::max);
+                    let total: f64 = scores.iter().chain(&sink).map(|s| (s - max).exp()).sum();
                     let gate = gates
                         .as_ref()
                         .map_or(1.0, |g| 1.0 / (1.0 + (-g[head]).exp()));
@@ -438,7 +537,7 @@ mod oracle {
         for (index, layer) in w.layers.iter().enumerate() {
             let inputs: Vec<Vec<f64>> = x
                 .iter()
-                .map(|row| rms_norm(row, Some(&layer.attn_norm), eps))
+                .map(|row| norm(row, &layer.attn_norm, layer.attn_norm_bias.as_deref(), eps))
                 .collect();
             let updates = match &layer.mixer {
                 MixerWeights::Attention(a) => attention(model, index, a, &inputs, &mut caches),
@@ -453,10 +552,22 @@ mod oracle {
                     .for_each(|v| *v *= c.residual_scale as f64);
                 add(&mut x[position], &update);
 
-                let h = rms_norm(&x[position], Some(&layer.ffn_norm), eps);
+                // A parallel block's network reads the block's input.
+                let h = if c.parallel {
+                    inputs[position].clone()
+                } else {
+                    rms_norm(&x[position], Some(&layer.ffn_norm), eps)
+                };
                 let mut update = match &layer.ffn {
                     FeedForward::Dense(dense) => feed_forward(model, dense, &h),
                     FeedForward::Experts(experts) => mixture(model, experts, &h),
+                    FeedForward::Plain(plain) => {
+                        let up: Vec<f64> = apply(model, &plain.up, &h)
+                            .iter()
+                            .map(|&u| activate(u, 1.0, c.activation))
+                            .collect();
+                        apply(model, &plain.down, &up)
+                    }
                 };
                 if let Some(weight) = &layer.ffn_post_norm {
                     update = rms_norm(&update, Some(weight), eps);
@@ -472,7 +583,7 @@ mod oracle {
                     let mixed: Vec<f64> = gate
                         .iter()
                         .zip(input)
-                        .map(|(g, i)| activate(*g, Activation::Gelu) * i)
+                        .map(|(g, i)| activate(*g, *i, Activation::Gelu))
                         .collect();
                     let update = apply(model, &plw.proj, &mixed);
                     add(
@@ -486,9 +597,10 @@ mod oracle {
             }
         }
 
-        let last = rms_norm(
+        let last = norm(
             x.last().expect("at least one token"),
-            Some(&w.output_norm),
+            &w.output_norm,
+            w.output_norm_bias.as_deref(),
             eps,
         );
         let mut logits = apply(model, &w.output, &last);
@@ -661,6 +773,31 @@ fn batching_and_threads_do_not_change_the_result() {
                 assert!(relative_error(&again, &narrow) < 1e-4);
             }
         }
+        // Reading prompts on more threads than generating changes nothing.
+        let config = SessionConfig {
+            n_ctx: 2048,
+            threads: 1,
+            batch_threads: 5,
+            batch: 32,
+            ..Default::default()
+        };
+        let mut split = Session::new(Arc::clone(&model), config).unwrap();
+        assert_eq!((split.threads(), split.batch_threads()), (1, 5));
+        split.eval(&LONG_PROMPT).unwrap();
+        assert_eq!(split.logits(), logits(&model, &LONG_PROMPT, 1, 32));
+        split.eval(&[3]).unwrap();
+        let mut whole = LONG_PROMPT.to_vec();
+        whole.push(3);
+        assert!(
+            relative_error(
+                split.logits(),
+                &logits(&model, &whole, 1, 1)
+                    .iter()
+                    .map(|v| *v as f64)
+                    .collect::<Vec<_>>()
+            ) < 1e-4
+        );
+
         // Feeding the prompt in pieces is the same as feeding it at once.
         let mut session = session(&model, 2, 4, None);
         session.eval(&PROMPT[..4]).unwrap();

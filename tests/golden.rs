@@ -243,8 +243,26 @@ fn granite_3_1_1b_a400m_q4_k_m() {
 }
 
 #[test]
+fn gemma_2_2b_q4_k_m() {
+    check("gemma-2-2b-it-Q4_K_M");
+}
+
+#[test]
+fn phi_4_mini_q4_k_m() {
+    check("microsoft_Phi-4-mini-instruct-Q4_K_M");
+}
+
+#[test]
+fn phi_2_q4_k_m() {
+    check("phi-2.Q4_K_M");
+}
+
+#[test]
 fn every_golden_file_has_a_test() {
     let tested = [
+        "phi-2.Q4_K_M",
+        "gemma-2-2b-it-Q4_K_M",
+        "microsoft_Phi-4-mini-instruct-Q4_K_M",
         "LFM2-8B-A1B-Q4_K_M",
         "granite-3.1-1b-a400m-instruct-Q4_K_M",
         "LFM2.5-350M-Q4_K_M",

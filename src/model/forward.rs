@@ -44,16 +44,17 @@ use crate::error::{Error, Result};
 use crate::gguf::Mapping;
 use crate::kernels::{self, Kernels};
 use crate::tensor::quant::dequantize_row;
-use crate::threads::{ThreadPool, default_threads};
+use crate::threads::{ThreadPool, default_batch_threads, default_threads};
 
 use super::Model;
-use super::config::{Activation, Config, Gating, LayerSpec, Mixer, Rope, Routing};
+use super::config::{Activation, Config, Gating, LayerSpec, Mixer, Rope, Routing, Yarn};
 use super::conv::ConvState;
 use super::kv::KvCache;
 use super::matmul::{ActScratch, Engine, Target};
+use super::recurrent::{self, RecurrentState};
 use super::weights::{
     AttentionWeights, ConvWeights, Dense, Experts, FeedForward, Linear, Matrix, MixerWeights,
-    PerLayerInputs, PerLayerWeights,
+    PerLayerInputs, PerLayerWeights, Plain,
 };
 
 /// Context length used when the caller does not choose one.
@@ -170,8 +171,13 @@ pub struct SessionConfig {
     /// Context window in tokens. Zero picks the model's training context,
     /// capped at 4096. Any size is accepted: the cache grows as it fills.
     pub n_ctx: usize,
-    /// Threads to compute with. Zero picks one per performance core.
+    /// Threads to generate with. Zero picks one per performance core.
     pub threads: usize,
+    /// Threads to read prompts with. Zero picks one per physical core,
+    /// efficiency cores included, unless `threads` is set, which it then
+    /// follows. Reading a prompt is arithmetic that every core speeds up,
+    /// where generating waits on memory.
+    pub batch_threads: usize,
     /// Tokens evaluated together while reading a prompt. Zero picks 32.
     /// Larger batches read prompts faster and use more scratch memory.
     pub batch: usize,
@@ -185,6 +191,9 @@ struct RopeKind {
     dims: usize,
     /// Angle per position of each rotated pair.
     freqs: Vec<f64>,
+    /// What every rotated value is multiplied by: the model's rotary
+    /// attention factor, and YaRN's.
+    scale: f32,
     /// `(cos, sin)` of every pair, for each token of the batch.
     table: Vec<f32>,
 }
@@ -218,9 +227,20 @@ impl RopeTables {
                 Some(index) => index,
                 None => {
                     settings.push(key);
+                    // YaRN scales rotated values up by a tenth of the log of
+                    // how far the layer stretches positions, as llama.cpp
+                    // does.
+                    let scale = match &config.yarn {
+                        Some(yarn) => {
+                            let stretch = 1.0 / layer.rope_scale;
+                            yarn.attn_factor * (1.0 + 0.1 * stretch.ln())
+                        }
+                        None => 1.0,
+                    };
                     kinds.push(RopeKind {
                         dims: layer.rope_dims,
-                        freqs: frequencies(layer, factors),
+                        freqs: frequencies(layer, factors, config.yarn.as_ref()),
+                        scale: scale * config.rope_attn_factor,
                         table: Vec::new(),
                     });
                     kinds.len() - 1
@@ -242,8 +262,8 @@ impl RopeTables {
                 let position = (first_position + index) as f64;
                 for frequency in &kind.freqs {
                     let (sin, cos) = (position * frequency).sin_cos();
-                    kind.table.push(cos as f32);
-                    kind.table.push(sin as f32);
+                    kind.table.push(cos as f32 * kind.scale);
+                    kind.table.push(sin as f32 * kind.scale);
                 }
             }
         }
@@ -273,14 +293,55 @@ impl RopeTables {
     }
 }
 
+/// The rotary divisors a session of `n_ctx` tokens uses: a LongRoPE model's
+/// long ones when the session reaches past the model's original context,
+/// as llama.cpp chooses them.
+fn rope_factors(model: &Model, n_ctx: usize) -> Option<&[f32]> {
+    let weights = model.weights();
+    match &weights.rope_factors_long {
+        Some(long) if n_ctx > model.config().long_context_after => Some(long),
+        _ => weights.rope_factors.as_deref(),
+    }
+}
+
 /// The angle per position of each rotated pair of a layer's heads.
-fn frequencies(layer: &LayerSpec, factors: Option<&[f32]>) -> Vec<f64> {
-    (0..layer.rope_dims / 2)
+///
+/// Under YaRN, the pairs that turn many times over the original context
+/// keep their frequency, the ones that turn few times are scaled like the
+/// rest, and a linear ramp blends the two in between. The ramp's ends are
+/// computed as in ggml, from the pairs that make `beta_fast` and
+/// `beta_slow` turns.
+fn frequencies(layer: &LayerSpec, factors: Option<&[f32]>, yarn: Option<&Yarn>) -> Vec<f64> {
+    let dims = layer.rope_dims;
+    let base = layer.rope_base as f64;
+    let scale = layer.rope_scale as f64;
+    // The pairs at which the ramp starts and ends.
+    let ramp = yarn.map(|yarn| {
+        let pair = |turns: f32| {
+            let context = yarn.original_context as f64;
+            dims as f64 * (context / (turns as f64 * 2.0 * std::f64::consts::PI)).ln()
+                / (2.0 * base.ln())
+        };
+        let low = pair(yarn.beta_fast).floor().max(0.0);
+        let high = pair(yarn.beta_slow).ceil().min(dims as f64 - 1.0);
+        (low, high)
+    });
+    (0..dims / 2)
         .map(|i| {
-            let exponent = -2.0 * i as f64 / layer.rope_dims as f64;
-            let frequency = (layer.rope_base as f64).powf(exponent);
+            let exponent = -2.0 * i as f64 / dims as f64;
             let divisor = factors.map_or(1.0, |f| f[i] as f64);
-            frequency * layer.rope_scale as f64 / divisor
+            let kept = base.powf(exponent) / divisor;
+            let scaled = kept * scale;
+            match ramp {
+                // How much of the kept frequency to use: all of it below
+                // the ramp, none above.
+                Some((low, high)) => {
+                    let along = (i as f64 - low) / (high - low).max(0.001);
+                    let keep = 1.0 - along.clamp(0.0, 1.0);
+                    scaled * (1.0 - keep) + kept * keep
+                }
+                None => scaled,
+            }
         })
         .collect()
 }
@@ -308,6 +369,34 @@ fn rotate(vector: &mut [f32], table: &[f32], rope: Rope) {
 }
 
 /// RMS normalization with a learned gain: `out = x / rms(x) * weight`.
+/// Normalizes `x` into `out`: LayerNorm when there is a bias, RMS norm
+/// otherwise.
+fn norm(
+    kernels: &Kernels,
+    x: &[f32],
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    eps: f32,
+    out: &mut [f32],
+) {
+    match bias {
+        Some(bias) => layer_norm(x, weight, bias, eps, out),
+        None => rms_norm(kernels, x, weight, eps, out),
+    }
+}
+
+/// LayerNorm: `(x - mean) / sqrt(variance + eps) * weight + bias`. The sums
+/// are taken in double precision, as ggml takes them.
+fn layer_norm(x: &[f32], weight: &[f32], bias: &[f32], eps: f32, out: &mut [f32]) {
+    let n = x.len() as f64;
+    let mean = x.iter().map(|&v| v as f64).sum::<f64>() / n;
+    let variance = x.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / n;
+    let scale = 1.0 / (variance + eps as f64).sqrt();
+    for (((out, &v), w), b) in out.iter_mut().zip(x).zip(weight).zip(bias) {
+        *out = ((v as f64 - mean) * scale) as f32 * w + b;
+    }
+}
+
 fn rms_norm(kernels: &Kernels, x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
     let scale = 1.0 / (kernels.sum_squares(x) / x.len() as f32 + eps).sqrt();
     for ((out, value), gain) in out.iter_mut().zip(x).zip(weight) {
@@ -395,6 +484,10 @@ struct ExpertScratch {
     groups: Vec<Range<usize>>,
     /// The gate, up and down maps of each expert in use.
     linears: Vec<Linear>,
+    /// The expert each group belongs to.
+    group_experts: Vec<usize>,
+    /// One expert's bias row, read from the file.
+    bias: Vec<f32>,
     /// The input of every pair, then its gate and up projections, then
     /// its output.
     inputs: Vec<f32>,
@@ -427,6 +520,9 @@ struct Scratch {
     /// The feed-forward gate and up projections.
     gate: Vec<f32>,
     up: Vec<f32>,
+    /// The normalized input of a parallel block, kept for its feed-forward
+    /// network while attention runs. Empty for other models.
+    parallel: Vec<f32>,
     experts: ExpertScratch,
     per_layer: PerLayerScratch,
     acts: ActScratch,
@@ -444,14 +540,20 @@ unsafe impl Sync for Slots {}
 pub struct Session {
     model: Arc<Model>,
     kernels: &'static Kernels,
+    /// Threads for generating, one token at a time.
     pool: ThreadPool,
+    /// Threads for reading prompts, when their number differs.
+    batch_pool: Option<ThreadPool>,
     kv: KvCache,
     conv: ConvState,
+    /// The states of recurrent blocks (Mamba, RWKV).
+    recurrent: RecurrentState,
     n_ctx: usize,
     batch: usize,
     /// One past the last block that keeps something for later tokens: a
-    /// key/value cache or a convolution state. From that block on, only the
-    /// rows whose logits are wanted are computed in full.
+    /// key/value cache, a convolution state or a recurrent state. From that
+    /// block on, only the rows whose logits are wanted are computed in
+    /// full.
     state_end: usize,
     scratch: Scratch,
     /// Logits for the token after the last evaluated one.
@@ -465,6 +567,11 @@ pub struct Session {
 impl Session {
     /// Starts an empty conversation with `model`.
     pub fn new(model: Arc<Model>, config: SessionConfig) -> Result<Session> {
+        if model.is_encoder() {
+            return Err(Error::invalid(
+                "this is an embedding or reranking model, which an Embedder runs",
+            ));
+        }
         let c = model.config();
         let n_ctx = if config.n_ctx == 0 {
             c.n_ctx_train.min(DEFAULT_CONTEXT)
@@ -481,11 +588,17 @@ impl Session {
         } else {
             config.threads
         };
-        if threads > 4096 || batch > 1 << 16 {
+        let batch_threads = match (config.batch_threads, config.threads) {
+            (0, 0) => default_batch_threads(),
+            (0, _) => threads,
+            (chosen, _) => chosen,
+        };
+        if threads > 4096 || batch_threads > 4096 || batch > 1 << 16 {
             return Err(Error::invalid("thread count or batch size out of range"));
         }
         let kernels = config.kernels.unwrap_or_else(kernels::best);
         let pool = ThreadPool::new(threads);
+        let batch_pool = (batch_threads != threads).then(|| ThreadPool::new(batch_threads));
 
         let d = c.n_embd;
         let is_conv: Vec<bool> = c
@@ -558,7 +671,7 @@ impl Session {
                 attended: vec![0.0; batch * q_dim],
                 gates: vec![0.0; batch * gated_heads],
                 slots: Slots(
-                    (0..pool.threads())
+                    (0..threads.max(batch_threads))
                         .map(|_| UnsafeCell::new((Vec::new(), Vec::new())))
                         .collect(),
                 ),
@@ -566,10 +679,15 @@ impl Session {
             conv: conv_scratch,
             gate: vec![0.0; batch * n_ff],
             up: vec![0.0; batch * n_ff],
+            parallel: if c.parallel {
+                vec![0.0; batch * d]
+            } else {
+                Vec::new()
+            },
             experts,
             per_layer,
             acts: ActScratch::default(),
-            rope: RopeTables::new(c, model.weights().rope_factors.as_deref()),
+            rope: RopeTables::new(c, rope_factors(&model, n_ctx)),
         };
         // Layers that read another layer's cache have none of their own.
         let shapes: Vec<(usize, usize)> = c
@@ -583,18 +701,23 @@ impl Session {
                 }
             })
             .collect();
-        let state_end = c
-            .layers
-            .iter()
-            .rposition(|layer| layer.owns_kv() || layer.mixer == Mixer::ShortConv)
+        let recurrent = RecurrentState::new(&recurrent::state_sizes(c));
+        let state_end = (0..c.n_layer)
+            .rev()
+            .find(|&index| {
+                let layer = &c.layers[index];
+                layer.owns_kv() || layer.mixer == Mixer::ShortConv || recurrent.has(index)
+            })
             .map_or(0, |index| index + 1);
         let logits = vec![0.0; c.n_vocab];
         Ok(Session {
             model,
             kernels,
             pool,
+            batch_pool,
             kv: KvCache::new(&shapes),
             conv,
+            recurrent,
             n_ctx,
             batch,
             state_end,
@@ -620,9 +743,14 @@ impl Session {
         &self.tokens
     }
 
-    /// Number of threads the session computes with.
+    /// Number of threads the session generates with.
     pub fn threads(&self) -> usize {
         self.pool.threads()
+    }
+
+    /// Number of threads the session reads prompts with.
+    pub fn batch_threads(&self) -> usize {
+        self.batch_pool.as_ref().unwrap_or(&self.pool).threads()
     }
 
     /// Name of the kernel backend in use.
@@ -633,7 +761,7 @@ impl Session {
     /// Bytes of memory held for the context: the key/value cache and the
     /// convolution state.
     pub fn cache_bytes(&self) -> usize {
-        self.kv.allocated_bytes() + self.conv.bytes()
+        self.kv.allocated_bytes() + self.conv.bytes() + self.recurrent.bytes()
     }
 
     /// Starts or stops timing the stages of every forward pass. Starting
@@ -660,13 +788,23 @@ impl Session {
     /// Removes every token from position `len` on. The logits are stale
     /// until the next [`eval`](Self::eval).
     ///
-    /// A model with convolution blocks may have to read a few hundred
-    /// tokens before `len` again to rebuild their state (see `conv.rs`).
+    /// A model with convolution or recurrent blocks may have to read tokens
+    /// before `len` again to rebuild their state (see `conv.rs` and
+    /// `recurrent.rs`).
     pub fn truncate(&mut self, len: usize) {
         if len >= self.tokens.len() {
             return;
         }
-        let resume = self.conv.rewind(len);
+        // Both kinds of state must stand at the same position. Each one
+        // stays where it is when asked for its own position, so this ends.
+        let mut resume = len;
+        loop {
+            let next = self.recurrent.rewind(self.conv.rewind(resume));
+            if next == resume {
+                break;
+            }
+            resume = next;
+        }
         self.kv.truncate(resume);
         let replay = self.tokens[resume..len].to_vec();
         self.tokens.truncate(resume);
@@ -700,6 +838,7 @@ impl Session {
             rotate(&mut key[..dims], &back[rope.of_layer[layer]], config.rope);
         });
         self.conv.shift(keep, discard);
+        self.recurrent.shift(keep, discard);
         self.tokens.drain(keep..keep + discard);
     }
 
@@ -738,6 +877,11 @@ impl Session {
         while let Some(batch) = batches.next() {
             self.forward(batch, want_logits && batches.peek().is_none());
         }
+        // The end of a prompt is where a later one is likely to go back
+        // to. Single generated tokens are not worth a copy of the state.
+        if tokens.len() > 1 {
+            self.recurrent.save();
+        }
     }
 
     /// Runs one batch through the model.
@@ -746,8 +890,10 @@ impl Session {
             model,
             kernels,
             pool,
+            batch_pool,
             kv,
             conv,
+            recurrent,
             state_end,
             scratch,
             logits,
@@ -760,6 +906,12 @@ impl Session {
         }
         let kernels: &'static Kernels = kernels;
         let model: &Model = model;
+        // A batch of tokens is arithmetic and gets every core. One token
+        // waits on memory and gets the fast ones.
+        let pool: &ThreadPool = match batch_pool {
+            Some(batch_pool) if tokens.len() > 1 => batch_pool,
+            _ => pool,
+        };
         let (config, weights) = (model.config(), model.weights());
         let map = model.gguf().mapping();
         let Scratch {
@@ -769,6 +921,7 @@ impl Session {
             conv: conv_scratch,
             gate,
             up,
+            parallel,
             experts,
             per_layer,
             acts,
@@ -795,6 +948,7 @@ impl Session {
             rope,
             kv,
             conv,
+            recurrent,
             acts,
             profile,
             count,
@@ -817,7 +971,8 @@ impl Session {
             } else {
                 count..count
             };
-            let keeps_state = spec.owns_kv() || spec.mixer == Mixer::ShortConv;
+            let keeps_state =
+                spec.owns_kv() || spec.mixer == Mixer::ShortConv || pass.recurrent.has(index);
             let inputs = if keeps_state {
                 0..count
             } else {
@@ -834,11 +989,24 @@ impl Session {
             };
 
             // The mixer: attention or a convolution over positions.
+            let attn_norm_bias = layer.attn_norm_bias.as_deref();
             for token in run.inputs.clone() {
                 let row = token * d..(token + 1) * d;
-                rms_norm(kernels, &x[row.clone()], &layer.attn_norm, eps, &mut h[row]);
+                norm(
+                    kernels,
+                    &x[row.clone()],
+                    &layer.attn_norm,
+                    attn_norm_bias,
+                    eps,
+                    &mut h[row],
+                );
             }
             pass.lap(Phase::Norm);
+            // A parallel block's feed-forward network reads the same input.
+            if config.parallel {
+                let rows = run.active.start * d..run.active.end * d;
+                parallel[..rows.len()].copy_from_slice(&h[rows]);
+            }
             match &layer.mixer {
                 MixerWeights::Attention(weights) => pass.attention(&run, weights, h, attention),
                 MixerWeights::ShortConv(weights) => pass.short_conv(&run, weights, h, conv_scratch),
@@ -860,12 +1028,17 @@ impl Session {
             );
 
             // Feed-forward: a gated network, or a mixture of them.
-            for (out, row) in h_active.chunks_exact_mut(d).zip(x_active.chunks_exact(d)) {
-                rms_norm(kernels, row, &layer.ffn_norm, eps, out);
+            if config.parallel {
+                h_active.copy_from_slice(&parallel[..n_active * d]);
+            } else {
+                for (out, row) in h_active.chunks_exact_mut(d).zip(x_active.chunks_exact(d)) {
+                    rms_norm(kernels, row, &layer.ffn_norm, eps, out);
+                }
             }
             pass.lap(Phase::Norm);
             match &layer.ffn {
                 FeedForward::Dense(dense) => pass.dense(dense, spec.n_ff, h_active, gate, up),
+                FeedForward::Plain(plain) => pass.plain(plain, spec.n_ff, h_active, gate, up),
                 FeedForward::Experts(weights) => {
                     pass.experts(weights, spec, h_active, (gate, up), experts)
                 }
@@ -890,12 +1063,14 @@ impl Session {
         }
         pass.kv.set_len(first_position + count);
         pass.conv.advance(first_position + count);
+        pass.recurrent.advance(first_position + count);
         history.extend_from_slice(tokens);
 
         if want_logits {
             let last = &x[(count - 1) * d..count * d];
             let normalized = &mut h[..d];
-            rms_norm(kernels, last, &weights.output_norm, eps, normalized);
+            let bias = weights.output_norm_bias.as_deref();
+            norm(kernels, last, &weights.output_norm, bias, eps, normalized);
             pass.multiply(
                 normalized,
                 d,
@@ -923,6 +1098,7 @@ struct Pass<'a> {
     rope: &'a RopeTables,
     kv: &'a mut KvCache,
     conv: &'a mut ConvState,
+    recurrent: &'a mut RecurrentState,
     acts: &'a mut ActScratch,
     profile: &'a mut Option<Profile>,
     /// Tokens in the batch.
@@ -1059,6 +1235,8 @@ impl Pass<'_> {
             q,
             first_position: self.first_position + run.active.start,
             window: spec.window,
+            softcap: config.attention_softcap,
+            sinks: w.sinks.as_deref(),
         };
         let source = spec.kv_source.unwrap_or(run.index);
         attend(&self.engine, self.kv, source, spec, &query, &s.slots, out);
@@ -1130,6 +1308,22 @@ impl Pass<'_> {
 
     /// A gated feed-forward network on the rows of `h`, which it replaces
     /// with its output.
+    /// An ungated feed-forward network: `down(act(up(x)))`. The activation
+    /// runs on the gate kernel, against ones.
+    fn plain(&mut self, w: &Plain, n_ff: usize, h: &mut [f32], act: &mut [f32], ones: &mut [f32]) {
+        let d = self.config.n_embd;
+        let rows = h.len() / d;
+        let (act, ones) = (&mut act[..rows * n_ff], &mut ones[..rows * n_ff]);
+        self.multiply(h, d, &mut [Target::new(&w.up, &mut *act)]);
+        self.lap(Phase::FeedForwardUp);
+        ones.fill(1.0);
+        let (kernels, pool) = (self.engine.kernels, self.engine.pool);
+        apply_gate(kernels, pool, self.config.activation, act, ones);
+        self.lap(Phase::Activation);
+        self.multiply(act, n_ff, &mut [Target::new(&w.down, h)]);
+        self.lap(Phase::FeedForwardDown);
+    }
+
     fn dense(&mut self, w: &Dense, n_ff: usize, h: &mut [f32], gate: &mut [f32], up: &mut [f32]) {
         let d = self.config.n_embd;
         let rows = h.len() / d;
@@ -1209,10 +1403,12 @@ impl Pass<'_> {
         }
         s.groups.clear();
         s.linears.clear();
+        s.group_experts.clear();
         for expert in 0..routing.count {
             let group = s.starts[expert]..s.starts[expert + 1];
             if !group.is_empty() {
                 s.groups.push(group);
+                s.group_experts.push(expert);
                 s.linears.extend([
                     w.gate.expert(expert),
                     w.up.expert(expert),
@@ -1244,6 +1440,20 @@ impl Pass<'_> {
         }
         self.multiply(inputs, d, &mut targets);
         drop(targets);
+        if let Some([gate_bias, up_bias, _]) = &w.biases {
+            let map = self.engine.map;
+            for (values, bias) in [(&mut *gate, gate_bias), (&mut *up, up_bias)] {
+                add_expert_biases(
+                    map,
+                    bias,
+                    &s.groups,
+                    &s.group_experts,
+                    n_ff,
+                    values,
+                    &mut s.bias,
+                );
+            }
+        }
         self.lap(Phase::FeedForwardUp);
         apply_gate(kernels, self.engine.pool, config.activation, gate, up);
         self.lap(Phase::Activation);
@@ -1263,6 +1473,18 @@ impl Pass<'_> {
         }
         self.multiply(gate, n_ff, &mut targets);
         drop(targets);
+        if let Some([_, _, down_bias]) = &w.biases {
+            let map = self.engine.map;
+            add_expert_biases(
+                map,
+                down_bias,
+                &s.groups,
+                &s.group_experts,
+                d,
+                out,
+                &mut s.bias,
+            );
+        }
         self.lap(Phase::FeedForwardDown);
 
         // A shared expert sees every row, scaled by its own gate. Then the
@@ -1415,6 +1637,43 @@ fn choose(
     }
 }
 
+/// Adds each expert's bias row to the rows routed to it. `values` holds
+/// `width` floats per row, in the grouped order.
+fn add_expert_biases(
+    map: &Mapping,
+    biases: &Matrix,
+    groups: &[Range<usize>],
+    experts: &[usize],
+    width: usize,
+    values: &mut [f32],
+    row: &mut Vec<f32>,
+) {
+    row.resize(width, 0.0);
+    for (group, &expert) in groups.iter().zip(experts) {
+        read_row(map, biases, expert, row);
+        for values in values[group.start * width..group.end * width].chunks_exact_mut(width) {
+            values
+                .iter_mut()
+                .zip(row.iter())
+                .for_each(|(value, bias)| *value += bias);
+        }
+    }
+}
+
+/// OpenAI's SwiGLU: with `x = min(g, 7)` and `y = clamp(u, -7, 7)`, the
+/// result is `x * sigmoid(1.702 * x) * (y + 1)`. It is computed as the SiLU
+/// kernel's `silu(a) * b`, with `a = 1.702 * x` and `b = (y + 1) / 1.702`,
+/// so that it runs on the fast kernel.
+fn swiglu_oai(kernels: &Kernels, gate: &mut [f32], up: &mut [f32]) {
+    const ALPHA: f32 = 1.702;
+    const LIMIT: f32 = 7.0;
+    for (g, u) in gate.iter_mut().zip(up.iter_mut()) {
+        *g = ALPHA * g.min(LIMIT);
+        *u = (u.clamp(-LIMIT, LIMIT) + 1.0) / ALPHA;
+    }
+    kernels.silu_mul(gate, up);
+}
+
 /// Applies the gate of the feed-forward network: `gate = act(gate) * up`.
 /// Large batches are split between the threads.
 fn apply_gate(
@@ -1422,22 +1681,28 @@ fn apply_gate(
     pool: &ThreadPool,
     activation: Activation,
     gate: &mut [f32],
-    up: &[f32],
+    up: &mut [f32],
 ) {
     /// Elements per parallel piece. Fewer are not worth waking a thread for.
     const GRAIN: usize = 16 * 1024;
-    let apply = |gate: &mut [f32], up: &[f32]| match activation {
+    let apply = |gate: &mut [f32], up: &mut [f32]| match activation {
         Activation::Silu => kernels.silu_mul(gate, up),
         Activation::Gelu => kernels.gelu_mul(gate, up),
+        Activation::SwigluOai => swiglu_oai(kernels, gate, up),
     };
-    if gate.len() <= GRAIN || pool.threads() == 1 {
-        return apply(gate, up);
+    let n = gate.len().min(up.len());
+    if n <= GRAIN || pool.threads() == 1 {
+        return apply(&mut gate[..n], &mut up[..n]);
     }
-    let output = SharedOutput(gate.as_mut_ptr());
-    pool.ranges(gate.len().min(up.len()), GRAIN, &|range| {
-        // SAFETY: the ranges are disjoint and lie inside `gate`.
-        let gate = unsafe { output.slice(range.start, range.len()) };
-        apply(gate, &up[range]);
+    let (gates, ups) = (
+        SharedOutput(gate.as_mut_ptr()),
+        SharedOutput(up.as_mut_ptr()),
+    );
+    pool.ranges(n, GRAIN, &|range| {
+        // SAFETY: the ranges are disjoint and lie inside `gate` and `up`.
+        let gate = unsafe { gates.slice(range.start, range.len()) };
+        let up = unsafe { ups.slice(range.start, range.len()) };
+        apply(gate, up);
     });
 }
 
@@ -1474,6 +1739,10 @@ struct Query<'a> {
     /// How many positions a token may look back, itself included. Zero for
     /// no limit.
     window: usize,
+    /// Soft cap on the scores, `cap * tanh(score / cap)`. Zero for none.
+    softcap: f32,
+    /// Each query head's sink score, when the model has them.
+    sinks: Option<&'a [f32]>,
 }
 
 /// Where a parallel loop writes, shared between its threads.
@@ -1532,6 +1801,8 @@ fn attend(
         };
         let end = position + 1;
         let visible = end - first;
+        // Each head's scores, with room for its sink at the end.
+        let stride = visible + usize::from(query.sinks.is_some());
         // The query heads that read this key/value head sit side by side.
         let group = token * q_dim + kv_head * group_dim;
 
@@ -1548,7 +1819,7 @@ fn attend(
                 .map(|value| value * spec.attention_scale),
         );
         scores.clear();
-        scores.resize(shared * visible, 0.0);
+        scores.resize(shared * stride, 0.0);
 
         kv.for_each_run(layer, kv_head, first, end, |run_first, keys, _| {
             kernels.dot_rows(
@@ -1556,15 +1827,26 @@ fn attend(
                 keys,
                 head_dim,
                 &mut scores[run_first - first..],
-                visible,
+                stride,
             );
         });
-        for head_scores in scores.chunks_exact_mut(visible) {
+        for (head, head_scores) in scores.chunks_exact_mut(stride).enumerate() {
+            if query.softcap > 0.0 {
+                let cap = query.softcap;
+                head_scores[..visible]
+                    .iter_mut()
+                    .for_each(|score| *score = cap * (*score / cap).tanh());
+            }
+            // A sink joins the softmax as one more score. Its weight is
+            // never used, so the others add up to less than one.
+            if let Some(sinks) = query.sinks {
+                head_scores[visible] = sinks[kv_head * shared + head];
+            }
             kernels.softmax(head_scores);
         }
         out.fill(0.0);
         kv.for_each_run(layer, kv_head, first, end, |run_first, _, values| {
-            kernels.mix_rows(&scores[run_first - first..], values, head_dim, out, visible);
+            kernels.mix_rows(&scores[run_first - first..], values, head_dim, out, stride);
         });
     };
 
