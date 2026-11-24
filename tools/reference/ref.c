@@ -7,6 +7,9 @@
 //   ref ids    MODEL IDSFILE OUTFILE           raw f32 logits after the token
 //                                              ids listed in IDSFILE
 //   ref bench  MODEL N_PROMPT N_GEN THREADS    prompt and generation speed
+//   ref mem    MODEL N_CTX N_TOKENS THREADS    memory in use after loading,
+//                                              with a context, and after
+//                                              reading tokens (Linux only)
 #include "llama.h"
 #include "ggml-backend.h"
 
@@ -40,6 +43,24 @@ static char * read_file(const char * path, size_t * len) {
     return buf;
 }
 
+// Prints what this process holds in memory, from /proc/self/status.
+// "own" is memory the process allocated. "file" is the part of the mapped
+// model file that is in memory, which the system can drop and read again.
+static void print_memory(const char * when) {
+    FILE * f = fopen("/proc/self/status", "r");
+    if (!f) { printf("%s: no /proc/self/status on this system\n", when); return; }
+    char line[256];
+    long own = 0, file = 0, shared = 0;
+    while (fgets(line, sizeof line, f)) {
+        sscanf(line, "RssAnon: %ld", &own);
+        sscanf(line, "RssFile: %ld", &file);
+        // A model on a memory file system is counted here instead.
+        sscanf(line, "RssShmem: %ld", &shared);
+    }
+    fclose(f);
+    printf("%-18s own %8.1f MB   file %8.1f MB\n", when, own / 1024.0, (file + shared) / 1024.0);
+}
+
 static int argmax(const float * v, int n) {
     int best = 0;
     for (int i = 1; i < n; i++) if (v[i] > v[best]) best = i;
@@ -63,6 +84,28 @@ int main(int argc, char ** argv) {
     if (!model) { fprintf(stderr, "cannot load model\n"); return 1; }
     const struct llama_vocab * vocab = llama_model_get_vocab(model);
     const int n_vocab = llama_vocab_n_tokens(vocab);
+
+    if (strcmp(mode, "mem") == 0) {
+        if (argc < 6) { fprintf(stderr, "mem MODEL N_CTX N_TOKENS THREADS\n"); return 2; }
+        int n_ctx = atoi(argv[3]), n_tokens = atoi(argv[4]), threads = atoi(argv[5]);
+        print_memory("model loaded");
+        struct llama_context_params cp = llama_context_default_params();
+        cp.n_ctx = n_ctx;
+        cp.n_threads = threads;
+        cp.n_threads_batch = threads;
+        cp.no_perf = true;
+        struct llama_context * ctx = llama_init_from_model(model, cp);
+        if (!ctx) { fprintf(stderr, "cannot make context\n"); return 1; }
+        print_memory("context ready");
+        llama_token * toks = malloc(sizeof(llama_token) * (n_tokens + 1));
+        for (int i = 0; i < n_tokens; i++) toks[i] = 1 + (i * 7919) % (n_vocab > 1000 ? 1000 : n_vocab - 1);
+        for (int done = 0; done < n_tokens; done += 32) {
+            int n = n_tokens - done < 32 ? n_tokens - done : 32;
+            if (llama_decode(ctx, llama_batch_get_one(toks + done, n))) { fprintf(stderr, "decode failed\n"); return 1; }
+        }
+        print_memory("tokens read");
+        return 0;
+    }
 
     if (strcmp(mode, "bench") == 0) {
         if (argc < 6) { fprintf(stderr, "bench MODEL N_PROMPT N_GEN THREADS\n"); return 2; }

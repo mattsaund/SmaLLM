@@ -58,6 +58,7 @@ pub fn main(raw: impl Iterator<Item = String>) -> Result<(), String> {
 
     let loaded = load_model(name)?;
     let model = &loaded.model;
+    let memory_loaded = memory_in_use();
     let mut config = session_config(&args)?;
     if config.n_ctx == 0 {
         config.n_ctx = n_prompt + n_gen + 8;
@@ -70,6 +71,7 @@ pub fn main(raw: impl Iterator<Item = String>) -> Result<(), String> {
         ));
     }
     let mut session = Session::new(model.clone(), config).map_err(|error| error.to_string())?;
+    let memory_ready = memory_in_use();
 
     // Token ids that cycle through the low end of the vocabulary. Their
     // meaning does not matter, only that every run sees the same ones.
@@ -127,10 +129,62 @@ pub fn main(raw: impl Iterator<Item = String>) -> Result<(), String> {
         ),
     );
 
+    if let (Some(loaded), Some(ready), Some(now)) = (memory_loaded, memory_ready, memory_in_use()) {
+        row(
+            "memory",
+            format!(
+                "{} with the model loaded, {} with a session, {} now",
+                human_bytes(loaded.own),
+                human_bytes(ready.own),
+                human_bytes(now.own)
+            ),
+        );
+        row(
+            "",
+            format!(
+                "plus {} of the model file, which the system can drop",
+                human_bytes(now.file)
+            ),
+        );
+    }
+
     if args.has("profile") && n_gen > 0 {
         profile(&mut session, &prompt, n_gen)?;
     }
     Ok(())
+}
+
+/// What the process holds in memory.
+struct Memory {
+    /// Bytes the process allocated itself.
+    own: u64,
+    /// Bytes of mapped files in memory: the model. The system can drop
+    /// these pages at any time and read them again from the file.
+    file: u64,
+}
+
+/// Reads the memory in use from the kernel. Only Linux reports it in this
+/// form.
+fn memory_in_use() -> Option<Memory> {
+    if !cfg!(any(target_os = "linux", target_os = "android")) {
+        return None;
+    }
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let kilobytes = |name: &str| {
+        let line = status.lines().find(|line| line.starts_with(name))?;
+        line[name.len()..]
+            .trim()
+            .strip_suffix("kB")?
+            .trim()
+            .parse::<u64>()
+            .ok()
+    };
+    // A model on a memory file system is counted as shared memory instead
+    // of as a file, so the two are added.
+    Some(Memory {
+        own: kilobytes("RssAnon:")? * 1024,
+        file: (kilobytes("RssFile:")? + kilobytes("RssShmem:").unwrap_or(0)) * 1024,
+    })
 }
 
 /// Times each stage of the forward pass, first while the prompt is read

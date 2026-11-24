@@ -370,6 +370,9 @@ pub fn available() -> Vec<&'static Kernels> {
     {
         if x86::supported() {
             list.push(&x86::KERNELS);
+            if x86::has_vnni() {
+                list.push(&x86::KERNELS_VNNI);
+            }
         }
     }
     list

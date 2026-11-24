@@ -15,33 +15,61 @@
 // sit in `unsafe` blocks with a SAFETY comment.
 #![allow(unsafe_op_in_unsafe_fn)]
 
+use std::arch::asm;
 use std::arch::x86_64::*;
 
 use super::scalar;
-use super::{ActRef, DotQuant, Kernels};
+use super::{ActRef, DotQuant, Kernels, TileDot};
 use crate::tensor::TensorType;
 use crate::tensor::f16::f16_to_f32;
 use crate::tensor::quant::Tile;
 
-pub static KERNELS: Kernels = Kernels {
-    name: "avx2",
-    dot,
-    axpy,
-    sum_squares,
-    dot_rows,
-    mix_rows,
-    silu_mul,
-    gelu_mul,
-    softmax,
-    quantize,
-    row_f32,
-    row_f16,
-    row_bf16,
-    row_quant,
-    tile_rows: 8,
-    tile_dot,
-    tile_fill,
-};
+/// Kernels for every CPU with AVX2.
+pub static KERNELS: Kernels = kernels("avx2", tile_dot);
+
+/// Kernels for CPUs that also have AVX-VNNI.
+pub static KERNELS_VNNI: Kernels = kernels("avx2+vnni", tile_dot_vnni);
+
+/// Builds a kernel table. Only the tile kernel differs between the two.
+const fn kernels(name: &'static str, tile_dot: TileDot) -> Kernels {
+    Kernels {
+        name,
+        dot,
+        axpy,
+        sum_squares,
+        dot_rows,
+        mix_rows,
+        silu_mul,
+        gelu_mul,
+        softmax,
+        quantize,
+        row_f32,
+        row_f16,
+        row_bf16,
+        row_quant,
+        tile_rows: 8,
+        tile_dot,
+        tile_fill,
+    }
+}
+
+/// Asks the CPU about itself. A function of its own because older
+/// compilers declare the instruction unsafe and newer ones do not.
+unsafe fn cpuid(leaf: u32, sub_leaf: u32) -> CpuidResult {
+    __cpuid_count(leaf, sub_leaf)
+}
+
+/// True when the running CPU has AVX-VNNI, which multiplies bytes and adds
+/// the products in fours with one instruction. Intel has it since the 12th
+/// generation Core and the N100, AMD since Zen 5.
+///
+/// Read from CPUID directly, because the standard library's check for it is
+/// newer than the oldest compiler this crate supports. The operating system
+/// already saves the registers involved when [`supported`] is true.
+pub fn has_vnni() -> bool {
+    // SAFETY: every x86-64 CPU has the CPUID instruction.
+    unsafe { cpuid(0, 0).eax >= 7 && cpuid(7, 0).eax >= 1 && cpuid(7, 1).eax & (1 << 4) != 0 }
+}
 
 /// True when the running CPU has every feature these kernels use.
 pub fn supported() -> bool {
@@ -96,8 +124,21 @@ unsafe fn hsum(v: __m256) -> f32 {
 /// - Signed weights: `maddubs` needs an unsigned operand, so it multiplies
 ///   the weights' magnitudes with activations that carry the weights'
 ///   signs. One step fills 16 bits.
+///
+/// With `VNNI`, one instruction per step multiplies and adds straight into
+/// 32-bit sums, so nothing has to fit in 16 bits. It also wants unsigned
+/// weights. Signed ones are moved up by 128, and the surplus, 128 times the
+/// sum of the activations, is taken off again. That sum is already known
+/// from quantizing them.
 #[target_feature(enable = "avx2,fma,f16c")]
-unsafe fn tile_dot(tile: &Tile, act: ActRef, scaled_sums: *const f32, group: usize, out: *mut f32) {
+#[inline]
+unsafe fn tile_dot_impl<const VNNI: bool>(
+    tile: &Tile,
+    act: ActRef,
+    scaled_sums: *const f32,
+    group: usize,
+    out: *mut f32,
+) {
     debug_assert_eq!(tile.height, 8);
     debug_assert!(tile.signed || tile.max <= 63);
     debug_assert!(group == 32 || group == 256);
@@ -118,6 +159,23 @@ unsafe fn tile_dot(tile: &Tile, act: ActRef, scaled_sums: *const f32, group: usi
         ($step:expr) => {{
             let (weights, acts) = operands!($step);
             _mm256_maddubs_epi16(weights, acts)
+        }};
+    }
+    // The row sums of the sub-block that starts at step `$step`, by the
+    // VNNI instruction. `$flip` is XORed into the weights first. Two chains
+    // of two steps keep each addition from waiting on three others.
+    macro_rules! vnni_rows {
+        ($step:expr, $flip:expr) => {{
+            let (w0, a0) = operands!($step);
+            let (w1, a1) = operands!($step + 1);
+            let (w2, a2) = operands!($step + 2);
+            let (w3, a3) = operands!($step + 3);
+            let none = _mm256_setzero_si256();
+            let even = dpbusd(none, _mm256_xor_si256(w0, $flip), a0);
+            let even = dpbusd(even, _mm256_xor_si256(w2, $flip), a2);
+            let odd = dpbusd(none, _mm256_xor_si256(w1, $flip), a1);
+            let odd = dpbusd(odd, _mm256_xor_si256(w3, $flip), a3);
+            _mm256_add_epi32(even, odd)
         }};
     }
     // The row sums of step `$step`, for signed weights.
@@ -188,7 +246,16 @@ unsafe fn tile_dot(tile: &Tile, act: ActRef, scaled_sums: *const f32, group: usi
     // groups of `group`, their scaled sums when the tile has offsets, and
     // room for 8 outputs. Every index below stays inside those sizes.
     unsafe {
-        let total = if tile.signed {
+        let total = if VNNI && tile.signed {
+            let flip = _mm256_set1_epi8(-128);
+            reduce!(tile.has_offset, |s| {
+                let surplus = 128 * *act.sums.add(s / 4) as i32;
+                _mm256_sub_epi32(vnni_rows!(s, flip), _mm256_set1_epi32(surplus))
+            })
+        } else if VNNI {
+            let flip = _mm256_setzero_si256();
+            reduce!(tile.has_offset, |s| vnni_rows!(s, flip))
+        } else if tile.signed {
             // Signed tiles come from formats without offsets.
             reduce!(tile.has_offset, |s| {
                 let low = _mm256_add_epi32(signed_rows!(s), signed_rows!(s + 1));
@@ -210,6 +277,51 @@ unsafe fn tile_dot(tile: &Tile, act: ActRef, scaled_sums: *const f32, group: usi
         };
         _mm256_storeu_ps(out, total);
     }
+}
+
+/// The tile kernel for every CPU with AVX2.
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn tile_dot(tile: &Tile, act: ActRef, scaled_sums: *const f32, group: usize, out: *mut f32) {
+    // SAFETY: forwarded contract.
+    unsafe { tile_dot_impl::<false>(tile, act, scaled_sums, group, out) }
+}
+
+/// The tile kernel for CPUs with AVX-VNNI.
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn tile_dot_vnni(
+    tile: &Tile,
+    act: ActRef,
+    scaled_sums: *const f32,
+    group: usize,
+    out: *mut f32,
+) {
+    // SAFETY: forwarded contract. This table is only chosen when the CPU
+    // reports the extension.
+    unsafe { tile_dot_impl::<true>(tile, act, scaled_sums, group, out) }
+}
+
+/// The AVX-VNNI instruction `vpdpbusd`: multiplies 32 unsigned bytes of
+/// `weights` with 32 signed bytes of `acts` and adds each four neighboring
+/// products to one 32-bit lane of `sums`.
+///
+/// Written in assembly because the intrinsic for it is newer than the
+/// oldest compiler this crate supports. The `{vex}` prefix selects the
+/// AVX-VNNI encoding, not the AVX-512 one.
+#[target_feature(enable = "avx2,fma,f16c")]
+#[inline]
+unsafe fn dpbusd(mut sums: __m256i, weights: __m256i, acts: __m256i) -> __m256i {
+    // SAFETY: the instruction only touches the three registers it is
+    // given. The caller guarantees the CPU has it.
+    unsafe {
+        asm!(
+            "{{vex}} vpdpbusd {sums}, {weights}, {acts}",
+            sums = inout(ymm_reg) sums,
+            weights = in(ymm_reg) weights,
+            acts = in(ymm_reg) acts,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+    sums
 }
 
 // ---------------------------------------------------------------------------
