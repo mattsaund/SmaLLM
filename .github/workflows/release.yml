@@ -48,7 +48,11 @@ env:
   # pinned, so a release never changes because the compiler did. To move
   # it, pick a newer date and check that this workflow still passes.
   # Building from source with stable Rust works as it always did.
-  TOOLCHAIN: nightly-2026-11-24
+  #
+  # The name is not TOOLCHAIN on purpose. Windows ignores the case of
+  # variable names, and the action that installs Rust has an input called
+  # `toolchain`, which this would then replace.
+  SMALL_TOOLCHAIN: nightly-2026-11-24
   SMALL_STD: -Z build-std=std,panic_abort -Z build-std-features=optimize_for_size
   SMALL_FLAGS: -Zunstable-options -Cpanic=immediate-abort
 
@@ -132,7 +136,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ env.TOOLCHAIN }}
+          toolchain: ${{ env.SMALL_TOOLCHAIN }}
           components: rust-src
           targets: ${{ matrix.target }}${{ matrix.library && format(',{0}', matrix.library) || '' }}
 
@@ -142,13 +146,16 @@ jobs:
 
       # RUSTFLAGS replaces the flags in .cargo/config.toml, so the static C
       # runtime for Windows is asked for here again. RISC-V and 32-bit ARM
-      # need the same flag to link musl statically.
+      # need the same flag to link musl statically. The musl that Rust
+      # ships for RISC-V cannot be moved around in memory, so that program
+      # is linked for a fixed address.
       - name: Choose the compiler flags
         shell: bash
         run: |
           flags="$SMALL_FLAGS"
           case "${{ matrix.target }}" in
-            *windows*|riscv64*|armv7*) flags="$flags -Ctarget-feature=+crt-static" ;;
+            riscv64*) flags="$flags -Ctarget-feature=+crt-static -Crelocation-model=static" ;;
+            *windows*|armv7*) flags="$flags -Ctarget-feature=+crt-static" ;;
           esac
           echo "RUSTFLAGS=$flags" >> "$GITHUB_ENV"
           if [ -n "${{ matrix.env_name }}" ]; then
