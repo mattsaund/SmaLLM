@@ -235,7 +235,7 @@ pub enum Absorb {
 }
 
 /// The weights of a latent attention block (DeepSeek V2 and V3). See
-/// [`Mla`](super::config::Mla) for the shape.
+/// [`Mla`] for the shape.
 pub struct MlaWeights {
     /// The compression of the hidden state that queries are made from, and
     /// its norm. `None` when `q` reads the hidden state itself.

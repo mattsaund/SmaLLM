@@ -313,7 +313,10 @@ param([switch]$Uninstall, [switch]$Yes)
         $sums = Join-Path $work 'SHA256SUMS'
         if (Get-File "$base/SHA256SUMS" $sums 85 90) {
             $actual = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash.ToLower()
-            $line = Get-Content $sums | Where-Object { $_ -match ([regex]::Escape($asset) + '$') } | Select-Object -First 1
+            # The whole name must match: the library's archive is named like
+            # the program's with a 'lib' in front, and is listed first.
+            $pattern = '^[0-9a-fA-F]+\s+\*?' + [regex]::Escape($asset) + '\s*$'
+            $line = Get-Content $sums | Where-Object { $_ -match $pattern } | Select-Object -First 1
             $expected = if ($line) { ($line -split '\s+')[0].ToLower() } else { '' }
             if ($expected -ne $actual) {
                 throw 'the download does not match its checksum. Nothing was installed.'
