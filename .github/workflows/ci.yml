@@ -169,10 +169,10 @@ jobs:
         include:
           - target: armv7-unknown-linux-musleabihf
             env_name: ARMV7_UNKNOWN_LINUX_MUSLEABIHF
-            qemu: qemu-arm-static
+            qemu: qemu-arm
           - target: riscv64gc-unknown-linux-musl
             env_name: RISCV64GC_UNKNOWN_LINUX_MUSL
-            qemu: qemu-riscv64-static
+            qemu: qemu-riscv64
     steps:
       - uses: actions/checkout@v7
 
@@ -181,7 +181,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install QEMU
-        run: sudo apt-get update && sudo apt-get install -y qemu-user-static
+        run: sudo apt-get update && sudo apt-get install -y qemu-user
 
       - name: Download a test model
         run: |

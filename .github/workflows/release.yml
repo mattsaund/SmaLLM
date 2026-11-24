@@ -93,11 +93,11 @@ jobs:
           - os: ubuntu-22.04
             target: armv7-unknown-linux-musleabihf
             env_name: ARMV7_UNKNOWN_LINUX_MUSLEABIHF
-            qemu: qemu-arm-static
+            qemu: qemu-arm
           - os: ubuntu-22.04
             target: riscv64gc-unknown-linux-musl
             env_name: RISCV64GC_UNKNOWN_LINUX_MUSL
-            qemu: qemu-riscv64-static
+            qemu: qemu-riscv64
           # Apple silicon natively, and Intel cross-built on the same runner.
           - os: macos-latest
             target: aarch64-apple-darwin
@@ -123,7 +123,7 @@ jobs:
 
       - name: Install QEMU
         if: matrix.qemu
-        run: sudo apt-get update && sudo apt-get install -y qemu-user-static
+        run: sudo apt-get update && sudo apt-get install -y qemu-user
 
       - name: Build the program
         shell: bash

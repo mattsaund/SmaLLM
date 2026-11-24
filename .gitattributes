@@ -1,0 +1,7 @@
+# Every text file is checked out with the line endings it was committed
+# with, on every system.
+* text=auto eol=lf
+
+# The golden test data is compared token by token, and a carriage return is
+# a token. Git must never touch these files.
+tests/golden/** -text
