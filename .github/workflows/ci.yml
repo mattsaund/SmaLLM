@@ -66,6 +66,19 @@ jobs:
           if command -v sha256sum >/dev/null; then sha256sum -c SHA256SUMS; else shasum -a 256 -c SHA256SUMS; fi
           echo "SMALLM_TEST_MODELS=$RUNNER_TEMP/models" >> "$GITHUB_ENV"
 
+      # llama.cpp keeps tokenizer test files: vocabularies, tricky texts, and
+      # the tokens each text becomes with the original tokenizer. They are
+      # fetched from a fixed release, without the rest of the repository.
+      # Tokenizing does not depend on the platform, so one runner does it.
+      - name: Download llama.cpp's tokenizer tests
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          git clone --quiet --depth 1 --branch b11846 --filter=blob:none --sparse \
+            https://github.com/ggml-org/llama.cpp "$RUNNER_TEMP/llama.cpp"
+          git -C "$RUNNER_TEMP/llama.cpp" sparse-checkout set --no-cone 'models/ggml-vocab-*'
+          echo "SMALLM_TEST_VOCABS=$RUNNER_TEMP/llama.cpp/models" >> "$GITHUB_ENV"
+          echo "SMALLM_TEST_REQUIRE_VOCABS=1" >> "$GITHUB_ENV"
+
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
 

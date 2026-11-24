@@ -2,18 +2,23 @@
 //!
 //! Two tokenizer kinds cover the models this engine runs:
 //!
-//! | Kind            | GGUF name | Used by                                   |
-//! |-----------------|-----------|-------------------------------------------|
-//! | SentencePiece   | `llama`   | Llama 2, TinyLlama, Mistral, Gemma        |
-//! | Byte-level BPE  | `gpt2`    | Llama 3, Qwen, SmolLM and most newer ones |
+//! | Kind           | GGUF name | Used by                                     |
+//! |----------------|-----------|---------------------------------------------|
+//! | SentencePiece  | `llama`   | Llama 2, TinyLlama, Mistral, Gemma 1 to 3   |
+//! | BPE            | `gpt2`    | Llama 3, Qwen, SmolLM, LFM and most others  |
+//! | BPE, raw UTF-8 | `gemma4`  | Gemma 4                                     |
 //!
 //! Both start from characters and merge adjacent pairs (see `merge.rs`). They
-//! differ in how text is prepared and how a pair is ranked.
+//! differ in how text is prepared and how a pair is ranked. BPE models also
+//! split text into words first, each family in its own way (see
+//! `pretok.rs`).
 //!
 //! The vocabulary is never copied out of the model file. See `vocab.rs`.
 
 mod merge;
 mod pretok;
+mod pretok_table;
+mod regex;
 mod unicode;
 mod unicode_tables;
 mod vocab;
@@ -108,7 +113,12 @@ impl Tokenizer {
         let model = file.get_str("tokenizer.ggml.model").unwrap_or("llama");
         let kind = match model {
             "llama" => Kind::SentencePiece,
-            "gpt2" => Kind::Bpe,
+            "gpt2" | "gemma4" => Kind::Bpe,
+            "bert" | "t5" | "rwkv" | "plamo2" | "plamo3" => {
+                return Err(Error::unsupported(format!(
+                    "tokenizer type '{model}', which only models this engine cannot run yet use"
+                )));
+            }
             other => return Err(Error::unsupported(format!("tokenizer type '{other}'"))),
         };
         let token_array = file
@@ -144,8 +154,12 @@ impl Tokenizer {
 
         let mut scores = Vec::new();
         let mut merges = None;
-        let pre_name = file.get_str("tokenizer.ggml.pre").unwrap_or("").to_string();
-        let mut pre = PreTokenizer::for_name("default");
+        // A Gemma 4 vocabulary names its family by its type.
+        let pre_name = match model {
+            "gemma4" => "gemma4".to_string(),
+            _ => file.get_str("tokenizer.ggml.pre").unwrap_or("").to_string(),
+        };
+        let mut pre = PreTokenizer::for_name("default")?;
         match kind {
             Kind::SentencePiece => {
                 if let Some(array) = file.get_array("tokenizer.ggml.scores") {
@@ -168,7 +182,7 @@ impl Tokenizer {
                 let table = StringTable::new(file.mapping(), &array, "tokenizer.ggml.merges")?;
                 let index = Index::build(&table, true);
                 merges = Some((table, index));
-                pre = PreTokenizer::for_name(&pre_name);
+                pre = PreTokenizer::for_name(&pre_name)?;
             }
         }
 
@@ -184,15 +198,18 @@ impl Tokenizer {
             Kind::SentencePiece => (Some(1), Some(2)),
             Kind::Bpe => (None, None),
         };
-        let bos = read_id("tokenizer.ggml.bos_token_id", default_bos);
+        let bos = read_id("tokenizer.ggml.bos_token_id", default_bos).filter(|_| !pre.no_bos);
         let eos = read_id("tokenizer.ggml.eos_token_id", default_eos);
         let mut eot = read_id("tokenizer.ggml.eot_token_id", None);
         let eom = read_id("tokenizer.ggml.eom_token_id", None);
 
         let default_add_bos = kind == Kind::SentencePiece || pre.add_bos;
-        let add_bos = file
+        // Gemma 4 files can say not to add BOS, but the model needs it, so
+        // llama.cpp adds it anyway.
+        let add_bos = (file
             .get_bool("tokenizer.ggml.add_bos_token")
             .unwrap_or(default_add_bos)
+            || model == "gemma4")
             && bos.is_some();
         let add_eos = file
             .get_bool("tokenizer.ggml.add_eos_token")
@@ -245,7 +262,7 @@ impl Tokenizer {
         special.sort_by_key(|&id| std::cmp::Reverse(tokenizer.tokens.get(id as usize).len()));
         tokenizer.special = special;
 
-        if kind == Kind::SentencePiece {
+        if kind == Kind::SentencePiece || tokenizer.pre.raw_bytes {
             tokenizer.byte_tokens = (0..=255u8)
                 .map(|byte| {
                     let escaped = format!("<0x{byte:02X}>");
@@ -396,9 +413,12 @@ impl Tokenizer {
         if flags & attr::SPECIAL != 0 {
             out.extend_from_slice(text);
         } else if flags & attr::NORMAL != 0 {
-            match self.kind {
-                Kind::SentencePiece => append_unmarked(text, out),
-                Kind::Bpe => append_byte_level(text, out),
+            if self.kind == Kind::SentencePiece || self.pre.escape_spaces {
+                append_unmarked(text, out);
+            } else if self.pre.raw_bytes {
+                out.extend_from_slice(text);
+            } else {
+                append_byte_level(text, out);
             }
         } else if flags & attr::BYTE != 0 {
             out.extend(parse_byte_token(text));
@@ -514,10 +534,18 @@ impl Tokenizer {
         }
     }
 
-    /// Tokenizes plain text the byte-level BPE way.
+    /// Tokenizes plain text the BPE way.
     fn encode_bpe(&self, text: &str, out: &mut Vec<u32>) {
         let Some((merges, merge_index)) = &self.merges else {
             return;
+        };
+        // Some families spell spaces the SentencePiece way.
+        let escaped;
+        let text = if self.pre.escape_spaces {
+            escaped = text.replace(' ', SPACE_MARK);
+            escaped.as_str()
+        } else {
+            text
         };
         // The rank of a merge rule is its position in the list. Lower ranks
         // merge first.
@@ -536,20 +564,30 @@ impl Tokenizer {
         let mut word = Vec::new();
         let mut pieces = Vec::new();
         let mut start = 0;
-        for end in pretok::split(self.pre.stages, text) {
-            // The vocabulary spells every byte as a printable character.
+        for end in self.pre.split(text) {
             word.clear();
-            let mut utf8 = [0u8; 4];
-            for &byte in &text.as_bytes()[start..end] {
-                word.extend_from_slice(
-                    unicode::byte_to_char(byte)
-                        .encode_utf8(&mut utf8)
-                        .as_bytes(),
-                );
-            }
+            let raw = &text.as_bytes()[start..end];
             start = end;
+            if self.pre.raw_bytes {
+                word.extend_from_slice(raw);
+            } else {
+                // The vocabulary spells every byte as a printable character.
+                let mut utf8 = [0u8; 4];
+                for &byte in raw {
+                    word.extend_from_slice(
+                        unicode::byte_to_char(byte)
+                            .encode_utf8(&mut utf8)
+                            .as_bytes(),
+                    );
+                }
+            }
 
-            if self.pre.ignore_merges {
+            // A word that is itself a token skips merging, in families that
+            // say so. Runs of line feeds always do in raw families, where
+            // the merges never join them.
+            let whole = self.pre.ignore_merges
+                || (self.pre.raw_bytes && raw.iter().all(|&byte| byte == b'\n'));
+            if whole {
                 if let Some(id) = self.find(&word) {
                     out.push(id);
                     continue;
@@ -560,6 +598,13 @@ impl Tokenizer {
                 let piece = &word[piece_start..piece_start + len];
                 match self.find(piece) {
                     Some(id) => out.push(id),
+                    // Raw families spell unknown bytes as `<0xNN>` tokens,
+                    // byte-level ones as their one-character tokens.
+                    None if self.pre.raw_bytes => out.extend(
+                        piece
+                            .iter()
+                            .filter_map(|&byte| self.byte_tokens[byte as usize]),
+                    ),
                     None => out.extend(piece.iter().filter_map(|&byte| self.find(&[byte]))),
                 }
             }

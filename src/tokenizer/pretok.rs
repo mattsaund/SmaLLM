@@ -1,18 +1,46 @@
 //! Splits text into words before byte pair merging.
 //!
 //! BPE models never merge across word boundaries, and each model family
-//! defines "word" with its own regular expression. A regex engine would be
-//! the largest piece of code in the tokenizer, so the handful of expressions
-//! in use are written out here as small scanners.
+//! defines "word" with its own regular expressions. The families and their
+//! expressions are in `pretok_table.rs`, generated from llama.cpp's table, and
+//! a model names its family in `tokenizer.ggml.pre`.
 //!
 //! A pre-tokenizer is a list of stages. Each stage splits every piece left
-//! by the stage before it.
+//! by the stage before it: the matches of its expression become pieces, and
+//! so does the text between them.
+//!
+//! `regex.rs` runs any expression. The most common ones also have scanners
+//! written out here, which do the same job several times faster. A test
+//! holds each scanner to the engine.
 
+use super::pretok_table::{DEFAULT_PATTERNS, FAMILIES};
+use super::regex::Regex;
 use super::unicode::{is_letter, is_number, is_other, is_punctuation, is_whitespace};
+use crate::error::{Error, Result};
 
-/// One splitting pass.
+/// One family of the table in `pretok_table.rs`.
+pub(super) struct Family {
+    /// The `tokenizer.ggml.pre` names that mean this family.
+    pub names: &'static [&'static str],
+    /// The expressions of the stages, in order.
+    pub patterns: &'static [&'static str],
+    /// A word that is itself a token is emitted whole, without merging.
+    pub ignore_merges: bool,
+    /// The family always starts a prompt with the BOS token.
+    pub add_bos: bool,
+    /// Spaces become `\u{2581}` before splitting, as in SentencePiece.
+    pub escape_spaces: bool,
+    /// The family has no BOS token, whatever the file says.
+    pub no_bos: bool,
+    /// The vocabulary spells text as raw UTF-8 rather than in the GPT-2
+    /// byte-level alphabet.
+    pub raw_bytes: bool,
+}
+
+/// A splitting pass written out by hand, for an expression that is used
+/// often. Each does exactly what its expression does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Stage {
+enum Scan {
     /// `[\p{P}$+<=>^~|]+` Runs of punctuation and a few symbols.
     PunctuationRuns,
     /// `\p{N}` Every number character on its own.
@@ -21,8 +49,10 @@ pub(super) enum Stage {
     NumberRuns,
     /// `[0-9][0-9][0-9]` Groups of exactly three ASCII digits.
     ThreeDigits,
+    /// `[^\n]+|[\n]+` Lines, and runs of line feeds.
+    Newlines,
     /// The GPT-2 expression:
-    /// `'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+`
+    /// `'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)`
     Gpt2,
     /// The Llama 3 expression, with numbers in groups of up to `max_digits`:
     /// `(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}|`
@@ -30,68 +60,89 @@ pub(super) enum Stage {
     Llama3 { max_digits: usize },
 }
 
-/// How a named pre-tokenizer splits and merges.
-#[derive(Clone, Copy, Debug)]
+/// The expressions the scanners stand for, as the table spells them.
+const SCANNED: [(&str, Scan); 8] = [
+    (r"[\p{P}\$\+<=>\^~\|]+", Scan::PunctuationRuns),
+    (r"\p{N}", Scan::EachNumber),
+    (r"\p{N}+", Scan::NumberRuns),
+    (r"[0-9][0-9][0-9]", Scan::ThreeDigits),
+    (r"[^\n]+|[\n]+", Scan::Newlines),
+    (
+        r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)",
+        Scan::Gpt2,
+    ),
+    (
+        r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+        Scan::Llama3 { max_digits: 3 },
+    ),
+    (
+        r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+        Scan::Llama3 { max_digits: 1 },
+    ),
+];
+
+/// One stage of a pre-tokenizer.
+enum Stage {
+    Scan(Scan),
+    Regex(Box<Regex>),
+}
+
+impl Stage {
+    /// The stage for an expression: its scanner, or else the expression
+    /// compiled.
+    fn new(pattern: &str) -> Result<Stage> {
+        if let Some((_, scan)) = SCANNED.iter().find(|(scanned, _)| *scanned == pattern) {
+            return Ok(Stage::Scan(*scan));
+        }
+        Regex::new(pattern)
+            .map(|regex| Stage::Regex(Box::new(regex)))
+            .map_err(|error| {
+                Error::unsupported(format!("pre-tokenizer expression {pattern:?}: {error}"))
+            })
+    }
+}
+
+/// How a family splits text, and its switches.
 pub(super) struct PreTokenizer {
-    /// The splitting passes, in order.
-    pub stages: &'static [Stage],
-    /// A word that is itself a token is emitted whole, without merging.
+    stages: Vec<Stage>,
     pub ignore_merges: bool,
-    /// The family always starts a prompt with the BOS token.
     pub add_bos: bool,
+    pub escape_spaces: bool,
+    pub no_bos: bool,
+    pub raw_bytes: bool,
     /// False when the name was not recognized and the default is used.
     pub known: bool,
 }
 
-const GPT2: &[Stage] = &[Stage::Gpt2];
-const SMOLLM: &[Stage] = &[Stage::EachNumber, Stage::Gpt2];
-const LLAMA3: &[Stage] = &[Stage::Llama3 { max_digits: 3 }];
-const QWEN2: &[Stage] = &[Stage::Llama3 { max_digits: 1 }];
-const DEFAULT: &[Stage] = &[
-    Stage::PunctuationRuns,
-    Stage::Gpt2,
-    Stage::NumberRuns,
-    Stage::ThreeDigits,
-];
-
 impl PreTokenizer {
-    /// Looks up a pre-tokenizer by its `tokenizer.ggml.pre` name.
-    pub fn for_name(name: &str) -> PreTokenizer {
-        let plain = |stages| PreTokenizer {
-            stages,
-            ignore_merges: false,
-            add_bos: false,
-            known: true,
-        };
-        match name {
-            "llama3" | "llama-v3" | "llama-bpe" | "falcon3" | "falcon-h1" | "midm-2.0"
-            | "jina-v5-nano" | "lfm2" => PreTokenizer {
-                stages: LLAMA3,
-                ignore_merges: true,
-                add_bos: true,
-                known: true,
-            },
-            "qwen2" | "deepseek-r1-qwen" | "kormo" | "f2llmv2" | "megrez" | "stablelm2"
-            | "hunyuan" => plain(QWEN2),
-            "smollm" | "starcoder" | "refact" | "command-r" | "codeshell" | "exaone"
-            | "minerva-7b" => plain(SMOLLM),
-            "gpt-2" | "phi-2" | "jina-es" | "jina-de" | "gigachat" | "jina-v2-es"
-            | "jina-v2-de" | "a.x-4.0" | "mellum" | "mpt" | "olmo" | "jais" | "trillion"
-            | "exaone4" => plain(GPT2),
-            "default" => plain(DEFAULT),
-            _ => PreTokenizer {
-                stages: DEFAULT,
-                ignore_merges: false,
-                add_bos: false,
-                known: false,
-            },
-        }
+    /// Looks up a family by its `tokenizer.ggml.pre` name. An empty or
+    /// unknown name gets the default expressions, as in llama.cpp.
+    pub fn for_name(name: &str) -> Result<PreTokenizer> {
+        let family = FAMILIES.iter().find(|family| family.names.contains(&name));
+        let patterns = family.map_or(DEFAULT_PATTERNS, |family| family.patterns);
+        Ok(PreTokenizer {
+            stages: patterns
+                .iter()
+                .map(|pattern| Stage::new(pattern))
+                .collect::<Result<_>>()?,
+            ignore_merges: family.is_some_and(|family| family.ignore_merges),
+            add_bos: family.is_some_and(|family| family.add_bos),
+            escape_spaces: family.is_some_and(|family| family.escape_spaces),
+            no_bos: family.is_some_and(|family| family.no_bos),
+            raw_bytes: family.is_some_and(|family| family.raw_bytes),
+            known: family.is_some() || name == "default",
+        })
+    }
+
+    /// Splits `text` into words. Returns the byte offset where each word
+    /// ends, in order. The words cover the text exactly.
+    pub fn split(&self, text: &str) -> Vec<usize> {
+        split_with(&self.stages, text)
     }
 }
 
-/// Splits `text` into words. Returns the byte offset where each word ends,
-/// in order. The words cover the text exactly.
-pub(super) fn split(stages: &[Stage], text: &str) -> Vec<usize> {
+/// Splits `text` with the given stages. See [`PreTokenizer::split`].
+fn split_with(stages: &[Stage], text: &str) -> Vec<usize> {
     let chars: Vec<char> = text.chars().collect();
     if chars.is_empty() {
         return Vec::new();
@@ -102,18 +153,26 @@ pub(super) fn split(stages: &[Stage], text: &str) -> Vec<usize> {
         let mut refined = Vec::with_capacity(ends.len() * 2);
         let mut start = 0;
         for &end in &ends {
-            let mut words = Words {
-                ends: &mut refined,
-                base: start,
-            };
             let piece = &chars[start..end];
-            match *stage {
-                Stage::PunctuationRuns => split_runs(piece, &mut words, is_punctuation_or_symbol),
-                Stage::EachNumber => split_each(piece, &mut words, is_number),
-                Stage::NumberRuns => split_runs(piece, &mut words, is_number),
-                Stage::ThreeDigits => split_three_digits(piece, &mut words),
-                Stage::Gpt2 => split_gpt2(piece, &mut words),
-                Stage::Llama3 { max_digits } => split_llama3(piece, &mut words, max_digits),
+            match stage {
+                Stage::Regex(regex) => regex.split(piece, start, &mut refined),
+                Stage::Scan(scan) => {
+                    let mut words = Words {
+                        ends: &mut refined,
+                        base: start,
+                    };
+                    match *scan {
+                        Scan::PunctuationRuns => {
+                            split_runs(piece, &mut words, is_punctuation_or_symbol)
+                        }
+                        Scan::EachNumber => split_each(piece, &mut words, is_number),
+                        Scan::NumberRuns => split_runs(piece, &mut words, is_number),
+                        Scan::ThreeDigits => split_three_digits(piece, &mut words),
+                        Scan::Newlines => split_runs(piece, &mut words, |c| c == '\n'),
+                        Scan::Gpt2 => split_gpt2(piece, &mut words),
+                        Scan::Llama3 { max_digits } => split_llama3(piece, &mut words, max_digits),
+                    }
+                }
             }
             start = end;
         }
@@ -336,11 +395,35 @@ fn split_llama3(piece: &[char], words: &mut Words<'_>, max_digits: usize) {
 mod tests {
     use super::*;
 
+    /// The stages for a list of expressions.
+    fn stages(patterns: &[&str]) -> Vec<Stage> {
+        patterns
+            .iter()
+            .map(|pattern| Stage::new(pattern).unwrap())
+            .collect()
+    }
+
+    /// The same, always through the regex engine.
+    fn compiled(patterns: &[&str]) -> Vec<Stage> {
+        patterns
+            .iter()
+            .map(|pattern| Stage::Regex(Box::new(Regex::new(pattern).unwrap())))
+            .collect()
+    }
+
+    fn family(name: &str) -> &'static [&'static str] {
+        FAMILIES
+            .iter()
+            .find(|family| family.names.contains(&name))
+            .unwrap()
+            .patterns
+    }
+
     /// Splits `text` and returns the words as strings.
     fn words(stages: &[Stage], text: &str) -> Vec<String> {
         let mut out = Vec::new();
         let mut start = 0;
-        for end in split(stages, text) {
+        for end in split_with(stages, text) {
             out.push(text[start..end].to_string());
             start = end;
         }
@@ -350,69 +433,149 @@ mod tests {
 
     #[test]
     fn gpt2_keeps_one_leading_space_with_each_word() {
-        assert_eq!(words(GPT2, "Hello world"), ["Hello", " world"]);
-        assert_eq!(words(GPT2, "a  b"), ["a", " ", " b"]);
-        assert_eq!(words(GPT2, "end   "), ["end", "   "]);
-        assert_eq!(words(GPT2, " x"), [" x"]);
-        assert_eq!(words(GPT2, "it's 42!"), ["it", "'s", " 42", "!"]);
+        let gpt2 = stages(family("gpt-2"));
+        assert_eq!(words(&gpt2, "Hello world"), ["Hello", " world"]);
+        assert_eq!(words(&gpt2, "a  b"), ["a", " ", " b"]);
+        assert_eq!(words(&gpt2, "end   "), ["end", "   "]);
+        assert_eq!(words(&gpt2, " x"), [" x"]);
+        assert_eq!(words(&gpt2, "it's 42!"), ["it", "'s", " 42", "!"]);
         assert_eq!(
-            words(GPT2, "we'll they've I'm"),
+            words(&gpt2, "we'll they've I'm"),
             ["we", "'ll", " they", "'ve", " I", "'m"]
         );
-        assert_eq!(words(GPT2, "It'S"), ["It", "'", "S"]);
-        assert_eq!(words(GPT2, "a\nb"), ["a", "\n", "b"]);
-        assert_eq!(words(GPT2, "x \n y"), ["x", " \n", " y"]);
-        assert_eq!(words(GPT2, "héllo wörld"), ["héllo", " wörld"]);
-        assert_eq!(words(GPT2, "1+1=2"), ["1", "+", "1", "=", "2"]);
-        assert_eq!(words(GPT2, "'"), ["'"]);
-        assert!(words(GPT2, "").is_empty());
+        assert_eq!(words(&gpt2, "It'S"), ["It", "'", "S"]);
+        assert_eq!(words(&gpt2, "a\nb"), ["a", "\n", "b"]);
+        assert_eq!(words(&gpt2, "x \n y"), ["x", " \n", " y"]);
+        assert_eq!(words(&gpt2, "héllo wörld"), ["héllo", " wörld"]);
+        assert_eq!(words(&gpt2, "1+1=2"), ["1", "+", "1", "=", "2"]);
+        assert_eq!(words(&gpt2, "'"), ["'"]);
+        assert!(words(&gpt2, "").is_empty());
     }
 
     #[test]
     fn llama3_groups_digits_and_attaches_newlines() {
-        assert_eq!(words(LLAMA3, "Hello world"), ["Hello", " world"]);
-        assert_eq!(words(LLAMA3, "12345"), ["123", "45"]);
-        assert_eq!(words(LLAMA3, "a 1234567"), ["a", " ", "123", "456", "7"]);
-        assert_eq!(words(LLAMA3, "It'S we'LL"), ["It", "'S", " we", "'LL"]);
-        assert_eq!(words(LLAMA3, "x!!\n\ny"), ["x", "!!\n\n", "y"]);
-        assert_eq!(words(LLAMA3, "a \n\n b"), ["a", " \n\n", " b"]);
-        assert_eq!(words(LLAMA3, "a   b"), ["a", "  ", " b"]);
-        assert_eq!(words(LLAMA3, "\tfoo"), ["\tfoo"]);
-        assert_eq!(words(LLAMA3, "(foo)"), ["(foo", ")"]);
-        assert_eq!(words(LLAMA3, "a ."), ["a", " ."]);
-        assert_eq!(words(LLAMA3, "tail "), ["tail", " "]);
-        assert_eq!(words(LLAMA3, "\n\nx"), ["\n\n", "x"]);
-        assert_eq!(words(LLAMA3, "\r\n"), ["\r\n"]);
+        let llama3 = stages(family("llama-bpe"));
+        assert_eq!(words(&llama3, "Hello world"), ["Hello", " world"]);
+        assert_eq!(words(&llama3, "12345"), ["123", "45"]);
+        assert_eq!(words(&llama3, "a 1234567"), ["a", " ", "123", "456", "7"]);
+        assert_eq!(words(&llama3, "It'S we'LL"), ["It", "'S", " we", "'LL"]);
+        assert_eq!(words(&llama3, "x!!\n\ny"), ["x", "!!\n\n", "y"]);
+        assert_eq!(words(&llama3, "a \n\n b"), ["a", " \n\n", " b"]);
+        assert_eq!(words(&llama3, "a   b"), ["a", "  ", " b"]);
+        assert_eq!(words(&llama3, "\tfoo"), ["\tfoo"]);
+        assert_eq!(words(&llama3, "(foo)"), ["(foo", ")"]);
+        assert_eq!(words(&llama3, "a ."), ["a", " ."]);
+        assert_eq!(words(&llama3, "tail "), ["tail", " "]);
+        assert_eq!(words(&llama3, "\n\nx"), ["\n\n", "x"]);
+        assert_eq!(words(&llama3, "\r\n"), ["\r\n"]);
     }
 
     #[test]
     fn qwen2_splits_every_digit() {
-        assert_eq!(words(QWEN2, "x 2024"), ["x", " ", "2", "0", "2", "4"]);
-        assert_eq!(words(QWEN2, "Hello, world!"), ["Hello", ",", " world", "!"]);
+        let qwen2 = stages(family("qwen2"));
+        assert_eq!(words(&qwen2, "x 2024"), ["x", " ", "2", "0", "2", "4"]);
+        assert_eq!(
+            words(&qwen2, "Hello, world!"),
+            ["Hello", ",", " world", "!"]
+        );
     }
 
     #[test]
     fn smollm_isolates_digits_before_the_gpt2_pass() {
-        assert_eq!(words(SMOLLM, "abc 123"), ["abc", " ", "1", "2", "3"]);
-        assert_eq!(words(SMOLLM, "v2 ok"), ["v", "2", " ok"]);
+        let smollm = stages(family("smollm"));
+        assert_eq!(words(&smollm, "abc 123"), ["abc", " ", "1", "2", "3"]);
+        assert_eq!(words(&smollm, "v2 ok"), ["v", "2", " ok"]);
     }
 
     #[test]
     fn default_separates_punctuation_runs_and_digit_triples() {
-        assert_eq!(words(DEFAULT, "Hi, there..."), ["Hi", ",", " there", "..."]);
-        assert_eq!(words(DEFAULT, "a 12345"), ["a", " ", "123", "45"]);
-        assert_eq!(words(DEFAULT, "x<=y"), ["x", "<=", "y"]);
+        let default = stages(DEFAULT_PATTERNS);
+        assert_eq!(
+            words(&default, "Hi, there..."),
+            ["Hi", ",", " there", "..."]
+        );
+        assert_eq!(words(&default, "a 12345"), ["a", " ", "123", "45"]);
+        assert_eq!(words(&default, "x<=y"), ["x", "<=", "y"]);
+    }
+
+    #[test]
+    fn other_families_split_by_their_own_rules() {
+        // DeepSeek V3 isolates groups of three digits first.
+        let deepseek = stages(family("deepseek-v3"));
+        assert_eq!(words(&deepseek, "abc1234"), ["abc", "123", "4"]);
+        // Gemma 4 only splits lines.
+        let gemma = stages(family("gemma4"));
+        assert_eq!(words(&gemma, "a b\n\nc"), ["a b", "\n\n", "c"]);
+        // SuperBPE splits digit runs into threes from the right.
+        let superbpe = stages(family("superbpe"));
+        assert_eq!(words(&superbpe, "x1234567"), ["x", "1", "234", "567"]);
+        // Kimi K2 keeps Han characters apart from other letters.
+        let kimi = stages(family("kimi-k2"));
+        assert_eq!(words(&kimi, "abc中文def"), ["abc", "中文", "def"]);
     }
 
     #[test]
     fn names_map_to_families() {
-        assert_eq!(PreTokenizer::for_name("llama-bpe").stages, LLAMA3);
-        assert!(PreTokenizer::for_name("llama-bpe").ignore_merges);
-        assert_eq!(PreTokenizer::for_name("qwen2").stages, QWEN2);
-        assert_eq!(PreTokenizer::for_name("smollm").stages, SMOLLM);
-        assert_eq!(PreTokenizer::for_name("gpt-2").stages, GPT2);
-        assert!(PreTokenizer::for_name("default").known);
-        assert!(!PreTokenizer::for_name("something-new").known);
+        let llama = PreTokenizer::for_name("llama-bpe").unwrap();
+        assert!(llama.ignore_merges && llama.add_bos && llama.known);
+        let gemma = PreTokenizer::for_name("gemma4").unwrap();
+        assert!(gemma.escape_spaces && gemma.raw_bytes);
+        assert!(PreTokenizer::for_name("chatglm-bpe").unwrap().no_bos);
+        assert!(PreTokenizer::for_name("default").unwrap().known);
+        assert!(!PreTokenizer::for_name("something-new").unwrap().known);
+    }
+
+    #[test]
+    fn every_family_compiles() {
+        for family in &FAMILIES {
+            for pattern in family.patterns {
+                if let Err(error) = Stage::new(pattern) {
+                    panic!("{:?}: {error}", family.names);
+                }
+            }
+        }
+    }
+
+    /// Short texts built from the characters the expressions treat
+    /// specially, in a fixed pseudo-random order so failures repeat.
+    fn tricky_texts() -> Vec<String> {
+        let alphabet = [
+            "a", "Z", "é", "ß", "中", "あ", "ア", "한", "я", "ह", "\u{301}", "1", "٣", "²", "Ⅷ",
+            " ", "  ", "\n", "\r", "\t", "\u{a0}", "\u{3000}", "'", "'s", "'S", "'ll", "'ve", ".",
+            ",", "!", "?", "$", "+", "<", "=", "^", "|", "`", "-", "_", "(", "）", "。", "…", "«",
+            "😀", "\u{200c}",
+        ];
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        (0..3000)
+            .map(|_| {
+                let length = 1 + (next() % 12) as usize;
+                (0..length)
+                    .map(|_| alphabet[(next() % alphabet.len() as u64) as usize])
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_scanner_splits_like_its_expression() {
+        let texts = tricky_texts();
+        for (pattern, scan) in SCANNED {
+            let fast = vec![Stage::Scan(scan)];
+            let slow = compiled(&[pattern]);
+            for text in &texts {
+                assert_eq!(
+                    words(&fast, text),
+                    words(&slow, text),
+                    "{scan:?} on {text:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -424,9 +587,14 @@ mod tests {
             "    \n    \n",
             "a\u{a0}b\u{3000}c\u{2028}d",
         ];
-        for stages in [GPT2, SMOLLM, LLAMA3, QWEN2, DEFAULT] {
+        let families = FAMILIES
+            .iter()
+            .map(|family| family.patterns)
+            .chain([DEFAULT_PATTERNS]);
+        for patterns in families {
+            let stages = stages(patterns);
             for text in samples {
-                let ends = split(stages, text);
+                let ends = split_with(&stages, text);
                 assert_eq!(ends.last().copied(), Some(text.len()));
                 assert!(ends.windows(2).all(|pair| pair[0] < pair[1]));
                 assert!(ends.iter().all(|&end| text.is_char_boundary(end)));
