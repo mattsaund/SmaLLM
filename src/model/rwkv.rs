@@ -31,7 +31,9 @@
 //! The formulas follow llama.cpp's graphs and its `rwkv_wkv6` and
 //! `rwkv_wkv7` operations. The projections go through the parallel matrix
 //! engine, batched over a prompt's tokens. The state update runs head by
-//! head on the thread pool, one token after another.
+//! head on the thread pool, one token after another. The steps in between
+//! treat each token on its own, so a prompt's tokens share them out over
+//! the pool as well.
 
 use std::ops::Range;
 use std::slice;
@@ -149,22 +151,31 @@ impl Pass<'_> {
             .attn_norm_bias
             .as_deref()
             .expect("RWKV blocks are bound with layer norms");
-        layer_norm_rows(
+        let state = self.recurrent.block(run.index);
+        norm_and_shift(
+            self.engine.pool,
             &x[..rows],
-            &layer.attn_norm,
-            bias,
+            (&layer.attn_norm, bias),
             eps,
             &mut s.normed[..rows],
+            &mut state[..d],
+            &mut s.shift[..rows],
         );
-        let state = self.recurrent.block(run.index);
-        token_shift(&s.normed[..rows], &mut state[..d], &mut s.shift[..rows]);
         self.lap(Phase::Norm);
 
         match &time_mix.version {
             TimeMixVersion::V6(parts) => self.time_mix6(run, time_mix, parts, h, s),
             TimeMixVersion::V7(parts) => self.time_mix7(run, time_mix, parts, h, s),
         }
-        add(&mut x[..rows], &h[..rows]);
+        let update = &h[..rows];
+        per_token(
+            self.engine.pool,
+            count,
+            [(&mut x[..rows], d)],
+            &|token, [x]| {
+                add(x, &update[token * d..(token + 1) * d]);
+            },
+        );
         self.channel_mix(run, layer, x, h, s, ffn);
 
         // RWKV-6 halves the hidden state every few blocks.
@@ -201,10 +212,16 @@ impl Pass<'_> {
 
         // The six inputs: receptance, decay, key, value, learning rate and
         // gate, each moved toward the previous token by its own amounts.
+        let pool = self.engine.pool;
         let parts = &mut parts[..6 * rows];
-        for (part, lerp) in parts.chunks_exact_mut(rows).zip(w.lerp.chunks_exact(d)) {
-            lerp_rows(part, normed, shift, lerp);
-        }
+        let mut each_part = parts.chunks_exact_mut(rows);
+        let part_rows: [_; 6] = std::array::from_fn(|_| (each_part.next().unwrap(), d));
+        per_token(pool, count, part_rows, &|token, rows| {
+            let span = token * d..(token + 1) * d;
+            for (row, lerp) in rows.into_iter().zip(w.lerp.chunks_exact(d)) {
+                lerp_row(row, &normed[span.clone()], &shift[span.clone()], lerp);
+            }
+        });
 
         // Every map in one multiply, each reading its own input.
         let value_rank = w.value_mix.as_ref().map_or(0, |(_, v1, _)| v1.rows);
@@ -251,16 +268,18 @@ impl Pass<'_> {
         // Row by row, so that each loop runs over slices of one length and
         // vectorizes.
         let head_size = config.rwkv.map_or(d, |rwkv| rwkv.head_size);
-        let tokens = decay
-            .chunks_exact_mut(d)
-            .zip(rate.chunks_exact_mut(d))
-            .zip(
-                v.chunks_exact_mut(d)
-                    .zip(first_value[..rows].chunks_exact_mut(d)),
-            )
-            .zip(k.chunks_exact_mut(d).zip(kk.chunks_exact_mut(d)))
-            .zip(value_mix.chunks_exact(d));
-        for ((((decay, rate), (value, first)), (key, kk)), mix) in tokens {
+        let value_mix = &*value_mix;
+        let buffers = [
+            (&mut *decay, d),
+            (&mut *rate, d),
+            (&mut *v, d),
+            (&mut first_value[..rows], d),
+            (&mut *k, d),
+            (&mut *kk, d),
+        ];
+        per_token(pool, count, buffers, &|token, rows| {
+            let [decay, rate, value, first, key, kk] = rows;
+            let mix = &value_mix[token * d..(token + 1) * d];
             for (decay, base) in decay.iter_mut().zip(&w.w0) {
                 *decay = exp_approx(-DECAY_SCALE * sigmoid(base + *decay));
             }
@@ -291,7 +310,7 @@ impl Pass<'_> {
                 *key *= 1.0 + (*rate - 1.0) * scale;
                 *rate *= kk;
             }
-        }
+        });
         self.lap(Phase::Rotate);
 
         let state = &mut self.recurrent.block(run.index)[2 * d..];
@@ -309,28 +328,29 @@ impl Pass<'_> {
         // Each head's output: normalized, plus a bonus for the current
         // token's value, then gated.
         let (norm_weight, norm_bias) = &time_mix.head_norm;
-        for (((y, r), (k, v)), gate) in normed
-            .chunks_exact_mut(d)
-            .zip(r.chunks_exact(d))
-            .zip(k.chunks_exact(d).zip(v.chunks_exact(d)))
-            .zip(gate.chunks_exact(d))
-        {
+        let (r, k, v, gate) = (&*r, &*k, &*v, &*gate);
+        per_token(pool, count, [(&mut *normed, d)], &|token, [y]| {
+            let span = token * d..(token + 1) * d;
             head_norm(y, head_size, norm_weight, norm_bias);
             let heads = y
                 .chunks_exact_mut(head_size)
-                .zip(r.chunks_exact(head_size))
-                .zip(k.chunks_exact(head_size).zip(v.chunks_exact(head_size)))
-                .zip(w.r_k.chunks_exact(head_size));
-            for (((y, r), (k, v)), r_k) in heads {
+                .zip(r[span.clone()].chunks_exact(head_size))
+                .zip(k[span.clone()].chunks_exact(head_size))
+                .zip(
+                    v[span.clone()]
+                        .chunks_exact(head_size)
+                        .zip(w.r_k.chunks_exact(head_size)),
+                );
+            for (((y, r), k), (v, r_k)) in heads {
                 let bonus: f32 = r.iter().zip(k).zip(r_k).map(|((r, k), s)| r * k * s).sum();
                 for (y, v) in y.iter_mut().zip(v) {
                     *y += bonus * v;
                 }
             }
-            for (y, gate) in y.iter_mut().zip(gate) {
+            for (y, gate) in y.iter_mut().zip(&gate[span]) {
                 *y *= gate;
             }
-        }
+        });
         self.multiply(
             normed,
             d,
@@ -365,9 +385,13 @@ impl Pass<'_> {
 
         // How far each input moves depends on the token: a low-rank map of
         // one shifted input gives five corrections to the learned amounts.
+        let pool = self.engine.pool;
         let wide = w.mix_down.rows;
         let rank = wide / 5;
-        lerp_rows(&mut parts[..rows], normed, shift, &w.lerp_x);
+        per_token(pool, count, [(&mut parts[..rows], d)], &|token, [row]| {
+            let span = token * d..(token + 1) * d;
+            lerp_row(row, &normed[span.clone()], &shift[span], &w.lerp_x);
+        });
         let (by_token, rest) = low.split_at_mut(count * wide);
         let (by_part, rest) = rest.split_at_mut(count * wide);
         let decay_low = &mut rest[..count * w.decay_down.rows];
@@ -397,17 +421,18 @@ impl Pass<'_> {
         self.multiply(by_part, rank, &mut targets);
         drop(targets);
         // The five inputs: decay, key, value, receptance and gate.
-        for (part, lerp) in parts.chunks_exact_mut(rows).zip(w.lerp.chunks_exact(d)) {
-            let tokens = part
-                .chunks_exact_mut(d)
-                .zip(normed.chunks_exact(d).zip(shift.chunks_exact(d)));
-            for (out, (normed, shift)) in tokens {
+        let mut each_part = parts.chunks_exact_mut(rows);
+        let part_rows: [_; 5] = std::array::from_fn(|_| (each_part.next().unwrap(), d));
+        per_token(pool, count, part_rows, &|token, rows| {
+            let span = token * d..(token + 1) * d;
+            let (normed, shift) = (&normed[span.clone()], &shift[span]);
+            for (out, lerp) in rows.into_iter().zip(w.lerp.chunks_exact(d)) {
                 let channels = out.iter_mut().zip(normed.iter().zip(shift)).zip(lerp);
                 for ((out, (normed, shift)), lerp) in channels {
                     *out = normed + shift * (lerp + *out);
                 }
             }
-        }
+        });
 
         let (r, rest) = rkv.split_at_mut(rows);
         let (k, rest) = rest.split_at_mut(rows);
@@ -431,12 +456,13 @@ impl Pass<'_> {
         );
         self.lap(Phase::Project);
 
-        for row in decay.chunks_exact_mut(d) {
-            for (decay, base) in row.iter_mut().zip(&w.decay) {
+        let buffers = [(&mut *decay, d), (&mut *gate, d)];
+        per_token(pool, count, buffers, &|_, [decay, gate]| {
+            for (decay, base) in decay.iter_mut().zip(&w.decay) {
                 *decay = exp_approx(-exp_approx(base + *decay));
             }
-        }
-        gate.iter_mut().for_each(|value| *value *= sigmoid(*value));
+            gate.iter_mut().for_each(|value| *value *= sigmoid(*value));
+        });
         self.lap(Phase::Rotate);
 
         let head_size = config.rwkv.map_or(d, |rwkv| rwkv.head_size);
@@ -452,12 +478,13 @@ impl Pass<'_> {
         self.lap(Phase::Attention);
 
         let (norm_weight, norm_bias) = &time_mix.head_norm;
-        for (y, gate) in normed.chunks_exact_mut(d).zip(gate.chunks_exact(d)) {
+        let gate = &*gate;
+        per_token(pool, count, [(&mut *normed, d)], &|token, [y]| {
             head_norm(y, head_size, norm_weight, norm_bias);
-            for (y, gate) in y.iter_mut().zip(gate) {
+            for (y, gate) in y.iter_mut().zip(&gate[token * d..(token + 1) * d]) {
                 *y *= gate;
             }
-        }
+        });
         self.multiply(
             normed,
             d,
@@ -486,9 +513,16 @@ impl Pass<'_> {
         let rows = count * d;
         let normed = &mut s.normed[..rows];
         let shift = &mut s.shift[..rows];
-        layer_norm_rows(&x[..rows], &layer.ffn_norm, &mix.norm_bias, eps, normed);
         let state = self.recurrent.block(run.index);
-        token_shift(normed, &mut state[d..2 * d], shift);
+        norm_and_shift(
+            self.engine.pool,
+            &x[..rows],
+            (&layer.ffn_norm, &mix.norm_bias),
+            eps,
+            normed,
+            &mut state[d..2 * d],
+            shift,
+        );
         self.lap(Phase::Norm);
 
         let active = run.active.start * d..run.active.end * d;
@@ -496,26 +530,31 @@ impl Pass<'_> {
         if n_active == 0 {
             return;
         }
+        // The inputs of the key and, in RWKV-6, of the receptance, for the
+        // active rows only.
+        let pool = self.engine.pool;
         let n_ff = mix.key.rows;
         let inputs = &mut s.parts[..2 * n_active * d];
         let (key_input, receptance_input) = inputs.split_at_mut(n_active * d);
-        lerp_rows(
-            key_input,
-            &normed[active.clone()],
-            &shift[active.clone()],
-            &mix.lerp_k,
-        );
+        let (normed, shift) = (&normed[active.clone()], &shift[active.clone()]);
+        let buffers = [(key_input, d), (receptance_input, d)];
+        per_token(pool, n_active, buffers, &|token, [key, receptance]| {
+            let span = token * d..(token + 1) * d;
+            let (normed, shift) = (&normed[span.clone()], &shift[span]);
+            lerp_row(key, normed, shift, &mix.lerp_k);
+            if let Some((lerp_r, _)) = &mix.receptance {
+                lerp_row(receptance, normed, shift, lerp_r);
+            }
+        });
         let keys = &mut ffn[..n_active * n_ff];
         let receptance = &mut s.rkv[..n_active * d];
         match &mix.receptance {
-            None => self.multiply(key_input, d, &mut [Target::new(&mix.key, &mut *keys)]),
-            Some((lerp_r, linear)) => {
-                lerp_rows(
-                    receptance_input,
-                    &normed[active.clone()],
-                    &shift[active.clone()],
-                    lerp_r,
-                );
+            None => self.multiply(
+                &inputs[..n_active * d],
+                d,
+                &mut [Target::new(&mix.key, &mut *keys)],
+            ),
+            Some((_, linear)) => {
                 let mut targets = [
                     target(&mix.key, &mut *keys, Some(0..n_active)),
                     target(linear, &mut *receptance, Some(n_active..2 * n_active)),
@@ -524,21 +563,113 @@ impl Pass<'_> {
             }
         }
         self.lap(Phase::FeedForwardUp);
-        keys.iter_mut().for_each(|value| {
-            let positive = value.max(0.0);
-            *value = positive * positive;
+        per_token(pool, n_active, [(&mut *keys, n_ff)], &|_, [keys]| {
+            for value in keys {
+                let positive = value.max(0.0);
+                *value = positive * positive;
+            }
         });
         self.lap(Phase::Activation);
         let out = &mut h[..n_active * d];
         self.multiply(keys, n_ff, &mut [Target::new(&mix.value, &mut *out)]);
-        if mix.receptance.is_some() {
-            for (out, gate) in out.iter_mut().zip(receptance.iter()) {
-                *out *= sigmoid(*gate);
+        let receptance = &*receptance;
+        let buffers = [(&mut x[active], d), (out, d)];
+        per_token(pool, n_active, buffers, &|token, [x, out]| {
+            if mix.receptance.is_some() {
+                let gates = &receptance[token * d..(token + 1) * d];
+                for (out, gate) in out.iter_mut().zip(gates) {
+                    *out *= sigmoid(*gate);
+                }
             }
-        }
-        add(&mut x[active], out);
+            add(x, out);
+        });
         self.lap(Phase::FeedForwardDown);
     }
+}
+
+/// Batches of fewer tokens than this run their per-token steps on the
+/// calling thread.
+const PARALLEL_TOKENS: usize = 4;
+
+/// A buffer with one row per token, shared by the threads of a loop over
+/// tokens.
+#[derive(Clone, Copy)]
+struct TokenRows {
+    data: *mut f32,
+    width: usize,
+}
+
+// SAFETY: a loop over tokens hands each token to one thread, and a token
+// reaches only its own row, which no other token's row overlaps.
+unsafe impl Sync for TokenRows {}
+unsafe impl Send for TokenRows {}
+
+/// Calls `body` with each token's row of every buffer, on the thread pool
+/// when the batch has several tokens. The buffers hold one row per token,
+/// each as wide as given with it. The steps that use this treat every
+/// token on its own, so any thread may take any token, and the work that is
+/// not a matrix multiply does not hold back a prompt that every core reads.
+fn per_token<const N: usize>(
+    pool: &ThreadPool,
+    count: usize,
+    buffers: [(&mut [f32], usize); N],
+    body: &(dyn Fn(usize, [&mut [f32]; N]) + Sync),
+) {
+    let rows = buffers.map(|(buffer, width)| {
+        assert!(buffer.len() >= count * width, "a buffer holds every row");
+        TokenRows {
+            data: buffer.as_mut_ptr(),
+            width,
+        }
+    });
+    let token = |index: usize| {
+        // SAFETY: the rows lie inside their buffers, as checked above, the
+        // rows of different tokens do not overlap, and the pool runs each
+        // token on one thread.
+        let parts = rows.map(|rows| unsafe {
+            slice::from_raw_parts_mut(rows.data.add(index * rows.width), rows.width)
+        });
+        body(index, parts);
+    };
+    if count < PARALLEL_TOKENS || pool.threads() == 1 {
+        (0..count).for_each(token);
+    } else {
+        pool.run(count, &token);
+    }
+}
+
+/// Layer-normalizes every row of `x` into `normed`, then writes each row's
+/// token shift into `shift`: the previous row minus the current one. The
+/// row before the first is `last`, which holds the previous batch's last
+/// row and then takes this batch's.
+fn norm_and_shift(
+    pool: &ThreadPool,
+    x: &[f32],
+    (weight, bias): (&[f32], &[f32]),
+    eps: f32,
+    normed: &mut [f32],
+    last: &mut [f32],
+    shift: &mut [f32],
+) {
+    let d = weight.len();
+    let count = x.len() / d;
+    per_token(pool, count, [(&mut *normed, d)], &|token, [row]| {
+        row.copy_from_slice(&x[token * d..(token + 1) * d]);
+        layer_norm(row, weight, bias, eps);
+    });
+    let normed = &*normed;
+    let previous_batch = &*last;
+    per_token(pool, count, [(shift, d)], &|token, [shift]| {
+        let previous = match token {
+            0 => previous_batch,
+            _ => &normed[(token - 1) * d..token * d],
+        };
+        let current = &normed[token * d..(token + 1) * d];
+        for ((shift, previous), current) in shift.iter_mut().zip(previous).zip(current) {
+            *shift = previous - current;
+        }
+    });
+    last.copy_from_slice(&normed[(count - 1) * d..]);
 }
 
 /// A target that reads the input vectors `inputs` of a multiply.
@@ -563,64 +694,39 @@ fn add(x: &mut [f32], update: &[f32]) {
     }
 }
 
-/// Moves each row of `normed` toward the previous row by the amounts in
-/// `lerp`, one per channel: `normed + shift * lerp`, where `shift` holds
-/// the previous row minus the current one.
-fn lerp_rows(out: &mut [f32], normed: &[f32], shift: &[f32], lerp: &[f32]) {
-    let d = lerp.len();
-    let rows = out
-        .chunks_exact_mut(d)
-        .zip(normed.chunks_exact(d).zip(shift.chunks_exact(d)));
-    for (out, (normed, shift)) in rows {
-        for ((out, (normed, shift)), lerp) in out.iter_mut().zip(normed.iter().zip(shift)).zip(lerp)
-        {
-            *out = normed + shift * lerp;
-        }
+/// Moves one token's row of `normed` toward the previous token's by the
+/// amounts in `lerp`, one per channel: `normed + shift * lerp`, where
+/// `shift` holds the previous token's row minus this one.
+fn lerp_row(out: &mut [f32], normed: &[f32], shift: &[f32], lerp: &[f32]) {
+    for ((out, (normed, shift)), lerp) in out.iter_mut().zip(normed.iter().zip(shift)).zip(lerp) {
+        *out = normed + shift * lerp;
     }
 }
 
-/// Token shift: writes the previous row minus the current one for every row
-/// of `normed` into `shift`. The row before the first is `last`, which
-/// holds the previous batch's last row and then takes this batch's.
-fn token_shift(normed: &[f32], last: &mut [f32], shift: &mut [f32]) {
-    let d = last.len();
-    for (index, (shift, current)) in shift
-        .chunks_exact_mut(d)
-        .zip(normed.chunks_exact(d))
-        .enumerate()
-    {
-        let previous = match index {
-            0 => &*last,
-            _ => &normed[(index - 1) * d..index * d],
-        };
-        for ((shift, previous), current) in shift.iter_mut().zip(previous).zip(current) {
-            *shift = previous - current;
-        }
-    }
-    if let Some(row) = normed.len().checked_sub(d) {
-        last.copy_from_slice(&normed[row..]);
-    }
-}
-
-/// Sums `values` in eight lanes, which the compiler turns into vector
-/// instructions.
-fn lane_sum(values: impl Iterator<Item = f32>) -> f32 {
+/// Sums `f` of every element of `x` in eight lanes, which the compiler
+/// turns into vector instructions.
+#[inline(always)]
+fn lane_sum(x: &[f32], f: impl Fn(f32) -> f32) -> f32 {
     let mut lanes = [0.0f32; 8];
-    for (index, value) in values.enumerate() {
-        lanes[index % 8] += value;
+    let mut chunks = x.chunks_exact(8);
+    for chunk in &mut chunks {
+        for lane in 0..8 {
+            lanes[lane] += f(chunk[lane]);
+        }
     }
-    lanes.iter().sum()
+    let tail: f32 = chunks.remainder().iter().map(|&value| f(value)).sum();
+    lanes.iter().sum::<f32>() + tail
 }
 
 /// The sum of the squares of `x`.
 fn sum_of_squares(x: &[f32]) -> f32 {
-    lane_sum(x.iter().map(|value| value * value))
+    lane_sum(x, |value| value * value)
 }
 
 /// Normalizes `x` to zero mean and unit variance, in place.
 fn standardize(x: &mut [f32], eps: f32) {
     let n = x.len() as f32;
-    let mean = lane_sum(x.iter().copied()) / n;
+    let mean = lane_sum(x, |value| value) / n;
     x.iter_mut().for_each(|value| *value -= mean);
     let scale = 1.0 / (sum_of_squares(x) / n + eps).sqrt();
     x.iter_mut().for_each(|value| *value *= scale);
@@ -632,14 +738,6 @@ pub(super) fn layer_norm(x: &mut [f32], weight: &[f32], bias: &[f32], eps: f32) 
     standardize(x, eps);
     for ((value, weight), bias) in x.iter_mut().zip(weight).zip(bias) {
         *value = *value * weight + bias;
-    }
-}
-
-/// [`layer_norm`] of every row of `x` into `out`.
-fn layer_norm_rows(x: &[f32], weight: &[f32], bias: &[f32], eps: f32, out: &mut [f32]) {
-    out.copy_from_slice(x);
-    for row in out.chunks_exact_mut(weight.len()) {
-        layer_norm(row, weight, bias, eps);
     }
 }
 
@@ -836,12 +934,18 @@ mod tests {
 
     #[test]
     fn token_shift_carries_the_last_row_over() {
-        let normed = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        // Four tokens of two channels, enough to run on the pool. Each row
+        // normalizes to plus or minus one.
+        let pool = ThreadPool::new(3);
+        let x = [1.0, 2.0, 2.0, 1.0, 5.0, 9.0, 0.0, 4.0];
+        let mut normed = [0.0; 8];
         let mut last = [10.0, 20.0];
-        let mut shift = [0.0; 6];
-        token_shift(&normed, &mut last, &mut shift);
-        assert_eq!(shift, [9.0, 18.0, -2.0, -2.0, -2.0, -2.0]);
-        assert_eq!(last, [5.0, 6.0]);
+        let mut shift = [0.0; 8];
+        let norm = ([1.0, 1.0].as_slice(), [0.0, 0.0].as_slice());
+        norm_and_shift(&pool, &x, norm, 0.0, &mut normed, &mut last, &mut shift);
+        assert_eq!(normed, [-1.0, 1.0, 1.0, -1.0, -1.0, 1.0, -1.0, 1.0]);
+        assert_eq!(shift, [11.0, 19.0, -2.0, 2.0, 2.0, -2.0, 0.0, 0.0]);
+        assert_eq!(last, [-1.0, 1.0]);
     }
 
     #[test]
@@ -910,6 +1014,6 @@ mod tests {
         let b: Vec<f32> = (0..19).map(|i| 1.0 + (i % 3) as f32).collect();
         let expected: f32 = a.iter().zip(&b).map(|(a, b)| a * b).sum();
         assert_eq!(dot(&a, &b), expected);
-        assert_eq!(lane_sum(a.iter().copied()), 171.0);
+        assert_eq!(lane_sum(&a, |value| value), 171.0);
     }
 }
