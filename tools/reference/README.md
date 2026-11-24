@@ -7,6 +7,7 @@ side of that comparison.
 |---|---|
 | `ref.c` | A small program on the llama.cpp library: tokens, greedy generation, raw logits and speed. |
 | `golden.sh` | Runs `ref` over a table of models and writes `tests/golden/*.golden`. |
+| `quant.c` | Quantizes test rows with ggml and expands them again, for `tests/golden/quant`. |
 
 The golden files are checked in, so running the tests needs none of this.
 Use it to add a model to the tests, to refresh the results after llama.cpp
@@ -49,6 +50,33 @@ Each golden file records, for one model:
 - The tokens llama.cpp generates after it with greedy sampling.
 
 `tests/golden.rs` replays the same inputs through SmaLLM.
+
+## Write the weight format vectors
+
+`tests/quant.rs` checks that SmaLLM expands the blocks of the IQ, TQ and
+MXFP4 formats to the same floats as ggml, bit for bit. Its vectors in
+`tests/golden/quant` come from `quant.c`, which needs only ggml's base
+library:
+
+```sh
+cc -O2 tools/reference/quant.c -o quant -Illama.cpp/ggml/include \
+    -Lllama.cpp/build/bin -lggml-base -lm
+LD_LIBRARY_PATH=llama.cpp/build/bin ./quant tests/golden/quant
+```
+
+For each format it quantizes the same pseudo-random rows with
+`ggml_quantize_chunk` and expands the blocks with the format's `to_float`.
+A file holds the element count, the blocks and ggml's floats. The rows are
+the same on every run, so the files only change when ggml does. To check
+another format, add it to `TYPES` in `quant.c` and to `FORMATS` in
+`tests/quant.rs`.
+
+The grids these formats look weights up in come from ggml's source as
+well. `tools/gen_iq_tables.py` writes them to `src/tensor/iq_tables.rs`:
+
+```sh
+python3 tools/gen_iq_tables.py llama.cpp > src/tensor/iq_tables.rs
+```
 
 ## Compare speed
 

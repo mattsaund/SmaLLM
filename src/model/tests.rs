@@ -30,7 +30,7 @@ const ARCHS: [&str; 14] = [
     "smollm3",
 ];
 
-const QUANT_TYPES: [TensorType; 11] = [
+const QUANT_TYPES: [TensorType; 22] = [
     TensorType::Q4_0,
     TensorType::Q4_1,
     TensorType::Q5_0,
@@ -42,6 +42,17 @@ const QUANT_TYPES: [TensorType; 11] = [
     TensorType::Q4K,
     TensorType::Q5K,
     TensorType::Q6K,
+    TensorType::Iq4Xs,
+    TensorType::Iq3S,
+    TensorType::Iq3Xxs,
+    TensorType::Iq2S,
+    TensorType::Iq2Xs,
+    TensorType::Iq2Xxs,
+    TensorType::Iq1M,
+    TensorType::Iq1S,
+    TensorType::Tq2_0,
+    TensorType::Tq1_0,
+    TensorType::Mxfp4,
 ];
 
 const PROMPT: [u32; 9] = [1, 5, 9, 12, 7, 30, 8, 8, 21];
