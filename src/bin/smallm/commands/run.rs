@@ -210,17 +210,22 @@ fn answer(
     if dropped > 0 {
         eprintln!("smallm: the context is full, so the {dropped} oldest messages were left out");
     }
-    // The reasoning of a thinking model is shown faint, and is not part of
-    // the reply that the conversation keeps.
+    // The reasoning of a thinking model is shown faint in a terminal and
+    // left out of a file or pipe. It is not part of the reply that the
+    // conversation keeps.
     let mut options = options.clone();
     options.reasoning = true;
+    let show_reasoning = term::stdout_is_terminal();
     let mut reply = String::new();
     let mut thinking = false;
     term::begin_generation();
     let result = generate::run_tokens_with(session, &tokens, &options, |piece| {
         if piece.reasoning {
+            if !show_reasoning {
+                return !term::interrupted();
+            }
             thinking = true;
-            return print_piece(&term::paint("2", piece.text));
+            return print_piece(&term::faint(piece.text));
         }
         // A blank line between the reasoning and the answer.
         let gap = if std::mem::take(&mut thinking) {
