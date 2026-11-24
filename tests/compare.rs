@@ -136,3 +136,51 @@ fn logits_match_the_reference() {
     show("float math in batches against one by one", &batched);
     assert!(batched.cosine > 0.99999, "batching changes the result");
 }
+
+/// Compares an encoder's pooled output with a reference file from
+/// `ref embed`:
+///
+/// ```sh
+/// ref embed model.gguf text.txt reference.bin
+/// SMALLM_COMPARE_EMBED="model.gguf text.txt reference.bin" \
+///     cargo test --release --test compare -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "needs a model and a reference file, see above"]
+fn embeddings_match_the_reference() {
+    let Ok(spec) = std::env::var("SMALLM_COMPARE_EMBED") else {
+        eprintln!("set SMALLM_COMPARE_EMBED to \"model text reference\"");
+        return;
+    };
+    let parts: Vec<&str> = spec.split_whitespace().collect();
+    let [model_path, text_path, reference_path] = parts[..] else {
+        panic!("SMALLM_COMPARE_EMBED needs three paths: model, text, reference");
+    };
+    let model = Arc::new(Model::load(model_path).expect("model loads"));
+    let text = std::fs::read_to_string(text_path).expect("text file");
+    let tokens = model.tokenizer().encode(&text, true, true);
+    let reference: Vec<f32> = std::fs::read(reference_path)
+        .expect("reference file")
+        .chunks_exact(4)
+        .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+        .collect();
+    let mut embedder = smallm::model::Embedder::new(Arc::clone(&model), 0).expect("an encoder");
+    let got = embedder.embed(&tokens).expect("embedding");
+    assert_eq!(got.len(), reference.len(), "one value per reference value");
+    let found = agreement(&got, &reference);
+    println!(
+        "{} tokens, {:?} pooling, {} values: max error {:.5}, cosine {:.7}",
+        tokens.len(),
+        embedder.pooling(),
+        got.len(),
+        found.max_error,
+        found.cosine
+    );
+    if got.len() <= 4 {
+        println!("scores: ours {got:?}, reference {reference:?}");
+    }
+    assert!(
+        found.cosine > 0.999 || got.len() <= 4,
+        "the embedding points elsewhere"
+    );
+}

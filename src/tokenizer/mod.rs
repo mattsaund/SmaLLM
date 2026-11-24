@@ -125,6 +125,8 @@ pub struct Tokenizer {
     /// The unknown token, and the separator that ends a WordPiece input.
     unk: Option<u32>,
     sep: Option<u32>,
+    /// Whether a pair of texts is joined with the separator.
+    add_sep: bool,
     /// Bytes in the longest token, which bounds the search for one.
     max_token_len: usize,
     /// How WordPiece cleans text.
@@ -295,6 +297,9 @@ impl Tokenizer {
             end_tokens: Vec::new(),
             unk,
             sep,
+            add_sep: file
+                .get_bool("tokenizer.ggml.add_sep_token")
+                .unwrap_or(kind == Kind::WordPiece),
             max_token_len: 0,
             normalizer,
             unigram: None,
@@ -523,6 +528,30 @@ impl Tokenizer {
         // WordPiece inputs always end with the separator.
         if add_special && self.kind == Kind::WordPiece {
             out.extend(self.sep);
+        }
+        out
+    }
+
+    /// The tokens of a pair of texts, such as a query and a document for a
+    /// reranker, laid out as llama.cpp's server lays them out: the start
+    /// token, the first text, the end token, the separator, the second
+    /// text and the end token, each token where the model asks for it.
+    pub fn encode_pair(&self, first: &str, second: &str) -> Vec<u32> {
+        let end = self.eos.or(self.sep);
+        let mut out = Vec::new();
+        if self.add_bos {
+            out.extend(self.bos);
+        }
+        out.extend(self.encode(first, false, false));
+        if self.add_eos {
+            out.extend(end);
+        }
+        if self.add_sep {
+            out.extend(self.sep);
+        }
+        out.extend(self.encode(second, false, false));
+        if self.add_eos {
+            out.extend(end);
         }
         out
     }

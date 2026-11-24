@@ -2,6 +2,7 @@
 
 pub mod bench;
 pub mod config;
+pub mod embed;
 pub mod info;
 pub mod pull;
 pub mod run;

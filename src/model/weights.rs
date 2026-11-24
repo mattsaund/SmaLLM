@@ -386,6 +386,26 @@ impl Weights {
     }
 }
 
+impl Weights {
+    /// The decoder weights of an encoder model, which has none: only its
+    /// token embeddings, shared with the encoder.
+    pub(super) fn for_encoder(token_embd: Matrix) -> Weights {
+        Weights {
+            token_embd,
+            output: Linear {
+                matrix: token_embd,
+                first_row: 0,
+                rows: token_embd.rows,
+                bias: None,
+            },
+            output_norm: Vec::new(),
+            rope_factors: None,
+            layers: Vec::new(),
+            per_layer_inputs: None,
+        }
+    }
+}
+
 /// Binds a gated feed-forward network: `{prefix}_gate{suffix}`,
 /// `{prefix}_up{suffix}` and `{prefix}_down{suffix}`. The gate is its own
 /// tensor, or the first half of a double-height up matrix.
@@ -492,7 +512,7 @@ fn stacked(file: &Gguf, name: &str, count: usize, rows: usize, cols: usize) -> R
 
 /// Binds the whole matrix `{name}.weight`, with `{name}.bias` when there is
 /// one.
-fn whole(file: &Gguf, name: &str, rows: usize, cols: usize) -> Result<Linear> {
+pub(super) fn whole(file: &Gguf, name: &str, rows: usize, cols: usize) -> Result<Linear> {
     Ok(Linear {
         matrix: matrix(file, &format!("{name}.weight"), rows, cols)?,
         first_row: 0,
@@ -517,7 +537,7 @@ fn supported<'a>(file: &'a Gguf, name: &str) -> Result<(&'a TensorInfo, TensorTy
 
 /// Binds the matrix `name`, which must have exactly `rows` by `cols`
 /// elements.
-fn matrix(file: &Gguf, name: &str, rows: usize, cols: usize) -> Result<Matrix> {
+pub(super) fn matrix(file: &Gguf, name: &str, rows: usize, cols: usize) -> Result<Matrix> {
     let (tensor, ty) = supported(file, name)?;
     // A single row may be stored as a vector.
     let shape_ok = match tensor.dims.len() {
@@ -546,7 +566,7 @@ fn matrix(file: &Gguf, name: &str, rows: usize, cols: usize) -> Result<Matrix> {
 
 /// Reads the vector `name` of `len` elements as f32. A tensor of any shape
 /// with that many elements will do.
-fn vector(file: &Gguf, name: &str, len: usize) -> Result<Vec<f32>> {
+pub(super) fn vector(file: &Gguf, name: &str, len: usize) -> Result<Vec<f32>> {
     let (tensor, ty) = supported(file, name)?;
     if tensor.n_elements() != len {
         return Err(Error::format(format!(
@@ -574,7 +594,7 @@ fn head_norm(
 }
 
 /// Like [`vector`], for tensors a model may leave out.
-fn optional_vector(file: &Gguf, name: &str, len: usize) -> Result<Option<Vec<f32>>> {
+pub(super) fn optional_vector(file: &Gguf, name: &str, len: usize) -> Result<Option<Vec<f32>>> {
     match file.tensor(name) {
         Some(_) => vector(file, name, len).map(Some),
         None => Ok(None),

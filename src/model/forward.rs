@@ -473,6 +473,11 @@ pub struct Session {
 impl Session {
     /// Starts an empty conversation with `model`.
     pub fn new(model: Arc<Model>, config: SessionConfig) -> Result<Session> {
+        if model.is_encoder() {
+            return Err(Error::invalid(
+                "this is an embedding or reranking model, which an Embedder runs",
+            ));
+        }
         let c = model.config();
         let n_ctx = if config.n_ctx == 0 {
             c.n_ctx_train.min(DEFAULT_CONTEXT)

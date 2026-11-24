@@ -6,11 +6,13 @@
 //! | `weights.rs` | Finds each tensor in the file and checks its shape.      |
 //! | `kv.rs`      | The key/value cache, grown in chunks.                    |
 //! | `conv.rs`    | The state of short convolution blocks, with rollback.    |
+//! | `encoder.rs` | Encoder models, for embeddings and reranking.            |
 //! | `matmul.rs`  | The parallel matrix multiply.                            |
 //! | `forward.rs` | The forward pass and the [`Session`] type.               |
 
 mod config;
 mod conv;
+mod encoder;
 mod forward;
 mod kv;
 mod matmul;
@@ -26,6 +28,7 @@ use crate::gguf::Gguf;
 use crate::tokenizer::Tokenizer;
 
 pub use config::{ARCHITECTURES, Activation, Config, Gating, LayerSpec, Mixer, Rope, Routing};
+pub use encoder::{ENCODERS, Embedder, Pooling, normalize};
 pub use forward::{Phase, Profile, Session, SessionConfig};
 pub use weights::{
     AttentionWeights, ConvWeights, Dense, ExpertMatrix, Experts, FeedForward, Layer, Linear,
@@ -41,6 +44,9 @@ pub struct Model {
     file: Gguf,
     config: Config,
     weights: Weights,
+    /// The weights of an encoder model, which [`Embedder`] runs. `None`
+    /// for the decoders that [`Session`] runs.
+    encoder: Option<encoder::Encoder>,
     tokenizer: Tokenizer,
 }
 
@@ -58,12 +64,25 @@ impl Model {
     /// Builds a model from a parsed file.
     pub fn from_gguf(file: Gguf) -> Result<Model> {
         let tokenizer = Tokenizer::from_gguf(&file)?;
+        let arch = file.get_str("general.architecture").unwrap_or("");
+        if ENCODERS.contains(&arch) {
+            let (config, encoder) = encoder::Encoder::bind(&file, arch, tokenizer.n_tokens())?;
+            let weights = Weights::for_encoder(encoder.token_embd());
+            return Ok(Model {
+                file,
+                config,
+                weights,
+                encoder: Some(encoder),
+                tokenizer,
+            });
+        }
         let mut config = Config::from_gguf(&file, tokenizer.n_tokens())?;
         let weights = Weights::bind(&file, &mut config)?;
         Ok(Model {
             file,
             config,
             weights,
+            encoder: None,
             tokenizer,
         })
     }
@@ -76,6 +95,17 @@ impl Model {
     /// The model's weights, bound to their roles.
     pub fn weights(&self) -> &Weights {
         &self.weights
+    }
+
+    /// The encoder weights of an embedding or reranking model.
+    pub fn encoder(&self) -> Option<&encoder::Encoder> {
+        self.encoder.as_ref()
+    }
+
+    /// True for embedding and reranking models, which [`Embedder`] runs
+    /// in the place of a [`Session`].
+    pub fn is_encoder(&self) -> bool {
+        self.encoder.is_some()
     }
 
     /// The model's tokenizer.

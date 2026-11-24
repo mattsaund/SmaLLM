@@ -7,6 +7,9 @@
 //   ref logits MODEL TEXTFILE OUTFILE          raw f32 logits after the prompt
 //   ref ids    MODEL IDSFILE OUTFILE           raw f32 logits after the token
 //                                              ids listed in IDSFILE
+//   ref embed  MODEL TEXTFILE OUTFILE [rank]   an encoder's pooled output as
+//                                              raw f32: an embedding, or with
+//                                              rank, a reranker's scores
 //   ref bench  MODEL N_PROMPT N_GEN THREADS    prompt and generation speed
 //   ref mem    MODEL N_CTX N_TOKENS THREADS    memory in use after loading,
 //                                              with a context, and after
@@ -141,6 +144,40 @@ int main(int argc, char ** argv) {
         double t2 = now_s();
         printf("threads %d  prompt %d tok %.2f tok/s  gen %d tok %.2f tok/s\n",
                threads, n_prompt, n_prompt / (t1 - t0), n_gen, n_gen / (t2 - t1));
+        return 0;
+    }
+
+    if (strcmp(mode, "embed") == 0) {
+        if (argc < 5) { fprintf(stderr, "embed MODEL TEXTFILE OUTFILE\n"); return 2; }
+        size_t len;
+        char * text = read_file(argv[3], &len);
+        int cap = (int) len + 16;
+        llama_token * toks = malloc(sizeof(llama_token) * cap);
+        int n = llama_tokenize(vocab, text, (int) len, toks, cap, true, true);
+        if (n < 0) { fprintf(stderr, "tokenize failed\n"); return 1; }
+        struct llama_context_params cp = llama_context_default_params();
+        cp.n_ctx = n + 8;
+        cp.n_batch = n + 8;
+        cp.n_ubatch = n + 8;
+        cp.n_threads = 4;
+        cp.n_threads_batch = 4;
+        cp.embeddings = true;
+        cp.no_perf = true;
+        /* A reranker is only ranked when asked, as llama-server's --reranking does. */
+        if (argc > 5 && strcmp(argv[5], "rank") == 0) cp.pooling_type = LLAMA_POOLING_TYPE_RANK;
+        struct llama_context * ctx = llama_init_from_model(model, cp);
+        if (!ctx) { fprintf(stderr, "cannot make context\n"); return 1; }
+        if (llama_encode(ctx, llama_batch_get_one(toks, n))) { fprintf(stderr, "encode failed\n"); return 1; }
+        const float * embedding = llama_get_embeddings_seq(ctx, 0);
+        if (!embedding) { fprintf(stderr, "no pooled output\n"); return 1; }
+        int width = llama_pooling_type(ctx) == LLAMA_POOLING_TYPE_RANK
+            ? (int) llama_model_n_cls_out(model) : llama_model_n_embd(model);
+        FILE * out = fopen(argv[4], "wb");
+        fwrite(embedding, sizeof(float), width, out);
+        fclose(out);
+        printf("tokens:");
+        for (int i = 0; i < n; i++) printf(" %d", toks[i]);
+        printf("\n%d values\n", width);
         return 0;
     }
 
