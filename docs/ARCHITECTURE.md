@@ -210,8 +210,7 @@ with SIMD in `kernels/x86.rs` and `kernels/arm.rs`, and the tests hold every
 one of them to the scalar result on random blocks, on extreme values and on
 every row length. On x86, the rarer formats are decoded by the scalar code
 a block at a time and multiplied with AVX2, which is most of the gain for
-little code. `tests/quant.rs` holds the scalar decoders themselves to
-ggml's: every format expands to the same floats, bit for bit.
+little code.
 
 | Backend | Runs on | Byte multiply |
 |---|---|---|
