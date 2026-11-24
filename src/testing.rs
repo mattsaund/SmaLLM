@@ -158,6 +158,9 @@ pub(crate) struct TinyModel {
     /// YaRN position scaling, with a short original context so that its
     /// ramp falls inside the small heads.
     pub yarn: bool,
+    /// gpt-oss: attention sinks, an output bias, biases on the router and
+    /// on every expert, and the feed-forward norm under another name.
+    pub gpt_oss: bool,
     pub seed: u64,
 }
 
@@ -180,7 +183,7 @@ impl TinyModel {
                 "qwen3" | "qwen3moe" | "gemma3" | "gemma4" | "lfm2" | "lfm2moe" | "lfm3" | "olmoe"
             ),
             post_norm: matches!(arch, "gemma2" | "gemma3" | "gemma4" | "lfm3"),
-            bias: matches!(arch, "qwen2" | "qwen2moe"),
+            bias: matches!(arch, "qwen2" | "qwen2moe" | "gpt-oss"),
             fused: false,
             window: 0,
             rope_factors: false,
@@ -203,12 +206,13 @@ impl TinyModel {
             wide_qk_norm: arch == "olmoe",
             granite_scales: matches!(arch, "granite" | "granitemoe"),
             longrope: arch == "phi3",
-            yarn: arch == "qwen3",
+            yarn: matches!(arch, "qwen3" | "gpt-oss"),
+            gpt_oss: arch == "gpt-oss",
             seed: 1,
         };
         if matches!(
             arch,
-            "qwen2moe" | "qwen3moe" | "olmoe" | "granitemoe" | "lfm2moe"
+            "qwen2moe" | "qwen3moe" | "olmoe" | "granitemoe" | "lfm2moe" | "gpt-oss"
         ) {
             model.experts = 4;
             model.experts_used = 2;
@@ -229,8 +233,8 @@ impl TinyModel {
             // Phi-3 stores query, key and value together, and the gate
             // with `up`.
             "phi3" => model.fused = true,
-            // Every other layer of Gemma 2 is windowed.
-            "gemma2" => {
+            // Every other layer of Gemma 2 and gpt-oss is windowed.
+            "gemma2" | "gpt-oss" => {
                 model.n_layer = 4;
                 model.window = 3;
             }
@@ -683,7 +687,42 @@ impl TinyModel {
             let head_dim = self.layer_head_dim(layer);
             let (q_dim, kv_dim) = (self.n_head * head_dim, self.n_head_kv * head_dim);
             vector(&mut builder, &name("attn_norm.weight"), d, 0.5, 1.5);
-            vector(&mut builder, &name("ffn_norm.weight"), d, 0.5, 1.5);
+            // gpt-oss calls its feed-forward norm the post-attention norm.
+            let ffn_norm = if self.gpt_oss {
+                "post_attention_norm.weight"
+            } else {
+                "ffn_norm.weight"
+            };
+            vector(&mut builder, &name(ffn_norm), d, 0.5, 1.5);
+            if self.gpt_oss {
+                let n_ff = self.layer_n_ff(layer);
+                vector(
+                    &mut builder,
+                    &name("attn_sinks.weight"),
+                    self.n_head,
+                    -1.0,
+                    2.0,
+                );
+                vector(&mut builder, &name("attn_output.bias"), d, -0.2, 0.2);
+                vector(
+                    &mut builder,
+                    &name("ffn_gate_inp.bias"),
+                    self.experts,
+                    -0.5,
+                    0.5,
+                );
+                // One bias row per expert.
+                let count = self.experts as u64;
+                let mut bias_rng = Rng(self.seed ^ (0xb0 + layer as u64));
+                for (part, width) in [
+                    ("ffn_gate_exps.bias", n_ff),
+                    ("ffn_up_exps.bias", n_ff),
+                    ("ffn_down_exps.bias", d),
+                ] {
+                    let values = bias_rng.floats(width * self.experts, -0.3, 0.3);
+                    builder.tensor_f32(&name(part), &[width as u64, count], &values);
+                }
+            }
             if self.is_conv(layer) {
                 let taps = self.conv_kernel as u64;
                 let mut taps_rng = Rng(self.seed ^ (0xc0 + layer as u64));

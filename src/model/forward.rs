@@ -456,6 +456,10 @@ struct ExpertScratch {
     groups: Vec<Range<usize>>,
     /// The gate, up and down maps of each expert in use.
     linears: Vec<Linear>,
+    /// The expert each group belongs to.
+    group_experts: Vec<usize>,
+    /// One expert's bias row, read from the file.
+    bias: Vec<f32>,
     /// The input of every pair, then its gate and up projections, then
     /// its output.
     inputs: Vec<f32>,
@@ -1176,6 +1180,7 @@ impl Pass<'_> {
             first_position: self.first_position + run.active.start,
             window: spec.window,
             softcap: config.attention_softcap,
+            sinks: w.sinks.as_deref(),
         };
         let source = spec.kv_source.unwrap_or(run.index);
         attend(&self.engine, self.kv, source, spec, &query, &s.slots, out);
@@ -1326,10 +1331,12 @@ impl Pass<'_> {
         }
         s.groups.clear();
         s.linears.clear();
+        s.group_experts.clear();
         for expert in 0..routing.count {
             let group = s.starts[expert]..s.starts[expert + 1];
             if !group.is_empty() {
                 s.groups.push(group);
+                s.group_experts.push(expert);
                 s.linears.extend([
                     w.gate.expert(expert),
                     w.up.expert(expert),
@@ -1361,6 +1368,20 @@ impl Pass<'_> {
         }
         self.multiply(inputs, d, &mut targets);
         drop(targets);
+        if let Some([gate_bias, up_bias, _]) = &w.biases {
+            let map = self.engine.map;
+            for (values, bias) in [(&mut *gate, gate_bias), (&mut *up, up_bias)] {
+                add_expert_biases(
+                    map,
+                    bias,
+                    &s.groups,
+                    &s.group_experts,
+                    n_ff,
+                    values,
+                    &mut s.bias,
+                );
+            }
+        }
         self.lap(Phase::FeedForwardUp);
         apply_gate(kernels, self.engine.pool, config.activation, gate, up);
         self.lap(Phase::Activation);
@@ -1380,6 +1401,18 @@ impl Pass<'_> {
         }
         self.multiply(gate, n_ff, &mut targets);
         drop(targets);
+        if let Some([_, _, down_bias]) = &w.biases {
+            let map = self.engine.map;
+            add_expert_biases(
+                map,
+                down_bias,
+                &s.groups,
+                &s.group_experts,
+                d,
+                out,
+                &mut s.bias,
+            );
+        }
         self.lap(Phase::FeedForwardDown);
 
         // A shared expert sees every row, scaled by its own gate. Then the
@@ -1532,6 +1565,43 @@ fn choose(
     }
 }
 
+/// Adds each expert's bias row to the rows routed to it. `values` holds
+/// `width` floats per row, in the grouped order.
+fn add_expert_biases(
+    map: &Mapping,
+    biases: &Matrix,
+    groups: &[Range<usize>],
+    experts: &[usize],
+    width: usize,
+    values: &mut [f32],
+    row: &mut Vec<f32>,
+) {
+    row.resize(width, 0.0);
+    for (group, &expert) in groups.iter().zip(experts) {
+        read_row(map, biases, expert, row);
+        for values in values[group.start * width..group.end * width].chunks_exact_mut(width) {
+            values
+                .iter_mut()
+                .zip(row.iter())
+                .for_each(|(value, bias)| *value += bias);
+        }
+    }
+}
+
+/// OpenAI's SwiGLU: with `x = min(g, 7)` and `y = clamp(u, -7, 7)`, the
+/// result is `x * sigmoid(1.702 * x) * (y + 1)`. It is computed as the SiLU
+/// kernel's `silu(a) * b`, with `a = 1.702 * x` and `b = (y + 1) / 1.702`,
+/// so that it runs on the fast kernel.
+fn swiglu_oai(kernels: &Kernels, gate: &mut [f32], up: &mut [f32]) {
+    const ALPHA: f32 = 1.702;
+    const LIMIT: f32 = 7.0;
+    for (g, u) in gate.iter_mut().zip(up.iter_mut()) {
+        *g = ALPHA * g.min(LIMIT);
+        *u = (u.clamp(-LIMIT, LIMIT) + 1.0) / ALPHA;
+    }
+    kernels.silu_mul(gate, up);
+}
+
 /// Applies the gate of the feed-forward network: `gate = act(gate) * up`.
 /// Large batches are split between the threads.
 fn apply_gate(
@@ -1539,22 +1609,28 @@ fn apply_gate(
     pool: &ThreadPool,
     activation: Activation,
     gate: &mut [f32],
-    up: &[f32],
+    up: &mut [f32],
 ) {
     /// Elements per parallel piece. Fewer are not worth waking a thread for.
     const GRAIN: usize = 16 * 1024;
-    let apply = |gate: &mut [f32], up: &[f32]| match activation {
+    let apply = |gate: &mut [f32], up: &mut [f32]| match activation {
         Activation::Silu => kernels.silu_mul(gate, up),
         Activation::Gelu => kernels.gelu_mul(gate, up),
+        Activation::SwigluOai => swiglu_oai(kernels, gate, up),
     };
-    if gate.len() <= GRAIN || pool.threads() == 1 {
-        return apply(gate, up);
+    let n = gate.len().min(up.len());
+    if n <= GRAIN || pool.threads() == 1 {
+        return apply(&mut gate[..n], &mut up[..n]);
     }
-    let output = SharedOutput(gate.as_mut_ptr());
-    pool.ranges(gate.len().min(up.len()), GRAIN, &|range| {
-        // SAFETY: the ranges are disjoint and lie inside `gate`.
-        let gate = unsafe { output.slice(range.start, range.len()) };
-        apply(gate, &up[range]);
+    let (gates, ups) = (
+        SharedOutput(gate.as_mut_ptr()),
+        SharedOutput(up.as_mut_ptr()),
+    );
+    pool.ranges(n, GRAIN, &|range| {
+        // SAFETY: the ranges are disjoint and lie inside `gate` and `up`.
+        let gate = unsafe { gates.slice(range.start, range.len()) };
+        let up = unsafe { ups.slice(range.start, range.len()) };
+        apply(gate, up);
     });
 }
 
@@ -1593,6 +1669,8 @@ struct Query<'a> {
     window: usize,
     /// Soft cap on the scores, `cap * tanh(score / cap)`. Zero for none.
     softcap: f32,
+    /// Each query head's sink score, when the model has them.
+    sinks: Option<&'a [f32]>,
 }
 
 /// Where a parallel loop writes, shared between its threads.
@@ -1651,6 +1729,8 @@ fn attend(
         };
         let end = position + 1;
         let visible = end - first;
+        // Each head's scores, with room for its sink at the end.
+        let stride = visible + usize::from(query.sinks.is_some());
         // The query heads that read this key/value head sit side by side.
         let group = token * q_dim + kv_head * group_dim;
 
@@ -1667,7 +1747,7 @@ fn attend(
                 .map(|value| value * spec.attention_scale),
         );
         scores.clear();
-        scores.resize(shared * visible, 0.0);
+        scores.resize(shared * stride, 0.0);
 
         kv.for_each_run(layer, kv_head, first, end, |run_first, keys, _| {
             kernels.dot_rows(
@@ -1675,21 +1755,26 @@ fn attend(
                 keys,
                 head_dim,
                 &mut scores[run_first - first..],
-                visible,
+                stride,
             );
         });
-        for head_scores in scores.chunks_exact_mut(visible) {
+        for (head, head_scores) in scores.chunks_exact_mut(stride).enumerate() {
             if query.softcap > 0.0 {
                 let cap = query.softcap;
-                head_scores
+                head_scores[..visible]
                     .iter_mut()
                     .for_each(|score| *score = cap * (*score / cap).tanh());
+            }
+            // A sink joins the softmax as one more score. Its weight is
+            // never used, so the others add up to less than one.
+            if let Some(sinks) = query.sinks {
+                head_scores[visible] = sinks[kv_head * shared + head];
             }
             kernels.softmax(head_scores);
         }
         out.fill(0.0);
         kv.for_each_run(layer, kv_head, first, end, |run_first, _, values| {
-            kernels.mix_rows(&scores[run_first - first..], values, head_dim, out, visible);
+            kernels.mix_rows(&scores[run_first - first..], values, head_dim, out, stride);
         });
     };
 

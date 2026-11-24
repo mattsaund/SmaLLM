@@ -13,7 +13,7 @@ use crate::kernels::{self, Kernels};
 use crate::tensor::TensorType;
 use crate::testing::TinyModel;
 
-const ARCHS: [&str; 16] = [
+const ARCHS: [&str; 17] = [
     "llama",
     "qwen2",
     "qwen3",
@@ -30,6 +30,7 @@ const ARCHS: [&str; 16] = [
     "smollm3",
     "gemma2",
     "phi3",
+    "gpt-oss",
 ];
 
 const QUANT_TYPES: [TensorType; 11] = [
@@ -202,27 +203,51 @@ mod oracle {
         factors.filter(|_| spec.rope_factors)
     }
 
-    fn activate(x: f64, activation: Activation) -> f64 {
+    /// The gate's activation times the up projection.
+    fn activate(gate: f64, up: f64, activation: Activation) -> f64 {
         match activation {
-            Activation::Silu => x / (1.0 + (-x).exp()),
+            Activation::Silu => gate / (1.0 + (-gate).exp()) * up,
             Activation::Gelu => {
-                let z = (2.0 / std::f64::consts::PI).sqrt() * (x + 0.044715 * x * x * x);
-                0.5 * x * (1.0 + z.tanh())
+                let z = (2.0 / std::f64::consts::PI).sqrt() * (gate + 0.044715 * gate.powi(3));
+                0.5 * gate * (1.0 + z.tanh()) * up
+            }
+            Activation::SwigluOai => {
+                let (gate, up) = (gate.min(7.0), up.clamp(-7.0, 7.0));
+                gate / (1.0 + (-1.702 * gate).exp()) * (up + 1.0)
             }
         }
     }
 
-    /// A gated feed-forward network.
+    /// A gated feed-forward network, with each projection's bias when it
+    /// has one (gpt-oss experts).
     fn feed_forward(model: &Model, w: &Dense, h: &[f64]) -> Vec<f64> {
+        feed_forward_biased(model, w, h, None)
+    }
+
+    fn feed_forward_biased(
+        model: &Model,
+        w: &Dense,
+        h: &[f64],
+        biases: Option<[Vec<f64>; 3]>,
+    ) -> Vec<f64> {
         let activation = model.config().activation;
-        let gate = apply(model, &w.gate, h);
-        let up = apply(model, &w.up, h);
+        let add = |mut values: Vec<f64>, index: usize| {
+            if let Some(biases) = &biases {
+                values
+                    .iter_mut()
+                    .zip(&biases[index])
+                    .for_each(|(v, b)| *v += b);
+            }
+            values
+        };
+        let gate = add(apply(model, &w.gate, h), 0);
+        let up = add(apply(model, &w.up, h), 1);
         let mixed: Vec<f64> = gate
             .iter()
             .zip(&up)
-            .map(|(g, u)| activate(*g, activation) * u)
+            .map(|(g, u)| activate(*g, *u, activation))
             .collect();
-        apply(model, &w.down, &mixed)
+        add(apply(model, &w.down, &mixed), 2)
     }
 
     /// A mixture of experts, following llama.cpp's routing step by step.
@@ -263,7 +288,11 @@ mod oracle {
                 up: w.up.expert(expert),
                 down: w.down.expert(expert),
             };
-            let result = feed_forward(model, &dense, h);
+            let biases = w
+                .biases
+                .as_ref()
+                .map(|matrices| matrices.each_ref().map(|m| row_of(model, m, expert)));
+            let result = feed_forward_biased(model, &dense, h, biases);
             out.iter_mut()
                 .zip(result)
                 .for_each(|(o, r)| *o += weight * r);
@@ -366,8 +395,15 @@ mod oracle {
                             }
                         })
                         .collect();
-                    let max = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                    let total: f64 = scores.iter().map(|s| (s - max).exp()).sum();
+                    // A sink counts in the softmax's total as one more
+                    // score, with no value.
+                    let sink = a.sinks.as_ref().map(|sinks| sinks[head] as f64);
+                    let max = scores
+                        .iter()
+                        .chain(&sink)
+                        .cloned()
+                        .fold(f64::NEG_INFINITY, f64::max);
+                    let total: f64 = scores.iter().chain(&sink).map(|s| (s - max).exp()).sum();
                     let gate = gates
                         .as_ref()
                         .map_or(1.0, |g| 1.0 / (1.0 + (-g[head]).exp()));
@@ -507,7 +543,7 @@ mod oracle {
                     let mixed: Vec<f64> = gate
                         .iter()
                         .zip(input)
-                        .map(|(g, i)| activate(*g, Activation::Gelu) * i)
+                        .map(|(g, i)| activate(*g, *i, Activation::Gelu))
                         .collect();
                     let update = apply(model, &plw.proj, &mixed);
                     add(

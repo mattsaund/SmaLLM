@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 use crate::gguf::Gguf;
 
 /// Architectures this engine runs, as named in `general.architecture`.
-pub const ARCHITECTURES: [&str; 16] = [
+pub const ARCHITECTURES: [&str; 17] = [
     "llama",
     "qwen2",
     "qwen3",
@@ -28,6 +28,7 @@ pub const ARCHITECTURES: [&str; 16] = [
     "smollm3",
     "gemma2",
     "phi3",
+    "gpt-oss",
 ];
 
 /// Which two elements of an attention head a rotary embedding rotates
@@ -45,6 +46,10 @@ pub enum Rope {
 pub enum Activation {
     Silu,
     Gelu,
+    /// OpenAI's SwiGLU (gpt-oss): the gate is capped at 7 and goes through
+    /// `x * sigmoid(1.702 * x)`, and the up projection is clamped to
+    /// `[-7, 7]` and has one added.
+    SwigluOai,
 }
 
 /// How a mixture of experts turns the router's scores into weights.
@@ -275,7 +280,11 @@ impl Config {
         let rope_base = meta.f32("rope.freq_base").unwrap_or(10000.0);
         // Gemma 2's windowed layers rotate like its others, unless the file
         // says otherwise. Elsewhere they default to a base of 10000.
-        let default_local_base = if arch == "gemma2" { rope_base } else { 10000.0 };
+        let default_local_base = if matches!(arch.as_str(), "gemma2" | "gpt-oss") {
+            rope_base
+        } else {
+            10000.0
+        };
         let rope_base_local = meta.f32("rope.freq_base_swa").unwrap_or(default_local_base);
         let rope_scale = meta.rope_scale()?;
         let window = meta.usize("attention.sliding_window").unwrap_or(0);
@@ -384,6 +393,26 @@ impl Config {
                         .layers
                         .iter_mut()
                         .for_each(|layer| layer.attention_scale = scale);
+                }
+            }
+            // gpt-oss: every other layer looks back over a short window, and
+            // rotates like the others, YaRN included. Its experts are
+            // weighed by a softmax over the chosen ones, and their gate is
+            // OpenAI's clamped SwiGLU.
+            "gpt-oss" => {
+                config.activation = Activation::SwigluOai;
+                for (layer, local) in config
+                    .layers
+                    .iter_mut()
+                    .zip(meta.window_pattern(n_layer, 2))
+                {
+                    if local {
+                        make_local(layer);
+                        layer.rope_scale = rope_scale;
+                    }
+                }
+                if let Some(routing) = &mut config.routing {
+                    routing.gating = Gating::SoftmaxChosen;
                 }
             }
             // Phi-3 rotates halves. Its long-context versions bring two sets
@@ -673,7 +702,7 @@ impl Meta<'_> {
         let normalize = self
             .file
             .get_bool(&self.key("expert_weights_norm"))
-            .unwrap_or(!matches!(self.arch, "qwen2moe" | "olmoe"));
+            .unwrap_or(!matches!(self.arch, "qwen2moe" | "olmoe" | "gpt-oss"));
         Ok(Some(Routing {
             count,
             used,
@@ -686,8 +715,6 @@ impl Meta<'_> {
         }))
     }
 
-    /// The linear position scaling, as a multiplier on rotary angles. Other
-    /// kinds of scaling change the rotary formula, which is not done here.
     /// The rotary scaling type the file names, linear by default.
     fn rope_scaling(&self) -> &str {
         self.file
@@ -708,6 +735,8 @@ impl Meta<'_> {
         })
     }
 
+    /// The position scaling, as a multiplier on rotary angles. YaRN scales
+    /// angles too, and adds a ramp that `yarn` describes.
     fn rope_scale(&self) -> Result<f32> {
         match self.rope_scaling() {
             "none" | "linear" | "yarn" => {
