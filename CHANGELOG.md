@@ -24,7 +24,23 @@ Each version is a `v` tag, with ready-made binaries and libraries on its
   Phi-2 and Phi-1.5: LayerNorm, and attention and the feed-forward network
   side by side.
 - **gpt-oss.** Attention sinks, biased experts, OpenAI's clamped SwiGLU and
-  the Harmony chat format.
+  the Harmony chat format. MXFP4, IQ4_NL and IQ4_XS got AVX2 and NEON
+  kernels, so gpt-oss-20b generates about as fast as llama.cpp and reads
+  prompts faster.
+- **DeepSeek.** `deepseek2` (DeepSeek V2, V2-Lite, V3, R1, Moonlight, Kimi)
+  with latent attention, whose cache holds one compressed row per position:
+  4.4 times smaller than llama.cpp's for older files. V3's routing by
+  groups of experts. `deepseek` for DeepSeek-MoE-16B. The DeepSeek V2 and
+  Kimi chat formats.
+- **Mamba.** `mamba` (with Falcon Mamba), `mamba2`, and `granitehybrid`
+  (IBM Granite 4.0 H, Mamba 2 blocks with attention and experts). Mamba
+  2.8B holds 88 MB of its own memory, where llama.cpp holds 1,436 MB.
+- **RWKV.** `rwkv6` and `rwkv7`, with the RWKV World tokenizer and chat
+  format. RWKV-7 1.5B holds 38 MB of its own memory against llama.cpp's
+  723 MB.
+- **Recurrent states** of Mamba and RWKV blocks are saved just before the
+  last token of each prompt, so the next turn of a chat, or an answer
+  asked for again, does not read the conversation again.
 - **Half the cache memory.** The key/value cache keeps 16-bit floats, as
   llama.cpp does. A full 4,096-token context of Llama 3.2 1B now holds
   176 MB of SmaLLM's own memory instead of 310 MB (llama.cpp: 636 MB), and

@@ -84,21 +84,30 @@ line wins over the file.
 
 ## What it runs
 
-**Models.** Fourteen architectures: Llama, Qwen2, Qwen3, Gemma 3, Gemma 4,
-LFM2, LFM3, Granite, OLMoE, SmolLM3, and the mixture-of-experts Qwen2-MoE,
-Qwen3-MoE, Granite MoE and LFM2-MoE. That covers Llama 2 and 3, Mistral,
-Mixtral, TinyLlama, SmolLM2 and 3, Qwen2.5, Qwen3, the DeepSeek R1
-distillations, Gemma 3 and 4, Granite 3, OLMoE, and Liquid AI's LFM2,
-LFM2.5 and LFM3, including the hybrids of attention and convolution. The
-engine is tested against llama.cpp on thirteen models. Tokens match
-exactly, and greedy output matches up to near ties between two candidates.
-LFM3 is newer than the llama.cpp it is tested against, so it is checked
-against llama.cpp's source instead.
+**Models.** Twenty-five architectures for chat and text:
+
+- Transformers: Llama, Qwen2, Qwen3, Gemma 2, Gemma 3, Gemma 4, Phi-2,
+  Phi-3, Granite, SmolLM3, and gpt-oss.
+- Mixtures of experts: Qwen2-MoE, Qwen3-MoE, OLMoE, Granite MoE, LFM2-MoE,
+  DeepSeek-MoE, and DeepSeek V2 and V3 with their latent attention.
+- Hybrids and models that are not transformers: LFM2 and LFM3 (attention
+  and short convolutions), Mamba, Mamba 2, Granite 4.0 H (Mamba 2 and
+  attention), RWKV-6 and RWKV-7.
+
+That covers Llama 2 and 3, Mistral, Mixtral, TinyLlama, SmolLM2 and 3,
+Qwen2.5, Qwen3, the DeepSeek R1 distillations, Gemma 2, 3 and 4, Phi-2 to
+Phi-4-mini, gpt-oss, DeepSeek V2 and V3, Kimi and Moonlight, Granite 3 and
+4, OLMoE, Falcon Mamba, and Liquid AI's LFM2, LFM2.5 and LFM3. BERT and
+nomic-bert models make embeddings and rerank. The engine is tested against
+llama.cpp on 27 models. Tokens match exactly, and greedy output matches up
+to near ties between two candidates. LFM3 is newer than the llama.cpp it is
+tested against, so it is checked against llama.cpp's source instead.
 
 **Tokenizers.** SentencePiece, byte-level BPE with the word splitting rules
-of all 67 families llama.cpp knows, Gemma 4's, and the encoder tokenizers
-WordPiece (BERT) and Unigram (T5, XLM-RoBERTa). llama.cpp's own tokenizer
-test texts pass on every vocabulary it ships that uses one of these.
+of all 67 families llama.cpp knows, Gemma 4's, RWKV's World tokenizer, and
+the encoder tokenizers WordPiece (BERT) and Unigram (T5, XLM-RoBERTa).
+llama.cpp's own tokenizer test texts pass on every vocabulary it ships that
+uses one of these, and on RWKV's.
 
 **Weights.** F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K,
 Q5_K, Q6_K, the i-quants IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS,
@@ -112,8 +121,8 @@ get hand-written kernels, picked when the program starts. Everything else,
 including 32-bit ARM and RISC-V, runs portable code.
 
 **Chat formats.** ChatML, Llama 3, Llama 2, Mistral, Gemma, Gemma 4, Granite,
-Phi-3, Phi-4-mini, Zephyr, DeepSeek and OpenAI's Harmony (gpt-oss),
-recognized from the model file.
+Phi-3, Phi-4-mini, Zephyr, DeepSeek, DeepSeek V2, Kimi, OpenAI's Harmony
+(gpt-oss) and RWKV World, recognized from the model file.
 
 ## Speed
 
@@ -121,9 +130,9 @@ Llama 3.2 1B, Q4_K_M, in tokens per second:
 
 | Threads | Prompt, SmaLLM | Prompt, llama.cpp | Generation, SmaLLM | Generation, llama.cpp |
 |---|---|---|---|---|
-| 1 | **120** | 103 | **24.4** | 23.6 |
-| 4 | **427** | 383 | **46.7** | 45.2 |
-| 8 | **757** | 681 | **50.8** | 49.2 |
+| 1 | **121** | 102 | 23.6 | **25.0** |
+| 4 | **448** | 372 | **47.6** | 42.7 |
+| 8 | **765** | 657 | **50.4** | 44.6 |
 
 Measured on an Intel Core i7-14700K under Linux, against llama.cpp b11846
 with its `alderlake` CPU backend: a 256-token prompt and 96 generated
@@ -137,8 +146,8 @@ the engine holds of its own is small. For Llama 3.2 1B:
 
 | | Model loaded | With a 4,096-token context | After reading 256 tokens |
 |---|---|---|---|
-| SmaLLM | **7.5 MB** | **7.7 MB** | **29 MB** |
-| llama.cpp | 498 MB | 627 MB | 658 MB |
+| SmaLLM | **7.5 MB** | **7.7 MB** | **21 MB** |
+| llama.cpp | 498 MB | 627 MB | 636 MB |
 
 This is memory the process allocated, which the system cannot take back.
 Both engines also have the 808 MB model file in memory, and the system can
@@ -243,14 +252,14 @@ static, with the header and the Python binding.
 ## Project status
 
 - [x] GGUF loading by memory map, with every read bounds-checked
-- [x] Fourteen architectures, including mixtures of experts and hybrids of attention and convolution layers
+- [x] Twenty-five architectures, including mixtures of experts, hybrids, and the state-space and RWKV families
 - [x] Twenty-five weight formats, float, quantized, i-quants, ternary and MXFP4, each expanding exactly as in ggml
 - [x] Kernels for AVX2, AVX-VNNI, NEON and the ARM dot product extension
 - [x] Prompt reading in tiles, up to twice as fast as llama.cpp
 - [x] A few megabytes of memory besides the model file
-- [x] SentencePiece and byte-level BPE tokenizers for every word splitting family llama.cpp knows, and the
-      encoder tokenizers WordPiece and Unigram, matching it token for token on its test texts
-- [x] Twelve chat formats, recognized from the model file
+- [x] SentencePiece and byte-level BPE tokenizers for every word splitting family llama.cpp knows, RWKV's, and
+      the encoder tokenizers WordPiece and Unigram, matching it token for token on its test texts
+- [x] Fifteen chat formats, recognized from the model file
 - [x] Embedding and reranking models, from the command line and the server
 - [x] Reasoning kept apart from the answer, for models that think first
 - [x] A context window that slides or keeps its start when it fills, chosen with `--overflow`
@@ -263,7 +272,7 @@ static, with the header and the Python binding.
       ARM64, ARMv7 and RISC-V
 - [x] CI on Linux, macOS and Windows, on x86-64 and ARM, with ARMv7 and RISC-V under emulation
 - [ ] Speed and memory measured on ARM boards
-- [x] A first tagged release, 0.2.0
+- [x] Tagged releases, the latest 0.3.0
 
 ## To do
 
@@ -289,8 +298,10 @@ left out.
 
 - [x] Mixture-of-experts models: Mixtral, Qwen2-MoE, Qwen3-MoE, OLMoE, Granite MoE and LFM2-MoE.
 - [x] Hybrids of attention and short convolutions: LFM2, LFM2.5 and LFM3.
-- [ ] More architectures: Phi, Gemma 2, the MoE models of DeepSeek and gpt-oss, and the families that are not
+- [x] More architectures: Phi, Gemma 2, the MoE models of DeepSeek and gpt-oss, and the families that are not
       transformers (RWKV, Mamba).
+- [ ] The other hybrids and distillations: Falcon-H1, Jamba, Nemotron-H, Qwen3-Next, and RWKV's distillations of
+      Qwen (rwkv6qwen2, arwkv7).
 - [x] Encoder tokenizers (WordPiece and Unigram), which only the encoder models below use.
 - [x] Encoder models, for embeddings and reranking.
 - [ ] Images and audio as input.
@@ -300,7 +311,7 @@ left out.
 **Generation**
 
 - [ ] Grammar-constrained output, and JSON that follows a schema.
-- [ ] Jinja chat templates, for models whose format is not one of the twelve built in.
+- [ ] Jinja chat templates, for models whose format is not one of the fifteen built in.
 - [ ] More samplers: Mirostat, typical, DRY, XTC and dynamic temperature, and a bias on chosen tokens.
 - [ ] Token probabilities in the output.
 - [ ] Speculative decoding with a small draft model.
