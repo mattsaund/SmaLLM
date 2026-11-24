@@ -27,8 +27,8 @@ use std::sync::OnceLock;
 use crate::tensor::TensorType;
 use crate::tensor::quant::Tile;
 
-/// The fast `exp` of the portable kernels, for loops elsewhere that should
-/// vectorize (the Mamba scan).
+/// A fast `exp` that loops vectorize, for model code outside the kernels:
+/// the Mamba scan and RWKV's decays.
 pub(crate) use scalar::exp_approx;
 
 /// One activation vector, quantized for integer dot products.

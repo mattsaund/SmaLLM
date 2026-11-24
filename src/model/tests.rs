@@ -13,7 +13,7 @@ use crate::kernels::{self, Kernels};
 use crate::tensor::TensorType;
 use crate::testing::TinyModel;
 
-const ARCHS: [&str; 18] = [
+const ARCHS: [&str; 20] = [
     "llama",
     "qwen2",
     "qwen3",
@@ -32,6 +32,8 @@ const ARCHS: [&str; 18] = [
     "phi3",
     "gpt-oss",
     "phi2",
+    "rwkv6",
+    "rwkv7",
 ];
 
 const QUANT_TYPES: [TensorType; 22] = [
@@ -629,8 +631,278 @@ mod oracle {
         outputs
     }
 
+    /// A matrix of the file applied to `x`, read by name rather than from
+    /// the bound weights.
+    fn by_name(model: &Model, name: &str, x: &[f64]) -> Vec<f64> {
+        let matrix = tensor(model, name);
+        matrix
+            .chunks_exact(x.len())
+            .map(|row| row.iter().zip(x).map(|(w, v)| w * v).sum())
+            .collect()
+    }
+
+    /// Layer normalization in f64, with the file's weight and bias.
+    fn layer_norm(model: &Model, x: &[f64], name: &str) -> Vec<f64> {
+        let weight = tensor(model, &format!("{name}.weight"));
+        let bias = tensor(model, &format!("{name}.bias"));
+        let mut out = standardize(x, model.config().norm_eps as f64);
+        for ((value, w), b) in out.iter_mut().zip(weight).zip(bias) {
+            *value = *value * w + b;
+        }
+        out
+    }
+
+    /// `x` shifted to zero mean and scaled to unit variance.
+    fn standardize(x: &[f64], eps: f64) -> Vec<f64> {
+        let n = x.len() as f64;
+        let mean = x.iter().sum::<f64>() / n;
+        let variance = x.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n;
+        x.iter()
+            .map(|v| (v - mean) / (variance + eps).sqrt())
+            .collect()
+    }
+
+    fn sigmoid(x: f64) -> f64 {
+        1.0 / (1.0 + (-x).exp())
+    }
+
+    /// What one RWKV block carries from token to token: the previous
+    /// token's normalized inputs to its two parts, and each head's matrix.
+    struct RwkvState {
+        time_shift: Vec<f64>,
+        channel_shift: Vec<f64>,
+        heads: Vec<Vec<Vec<f64>>>,
+    }
+
+    /// The logits of an RWKV model after `tokens`, one token at a time as
+    /// llama.cpp's graphs for RWKV-6 and RWKV-7 write it. Row `i` of a
+    /// head's matrix is value channel `i` in RWKV-7 and key channel `i` in
+    /// RWKV-6, as in llama.cpp's state.
+    fn rwkv_logits(model: &Model, tokens: &[u32]) -> Vec<f64> {
+        let c = model.config();
+        let v7 = c.arch == "rwkv7";
+        let d = c.n_embd;
+        let n = c.rwkv.expect("an RWKV model").head_size;
+        let heads = d / n;
+        let rescale = c.rwkv.map_or(0, |rwkv| rwkv.rescale_every);
+        let mut states: Vec<RwkvState> = (0..c.n_layer)
+            .map(|_| RwkvState {
+                time_shift: vec![0.0; d],
+                channel_shift: vec![0.0; d],
+                heads: vec![vec![vec![0.0; n]; n]; heads],
+            })
+            .collect();
+        let mut x = Vec::new();
+        for &token in tokens {
+            let embedding = row_of(model, &model.weights().token_embd, token as usize);
+            x = layer_norm(model, &embedding, "token_embd_norm");
+            let mut first_value: Vec<f64> = Vec::new();
+            for (layer, state) in states.iter_mut().enumerate() {
+                let t = |part: &str| tensor(model, &format!("blk.{layer}.{part}.weight"));
+                let mat = |part: &str, input: &[f64]| {
+                    by_name(model, &format!("blk.{layer}.{part}.weight"), input)
+                };
+
+                // Time mixing.
+                let xa = layer_norm(model, &x, &format!("blk.{layer}.attn_norm"));
+                let sx: Vec<f64> = state
+                    .time_shift
+                    .iter()
+                    .zip(&xa)
+                    .map(|(p, c)| p - c)
+                    .collect();
+                state.time_shift = xa.clone();
+                let moved = |amounts: &[f64]| -> Vec<f64> {
+                    xa.iter()
+                        .zip(&sx)
+                        .zip(amounts)
+                        .map(|((x, s), a)| x + s * a)
+                        .collect()
+                };
+                let mut y = vec![0.0; d];
+                let (r, k, v, gate);
+                if v7 {
+                    let lerp = t("time_mix_lerp_fused");
+                    let input = |part: usize| moved(&lerp[part * d..(part + 1) * d]);
+                    let (xr, xw, xk, xv, xa_, xg) =
+                        (input(0), input(1), input(2), input(3), input(4), input(5));
+                    let rr = mat("time_mix_receptance", &xr);
+                    let kk0 = mat("time_mix_key", &xk);
+                    let mut vv = mat("time_mix_value", &xv);
+                    let low = |part: &str, input: &[f64], f: fn(f64) -> f64| {
+                        let inner: Vec<f64> = mat(&format!("time_mix_{part}1"), input)
+                            .into_iter()
+                            .map(f)
+                            .collect();
+                        mat(&format!("time_mix_{part}2"), &inner)
+                    };
+                    let w0 = t("time_mix_w0");
+                    let decay: Vec<f64> = low("w", &xw, f64::tanh)
+                        .iter()
+                        .zip(&w0)
+                        .map(|(l, b)| (-0.606531 * sigmoid(b + l)).exp())
+                        .collect();
+                    if layer == 0 {
+                        first_value = vv.clone();
+                    } else {
+                        let v0 = t("time_mix_v0");
+                        let mix = low("v", &xv, |x| x);
+                        for i in 0..d {
+                            vv[i] += (first_value[i] - vv[i]) * sigmoid(v0[i] + mix[i]);
+                        }
+                    }
+                    let g = low("g", &xg, sigmoid);
+                    let a0 = t("time_mix_a0");
+                    let a: Vec<f64> = low("a", &xa_, |x| x)
+                        .iter()
+                        .zip(&a0)
+                        .map(|(l, b)| sigmoid(b + l))
+                        .collect();
+                    let (k_k, k_a) = (t("time_mix_k_k"), t("time_mix_k_a"));
+                    let mut kk: Vec<f64> = kk0.iter().zip(&k_k).map(|(k, s)| k * s).collect();
+                    for head in kk.chunks_exact_mut(n) {
+                        let norm = head.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-12);
+                        head.iter_mut().for_each(|v| *v /= norm);
+                    }
+                    let key: Vec<f64> = (0..d)
+                        .map(|i| kk0[i] + (a[i] * kk0[i] * k_a[i] - kk0[i] * k_a[i]))
+                        .collect();
+                    for (head, matrix) in state.heads.iter_mut().enumerate() {
+                        let span = head * n..(head + 1) * n;
+                        for (i, row) in matrix.iter_mut().enumerate() {
+                            let sa: f64 = span.clone().map(|j| -kk[j] * row[j - span.start]).sum();
+                            let vi = vv[span.start + i];
+                            let mut out = 0.0;
+                            for j in span.clone() {
+                                let s = &mut row[j - span.start];
+                                *s = *s * decay[j] + vi * key[j] + sa * kk[j] * a[j];
+                                out += *s * rr[j];
+                            }
+                            y[span.start + i] = out;
+                        }
+                    }
+                    (r, k, v, gate) = (rr, key, vv, g);
+                } else {
+                    let xxx = moved(&t("time_mix_lerp_x"));
+                    let inner: Vec<f64> = mat("time_mix_w1", &xxx)
+                        .into_iter()
+                        .map(f64::tanh)
+                        .collect();
+                    let rank = inner.len() / 5;
+                    let up = t("time_mix_w2");
+                    let lerp = t("time_mix_lerp_fused");
+                    // Part p's correction: matrix p of the stacked tensor
+                    // applied to chunk p of the inner vector.
+                    let input = |part: usize| -> Vec<f64> {
+                        let chunk = &inner[part * rank..(part + 1) * rank];
+                        (0..d)
+                            .map(|i| {
+                                let at = (part * d + i) * rank;
+                                let correction: f64 = up[at..at + rank]
+                                    .iter()
+                                    .zip(chunk)
+                                    .map(|(w, x)| w * x)
+                                    .sum();
+                                xa[i] + sx[i] * (lerp[part * d + i] + correction)
+                            })
+                            .collect()
+                    };
+                    let (xw, xk, xv, xr, xg) = (input(0), input(1), input(2), input(3), input(4));
+                    let rr = mat("time_mix_receptance", &xr);
+                    let key = mat("time_mix_key", &xk);
+                    let vv = mat("time_mix_value", &xv);
+                    let g: Vec<f64> = mat("time_mix_gate", &xg)
+                        .into_iter()
+                        .map(|x| x * sigmoid(x))
+                        .collect();
+                    let inner: Vec<f64> = mat("time_mix_decay_w1", &xw)
+                        .into_iter()
+                        .map(f64::tanh)
+                        .collect();
+                    let base = t("time_mix_decay");
+                    let decay: Vec<f64> = mat("time_mix_decay_w2", &inner)
+                        .iter()
+                        .zip(&base)
+                        .map(|(l, b)| (-(b + l).exp()).exp())
+                        .collect();
+                    let u = t("time_mix_first");
+                    for (head, matrix) in state.heads.iter_mut().enumerate() {
+                        let start = head * n;
+                        for (i, row) in matrix.iter_mut().enumerate() {
+                            let key_i = start + i;
+                            for (j, s) in row.iter_mut().enumerate() {
+                                let kv = key[key_i] * vv[start + j];
+                                y[start + j] += rr[key_i] * (u[key_i] * kv + *s);
+                                *s = *s * decay[key_i] + kv;
+                            }
+                        }
+                    }
+                    (r, k, v, gate) = (rr, key, vv, g);
+                }
+                // Each head's output: normalized, a bonus for the current
+                // token (RWKV-7), gated, projected.
+                let (ln_w, ln_b) = (
+                    t("time_mix_ln"),
+                    tensor(model, &format!("blk.{layer}.time_mix_ln.bias")),
+                );
+                let r_k = if v7 { t("time_mix_r_k") } else { Vec::new() };
+                for head in 0..heads {
+                    let span = head * n..(head + 1) * n;
+                    let normed = standardize(&y[span.clone()], 64e-5);
+                    let bonus: f64 = if v7 {
+                        span.clone().map(|j| r[j] * k[j] * r_k[j]).sum()
+                    } else {
+                        0.0
+                    };
+                    for (offset, j) in span.enumerate() {
+                        y[j] = (normed[offset] * ln_w[j] + ln_b[j] + bonus * v[j]) * gate[j];
+                    }
+                }
+                add(&mut x, &mat("time_mix_output", &y));
+
+                // Channel mixing.
+                let xf = layer_norm(model, &x, &format!("blk.{layer}.attn_norm_2"));
+                let sx: Vec<f64> = state
+                    .channel_shift
+                    .iter()
+                    .zip(&xf)
+                    .map(|(p, c)| p - c)
+                    .collect();
+                state.channel_shift = xf.clone();
+                let moved = |amounts: &[f64]| -> Vec<f64> {
+                    xf.iter()
+                        .zip(&sx)
+                        .zip(amounts)
+                        .map(|((x, s), a)| x + s * a)
+                        .collect()
+                };
+                let keys: Vec<f64> = mat("channel_mix_key", &moved(&t("channel_mix_lerp_k")))
+                    .into_iter()
+                    .map(|k| k.max(0.0).powi(2))
+                    .collect();
+                let mut out = mat("channel_mix_value", &keys);
+                if !v7 {
+                    let receptance =
+                        mat("channel_mix_receptance", &moved(&t("channel_mix_lerp_r")));
+                    for (o, r) in out.iter_mut().zip(receptance) {
+                        *o *= sigmoid(r);
+                    }
+                }
+                add(&mut x, &out);
+                if rescale > 0 && (layer + 1) % rescale == 0 {
+                    x.iter_mut().for_each(|v| *v *= 0.5);
+                }
+            }
+        }
+        let last = layer_norm(model, &x, "output_norm");
+        by_name(model, "output.weight", &last)
+    }
+
     /// The logits after `tokens`, computed from scratch.
     pub fn logits(model: &Model, tokens: &[u32]) -> Vec<f64> {
+        if model.config().rwkv.is_some() {
+            return rwkv_logits(model, tokens);
+        }
         let (c, w) = (model.config(), model.weights());
         let eps = c.norm_eps;
         let mut x: Vec<Vec<f64>> = tokens
@@ -682,6 +954,7 @@ mod oracle {
             let updates = match &layer.mixer {
                 MixerWeights::Attention(a) => attention(model, index, a, &inputs, &mut caches),
                 MixerWeights::ShortConv(cw) => short_conv(model, index, cw, &inputs),
+                MixerWeights::Rwkv(_) => unreachable!("RWKV models have an oracle of their own"),
                 MixerWeights::Mamba(mw) => mamba(model, index, mw, &inputs),
             };
             for (position, mut update) in updates.into_iter().enumerate() {
@@ -714,6 +987,7 @@ mod oracle {
                         apply(model, &plain.down, &up)
                     }
                     FeedForward::None => unreachable!("skipped above"),
+                    FeedForward::ChannelMix(_) => unreachable!("handled with RWKV above"),
                 };
                 if let Some(weight) = &layer.ffn_post_norm {
                     update = rms_norm(&update, Some(weight), eps);
@@ -988,6 +1262,8 @@ fn new_layer_kinds_batch_and_thread_exactly() {
         "lfm2moe",
         "olmoe",
         "granitemoe",
+        "rwkv6",
+        "rwkv7",
     ] {
         for ty in [TensorType::F32, TensorType::Q8_0] {
             let model = load(&TinyModel::new(arch, ty));
@@ -1135,7 +1411,7 @@ fn mamba_models_batch_and_thread_exactly() {
 }
 
 #[test]
-fn recurrent_state_survives_rolling_back() {
+fn mamba_state_survives_rolling_back() {
     // A chat: a prompt, a reply generated one token at a time, then cuts
     // back into the reply, to the end of the prompt, and before it. The
     // session restores the state saved at the end of a prompt, or starts
@@ -1174,6 +1450,71 @@ fn recurrent_state_survives_rolling_back() {
         session.clear();
         assert!(session.cache_bytes() < state);
     }
+}
+
+#[test]
+fn rwkv_models_stay_close_to_the_oracle_when_quantized() {
+    for arch in ["rwkv6", "rwkv7"] {
+        for ty in QUANT_TYPES {
+            let model = load(&TinyModel::new(arch, ty));
+            let expected = oracle::logits(&model, &PROMPT);
+            // Without rounding activations, only float precision separates
+            // the engine from the oracle, whatever the weight format.
+            let mut exact = session(&model, 2, 4, Some(kernels::exact()));
+            exact.eval(&PROMPT).unwrap();
+            let error = relative_error(exact.logits(), &expected);
+            assert!(error < 2e-4, "{arch} {} exact: error {error}", ty.name());
+            // Rounding activations to 8 bits costs more here than in other
+            // blocks. Each head's output is normalized, which magnifies the
+            // small errors of a quiet head. A wrong bit layout would still
+            // be off by far more.
+            let error = relative_error(&logits(&model, &PROMPT, 2, 4), &expected);
+            assert!(error < 0.3, "{arch} {}: error {error}", ty.name());
+        }
+    }
+}
+
+#[test]
+fn rwkv_state_survives_rolling_back() {
+    // Prompts of several lengths, read one after another as a chat would,
+    // leave saved states behind. Each cut restores one, or starts over,
+    // and reads the tokens after it again.
+    let tokens: Vec<u32> = (0..90u32).map(|i| 1 + (i * 7) % 39).collect();
+    let next = [30, 31, 32];
+    for arch in ["rwkv6", "rwkv7"] {
+        let model = load(&TinyModel::new(arch, TensorType::F32));
+        let mut session = session(&model, 2, 5, None);
+        for end in [20, 50, 51, 90] {
+            let start = session.tokens().len();
+            session.eval(&tokens[start..end]).unwrap();
+        }
+        let full_size = session.cache_bytes();
+        for len in [89, 60, 50, 49, 20, 7, 0] {
+            session.truncate(len);
+            assert_eq!(session.tokens(), &tokens[..len]);
+            session.eval(&next).unwrap();
+            let mut expected = tokens[..len].to_vec();
+            expected.extend(next);
+            assert_eq!(
+                session.logits(),
+                logits(&model, &expected, 2, 5),
+                "{arch} cut to {len}"
+            );
+            session.truncate(len);
+            session.eval(&tokens[len..]).unwrap();
+            assert_eq!(session.logits(), logits(&model, &tokens, 2, 5));
+        }
+        assert!(session.cache_bytes() <= full_size + 3 * model_state_bytes(&model));
+        session.clear();
+        assert_eq!(session.cache_bytes(), model_state_bytes(&model));
+    }
+}
+
+/// Bytes of one copy of every block's recurrent state.
+fn model_state_bytes(model: &Model) -> usize {
+    let c = model.config();
+    let per_block = 2 * c.n_embd + c.n_embd * c.rwkv.map_or(0, |rwkv| rwkv.head_size);
+    c.n_layer * per_block * 4
 }
 
 #[test]
@@ -1317,7 +1658,7 @@ fn broken_models_fail_to_load() {
 
     // An architecture this engine does not run.
     let mut spec = TinyModel::new("llama", TensorType::F32);
-    spec.arch = "rwkv7";
+    spec.arch = "bloom";
     assert!(matches!(
         Model::from_bytes(spec.build()),
         Err(Error::Unsupported(_))

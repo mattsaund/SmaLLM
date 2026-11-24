@@ -13,7 +13,9 @@
 //!
 //! Some vocabularies come without test files. For those,
 //! `tests/golden/vocab` holds the tokens llama.cpp gives the BERT test
-//! texts, made with `ref tokraw` from `tools/reference`.
+//! texts, made with `ref tokraw` from `tools/reference`. llama.cpp keeps no
+//! RWKV World vocabulary at all, so a file there may also be named after a
+//! model file. It is checked when `SMALLM_TEST_MODELS` holds that model.
 
 use std::path::{Path, PathBuf};
 
@@ -33,17 +35,40 @@ struct Suite {
     cases: Vec<(String, Vec<u32>)>,
 }
 
-/// Reads every vocabulary in `dir` that has both test files.
+/// Model files in `SMALLM_TEST_MODELS` that `tests/golden/vocab` holds
+/// tokens for, as `<model file>.out`. They stand in for the vocabularies
+/// llama.cpp keeps no file of.
+fn model_vocabularies() -> Vec<PathBuf> {
+    let Some(models) = std::env::var_os("SMALLM_TEST_MODELS").map(PathBuf::from) else {
+        return Vec::new();
+    };
+    let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/vocab");
+    let Ok(entries) = std::fs::read_dir(golden) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| {
+            let file_name = entry.ok()?.file_name().to_string_lossy().to_string();
+            let model = file_name.strip_suffix(".out")?;
+            let path = models.join(model);
+            (!model.starts_with("ggml-vocab-") && path.is_file()).then_some(path)
+        })
+        .collect()
+}
+
+/// Reads every vocabulary in `dir` that has both test files, and every
+/// model of [`model_vocabularies`].
 fn suites(dir: &Path) -> Vec<Suite> {
     let mut found = Vec::new();
     let entries =
         std::fs::read_dir(dir).unwrap_or_else(|error| panic!("{}: {error}", dir.display()));
-    for entry in entries {
-        let path = entry.unwrap().path();
+    let paths = entries.map(|entry| entry.unwrap().path());
+    for path in paths.chain(model_vocabularies()) {
         let file_name = path.file_name().unwrap().to_string_lossy().to_string();
         let Some(name) = file_name
             .strip_prefix("ggml-vocab-")
-            .and_then(|rest| rest.strip_suffix(".gguf"))
+            .unwrap_or(&file_name)
+            .strip_suffix(".gguf")
         else {
             continue;
         };

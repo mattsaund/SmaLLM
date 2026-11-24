@@ -295,6 +295,7 @@ impl Encoder {
             parallel: false,
             ungated: false,
             routing: None,
+            rwkv: None,
         };
         Ok((config, encoder))
     }

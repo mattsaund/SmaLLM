@@ -348,6 +348,9 @@ impl TinyModel {
                 model.ssm_groups = 2;
                 model.granite_scales = true;
             }
+            // Three blocks: RWKV-7's later blocks mix in the first one's
+            // values, and RWKV-6 halves the state after the second.
+            "rwkv6" | "rwkv7" => model.n_layer = 3,
             _ => {}
         }
         model
@@ -407,6 +410,9 @@ impl TinyModel {
     pub fn build(&self) -> Vec<u8> {
         if self.ssm_state > 0 {
             return self.build_ssm();
+        }
+        if self.arch.starts_with("rwkv") {
+            return self.build_rwkv();
         }
         let mut rng = Rng(self.seed);
         let arch = self.arch;
@@ -1111,6 +1117,209 @@ impl TinyModel {
                 );
             } else {
                 vector(&mut builder, &name("ssm_d"), &[inner], 0.5, 1.5);
+            }
+        }
+        builder.build()
+    }
+}
+
+impl TinyModel {
+    /// Serializes an RWKV model, in the shapes llama.cpp's converter
+    /// writes. The low-rank maps are f32 whatever the type of the large
+    /// matrices, as converted files keep them in floats.
+    fn build_rwkv(&self) -> Vec<u8> {
+        let arch = self.arch;
+        let v7 = arch == "rwkv7";
+        let (d, n_ff) = (self.n_embd, self.n_ff);
+        let head_size = self.head_dim();
+        let mut builder = Builder::new();
+        builder
+            .string("general.architecture", arch)
+            .string("general.name", "tiny test model")
+            .u32(&format!("{arch}.context_length"), 1 << 20)
+            .u32(&format!("{arch}.embedding_length"), d as u32)
+            .u32(&format!("{arch}.block_count"), self.n_layer as u32)
+            .u32(&format!("{arch}.attention.head_count"), 0)
+            .u32(&format!("{arch}.wkv.head_size"), head_size as u32)
+            .u32(&format!("{arch}.feed_forward_length"), n_ff as u32)
+            .f32(&format!("{arch}.attention.layer_norm_epsilon"), 1e-5);
+        if !v7 {
+            builder.u32(&format!("{arch}.rescale_every_n_layers"), 2);
+        }
+
+        // An RWKV World vocabulary: a control token, then plain words.
+        let texts: Vec<String> = (0..self.n_vocab)
+            .map(|id| match id {
+                0 => "<s>".to_string(),
+                _ => format!("w{id} "),
+            })
+            .collect();
+        let refs: Vec<&[u8]> = texts.iter().map(|text| text.as_bytes()).collect();
+        let types: Vec<i32> = (0..self.n_vocab)
+            .map(|id| if id == 0 { 3 } else { 1 })
+            .collect();
+        builder
+            .string("tokenizer.ggml.model", "rwkv")
+            .strings("tokenizer.ggml.tokens", &refs)
+            .i32s("tokenizer.ggml.token_type", &types)
+            .u32("tokenizer.ggml.bos_token_id", 0)
+            .u32("tokenizer.ggml.eos_token_id", 0);
+
+        // The large matrices, in the model's type.
+        let id = type_id(self.ty);
+        let mut rng = Rng(self.seed);
+        let mut matrix =
+            |builder: &mut Builder, name: &str, rows: usize, cols: usize, magnitude: f32| {
+                let data = random_weights(&mut rng, self.ty, rows * cols, magnitude);
+                builder.tensor(name, &[cols as u64, rows as u64], id, data);
+            };
+        let scale = |width: usize| 1.5 / (width as f32).sqrt();
+        matrix(&mut builder, "token_embd.weight", self.n_vocab, d, 1.0);
+        matrix(&mut builder, "output.weight", self.n_vocab, d, scale(d));
+        for layer in 0..self.n_layer {
+            let name = |part: &str| format!("blk.{layer}.{part}.weight");
+            let mut squares = vec![
+                "time_mix_key",
+                "time_mix_value",
+                "time_mix_receptance",
+                "time_mix_output",
+            ];
+            if !v7 {
+                squares.extend(["time_mix_gate", "channel_mix_receptance"]);
+            }
+            for part in squares {
+                matrix(&mut builder, &name(part), d, d, scale(d));
+            }
+            matrix(&mut builder, &name("channel_mix_key"), n_ff, d, scale(d));
+            matrix(
+                &mut builder,
+                &name("channel_mix_value"),
+                d,
+                n_ff,
+                scale(n_ff),
+            );
+        }
+
+        // Everything else in f32. Amounts that move toward the previous
+        // token lie between 0 and 1.
+        let mut rng = Rng(self.seed ^ 0x5eed);
+        let mut floats = |builder: &mut Builder, name: &str, dims: &[u64], low: f32, high: f32| {
+            let n = dims.iter().product::<u64>() as usize;
+            builder.tensor_f32(name, dims, &rng.floats(n, low, high));
+        };
+        let d64 = d as u64;
+        for norm in ["token_embd_norm", "output_norm"] {
+            floats(&mut builder, &format!("{norm}.weight"), &[d64], 0.5, 1.5);
+            floats(&mut builder, &format!("{norm}.bias"), &[d64], -0.2, 0.2);
+        }
+        // Ranks of the low-rank maps: decay, learning rate, value mix and
+        // gate in RWKV-7, then the token shift's five parts and the decay
+        // in RWKV-6.
+        let (w_rank, a_rank, v_rank, g_rank) = (8u64, 8u64, 4u64, 16u64);
+        let (mix_rank, decay_rank) = (4u64, 8u64);
+        for layer in 0..self.n_layer {
+            let name = |part: &str| format!("blk.{layer}.{part}");
+            for norm in ["attn_norm", "attn_norm_2", "time_mix_ln"] {
+                let weight = name(&format!("{norm}.weight"));
+                floats(&mut builder, &weight, &[d64], 0.5, 1.5);
+                floats(
+                    &mut builder,
+                    &name(&format!("{norm}.bias")),
+                    &[d64],
+                    -0.2,
+                    0.2,
+                );
+            }
+            floats(
+                &mut builder,
+                &name("channel_mix_lerp_k.weight"),
+                &[d64],
+                0.0,
+                1.0,
+            );
+            if v7 {
+                let lerp = name("time_mix_lerp_fused.weight");
+                floats(&mut builder, &lerp, &[d64, 1, 1, 6], 0.0, 1.0);
+                // Each low-rank map: a base (none for the gate), a map down
+                // to its rank and one back up, each scaled for its input.
+                // The converter gives the first block stand-ins for the
+                // value mix, of the learning rate's rank.
+                let value_rank = if layer == 0 { a_rank } else { v_rank };
+                let maps = [
+                    ("w", w_rank),
+                    ("a", a_rank),
+                    ("v", value_rank),
+                    ("g", g_rank),
+                ];
+                for (part, rank) in maps {
+                    if part != "g" {
+                        let base = name(&format!("time_mix_{part}0.weight"));
+                        floats(&mut builder, &base, &[d64], -1.0, 1.0);
+                    }
+                    let (down, up) = (scale(d), scale(rank as usize));
+                    let first = name(&format!("time_mix_{part}1.weight"));
+                    floats(&mut builder, &first, &[d64, rank], -down, down);
+                    let second = name(&format!("time_mix_{part}2.weight"));
+                    floats(&mut builder, &second, &[rank, d64], -up, up);
+                }
+                floats(&mut builder, &name("time_mix_k_k.weight"), &[d64], 0.5, 1.5);
+                floats(&mut builder, &name("time_mix_k_a.weight"), &[d64], 0.0, 1.0);
+                floats(
+                    &mut builder,
+                    &name("time_mix_r_k.weight"),
+                    &[d64],
+                    -0.5,
+                    0.5,
+                );
+            } else {
+                let (down, up) = (scale(d), scale(mix_rank as usize));
+                let wide = [d64, 5 * mix_rank];
+                floats(
+                    &mut builder,
+                    &name("time_mix_w1.weight"),
+                    &wide,
+                    -down,
+                    down,
+                );
+                let stacked = [mix_rank, d64, 5];
+                floats(&mut builder, &name("time_mix_w2.weight"), &stacked, -up, up);
+                floats(
+                    &mut builder,
+                    &name("time_mix_lerp_x.weight"),
+                    &[d64],
+                    0.0,
+                    1.0,
+                );
+                let lerp = name("time_mix_lerp_fused.weight");
+                floats(&mut builder, &lerp, &[d64, 1, 1, 5], 0.0, 1.0);
+                let heads = (d / head_size) as u64;
+                let first = [head_size as u64, heads];
+                floats(
+                    &mut builder,
+                    &name("time_mix_first.weight"),
+                    &first,
+                    -1.0,
+                    1.0,
+                );
+                floats(
+                    &mut builder,
+                    &name("time_mix_decay.weight"),
+                    &[d64],
+                    -2.0,
+                    1.0,
+                );
+                let (down, up) = (scale(d), scale(decay_rank as usize));
+                let first = name("time_mix_decay_w1.weight");
+                floats(&mut builder, &first, &[d64, decay_rank], -down, down);
+                let second = name("time_mix_decay_w2.weight");
+                floats(&mut builder, &second, &[decay_rank, d64], -up, up);
+                floats(
+                    &mut builder,
+                    &name("channel_mix_lerp_r.weight"),
+                    &[d64],
+                    0.0,
+                    1.0,
+                );
             }
         }
         builder.build()

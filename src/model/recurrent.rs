@@ -16,6 +16,7 @@
 //! the saved position.
 
 use super::config::{Config, Mixer};
+use super::rwkv;
 
 /// Saved states kept. Older ones are dropped first. Each costs as much
 /// memory as the state itself.
@@ -29,6 +30,7 @@ pub fn state_sizes(config: &Config) -> Vec<usize> {
         .iter()
         .map(|layer| match layer.mixer {
             Mixer::Mamba(ssm) => ssm.state_floats(),
+            Mixer::Rwkv6 | Mixer::Rwkv7 => rwkv::state_size(config),
             _ => 0,
         })
         .collect()

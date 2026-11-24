@@ -152,6 +152,13 @@ file, from a short set or a long one by the length of the context. YaRN
 (gpt-oss, DeepSeek) scales the low frequencies, keeps the high ones, blends
 the two along a ramp in between, and scales the rotated values up a little.
 
+RWKV models have no attention. Each head keeps a square matrix that every
+token decays and writes its key and value into, and the token's output is
+that matrix read with its receptance. RWKV-7 also removes what the matrix
+held for a key before it writes the new value. The blocks normalize with
+layer norms, and every input moves part of the way toward the previous
+token's. They run a path of their own, in `model/rwkv.rs`.
+
 `model/config.rs` turns the architecture name and its metadata into a few
 model-wide switches (how positions are rotated, the activation, embedding
 and logit scaling) and one `LayerSpec` per block. A layer's spec says how it

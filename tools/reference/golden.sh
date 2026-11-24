@@ -58,4 +58,6 @@ mamba-370m-hf.Q8_0.gguf                    plain.txt   48
 mamba2-130m-hf-q8_0.gguf                   plain.txt   48
 granite-4.0-h-350m-Q4_K_M.gguf             granite.txt 32
 granite-4.0-h-tiny-Q4_K_M.gguf             granite.txt 32
+rwkv7-g1d-0.1b-Q8_0.gguf                   rwkv-world.txt 32
+rwkv-6-world-1.6b-Q4_K.gguf                rwkv-world.txt 32
 TABLE
