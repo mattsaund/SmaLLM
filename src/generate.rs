@@ -62,6 +62,14 @@ pub struct Stats {
     pub generate_time: Duration,
     /// Why the generation ended.
     pub finish: Finish,
+    /// Tokens in the context when the generation ended: the prompt and the
+    /// answer, as far as the session holds them.
+    pub context_tokens: usize,
+    /// Size of the context window in tokens.
+    pub context_size: usize,
+    /// Bytes of memory the context holds, for the key/value cache and any
+    /// other per-token state.
+    pub context_bytes: usize,
 }
 
 impl Stats {
@@ -73,6 +81,15 @@ impl Stats {
     /// Tokens generated per second.
     pub fn generate_speed(&self) -> f64 {
         rate(self.generated_tokens, self.generate_time)
+    }
+
+    /// The share of the context window in use, from 0 to 1.
+    pub fn context_used(&self) -> f64 {
+        if self.context_size == 0 {
+            0.0
+        } else {
+            (self.context_tokens as f64 / self.context_size as f64).min(1.0)
+        }
     }
 }
 
@@ -232,6 +249,11 @@ pub fn run_tokens(
         generated_tokens: generated,
         generate_time: start.elapsed(),
         finish,
+        // A sampled token that was not evaluated yet still belongs to the
+        // conversation, and the next turn evaluates it.
+        context_tokens: session.tokens().len() + usize::from(pending.is_some()),
+        context_size: session.n_ctx(),
+        context_bytes: session.cache_bytes(),
     })
 }
 

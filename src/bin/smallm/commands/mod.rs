@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use smallm::chat::Template;
+use smallm::generate::{Finish, Stats};
 use smallm::tensor::type_name;
 use smallm::{Model, SamplerConfig, SessionConfig};
 
@@ -193,6 +194,41 @@ pub fn describe(model: &Model) -> String {
     )
 }
 
+/// One line on how an answer went: its speed, the prompt's speed, and how
+/// much of the context window is in use.
+///
+/// It reads like
+/// `42 tokens at 38.1 tok/s | prompt 23 tokens at 812 tok/s | context 612/4096 (15%), 9.4 MB`.
+pub fn stats_line(stats: &Stats) -> String {
+    let evaluated = stats.prompt_tokens - stats.reused_tokens;
+    let mut prompt = format!(
+        "prompt {evaluated} tokens at {:.0} tok/s",
+        stats.prompt_speed()
+    );
+    if stats.reused_tokens > 0 {
+        prompt.push_str(&format!(" (+{} reused)", stats.reused_tokens));
+    }
+    let mut line = format!(
+        "{} tokens at {:.1} tok/s | {prompt} | context {}/{} ({:.0}%), {}",
+        stats.generated_tokens,
+        stats.generate_speed(),
+        stats.context_tokens,
+        stats.context_size,
+        stats.context_used() * 100.0,
+        models::human_bytes(stats.context_bytes as u64)
+    );
+    let stopped = match stats.finish {
+        Finish::End | Finish::Stop => None,
+        Finish::Length => Some("token limit"),
+        Finish::Context => Some("context full"),
+        Finish::Canceled => Some("interrupted"),
+    };
+    if let Some(reason) = stopped {
+        line.push_str(&format!(" | stopped: {reason}"));
+    }
+    line
+}
+
 /// Formats a parameter count: `134.5M`.
 pub fn human_count(count: u64) -> String {
     match count {
@@ -206,6 +242,26 @@ pub fn human_count(count: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_stats_line_says_speed_and_context() {
+        let stats = Stats {
+            prompt_tokens: 512,
+            reused_tokens: 489,
+            prompt_time: Duration::from_millis(50),
+            generated_tokens: 42,
+            generate_time: Duration::from_secs(2),
+            finish: Finish::Context,
+            context_tokens: 554,
+            context_size: 4096,
+            context_bytes: 9_400_000,
+        };
+        assert_eq!(
+            stats_line(&stats),
+            "42 tokens at 21.0 tok/s | prompt 23 tokens at 460 tok/s (+489 reused) | \
+             context 554/4096 (14%), 9.4 MB | stopped: context full"
+        );
+    }
 
     #[test]
     fn counts_are_readable() {

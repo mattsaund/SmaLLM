@@ -7,13 +7,17 @@
 //! | `server/`     | The HTTP API behind `smallm serve`.                |
 //! | `models.rs`   | Finds downloaded models.                           |
 //! | `json.rs`     | JSON for the API and the downloader.               |
-//! | `term.rs`     | Ctrl+C handling.                                   |
+//! | `term.rs`     | Ctrl+C handling, and what the terminal can show.   |
+//! | `screen.rs`   | A scrolling log with one progress bar under it.    |
+//! | `sha256.rs`   | Checks that a download arrived intact.             |
 
 mod args;
 mod commands;
 mod json;
 mod models;
+mod screen;
 mod server;
+mod sha256;
 mod term;
 
 use std::process::ExitCode;

@@ -7,17 +7,17 @@
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 
 use smallm::chat::{Message, Role, Template};
-use smallm::generate::{self, Finish, Options, Stats};
+use smallm::generate::{self, Options, Stats};
 use smallm::{Model, Session};
 
 use super::{
     SAMPLER_SPECS, SESSION_SPECS, TEMPLATE_SPECS, chat_template, describe, load_model,
-    sampler_config,
+    sampler_config, stats_line,
 };
 use crate::args::{self, Args, Spec, switch, value};
 use crate::term;
 
-const SPECS: [Spec; 6] = [
+const SPECS: [Spec; 7] = [
     value(
         "max-tokens",
         Some('n'),
@@ -31,7 +31,16 @@ const SPECS: [Spec; 6] = [
     value("file", Some('f'), "Read the prompt from a file"),
     value("stop", None, "Stop when this text appears. May be repeated"),
     switch("show-special", None, "Show control tokens in the output"),
-    switch("verbose", Some('v'), "Print load time and speed"),
+    switch(
+        "verbose",
+        Some('v'),
+        "Print how the model loaded, and the speed after every answer",
+    ),
+    switch(
+        "quiet",
+        Some('q'),
+        "Print only the answer, without the speed and context line",
+    ),
 ];
 
 /// Tokens kept free for the answer when a long chat is trimmed to fit.
@@ -62,6 +71,11 @@ pub fn main(raw: impl Iterator<Item = String>) -> Result<(), String> {
         .positional(0)
         .ok_or("which model? Usage: smallm run <model> [prompt]")?;
     let verbose = args.has("verbose");
+    // The line after each answer goes to stderr, so it is shown where a
+    // person reads it and stays out of output that is piped on.
+    let report = Report {
+        stats: verbose || (term::stderr_is_terminal() && !args.has("quiet")),
+    };
 
     let loaded = load_model(name)?;
     let model = &loaded.model;
@@ -101,12 +115,25 @@ pub fn main(raw: impl Iterator<Item = String>) -> Result<(), String> {
                 None => complete(&mut session, &prompt, &options)?,
             };
             println!();
-            if verbose {
-                eprintln!("{}", speed_line(&stats));
-            }
+            report.answer(&stats);
             Ok(())
         }
-        None => chat(&mut session, model, template, system, &options, verbose),
+        None => chat(&mut session, model, template, system, &options, report),
+    }
+}
+
+/// What to print about each answer.
+#[derive(Clone, Copy)]
+struct Report {
+    /// The speed and context line.
+    stats: bool,
+}
+
+impl Report {
+    fn answer(self, stats: &Stats) {
+        if self.stats {
+            eprintln!("{}", term::paint("2", &stats_line(stats)));
+        }
     }
 }
 
@@ -179,25 +206,6 @@ fn answer(
     Ok((reply, stats))
 }
 
-/// One line on how fast a generation ran.
-fn speed_line(stats: &Stats) -> String {
-    let reason = match stats.finish {
-        Finish::End => "the model finished",
-        Finish::Length => "token limit",
-        Finish::Stop => "stop text",
-        Finish::Context => "context full",
-        Finish::Canceled => "interrupted",
-    };
-    format!(
-        "prompt: {} tokens ({} reused), {:.1} tok/s | answer: {} tokens, {:.1} tok/s | ended: {reason}",
-        stats.prompt_tokens,
-        stats.reused_tokens,
-        stats.prompt_speed(),
-        stats.generated_tokens,
-        stats.generate_speed()
-    )
-}
-
 const CHAT_HELP: &str = "\
 Commands:
   /clear            forget the conversation
@@ -214,7 +222,7 @@ fn chat(
     template: Option<Template>,
     mut system: Option<String>,
     options: &Options,
-    verbose: bool,
+    report: Report,
 ) -> Result<(), String> {
     eprintln!("{}", describe(model));
     match template {
@@ -278,9 +286,7 @@ fn chat(
             None => complete(session, input, options)?,
         };
         println!();
-        if verbose {
-            eprintln!("{}", speed_line(&stats));
-        }
+        report.answer(&stats);
     }
     Ok(())
 }

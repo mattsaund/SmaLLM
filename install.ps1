@@ -7,6 +7,9 @@
 # download, it builds from source, which needs Rust and the Visual Studio
 # Build Tools.
 #
+# Every step prints a line, and one progress bar for the whole installation
+# stays at the bottom of the window.
+#
 # To remove SmaLLM again:
 #
 #   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/mattsaund/SmaLLM/main/install.ps1))) -Uninstall
@@ -41,8 +44,217 @@ param([switch]$Uninstall)
     [Net.ServicePointManager]::SecurityProtocol =
         [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
+    # --- the screen ----------------------------------------------------------
+    #
+    # A log that scrolls, and one progress bar under it. Write-Log clears the
+    # bar, prints its line, and draws the bar again, so the bar stays on the
+    # last line however much is printed above it. Without a console, as in
+    # CI or with the output redirected, there is no bar, only the log.
+    #
+    # The state lives in one table, so the functions below can change it
+    # without reaching into scopes that are not theirs.
+
+    $screen = @{
+        Live     = $false
+        Percent  = 0
+        Activity = 'starting'
+        Work     = $null
+    }
+    try {
+        $screen.Live = -not [Console]::IsOutputRedirected -and [Console]::WindowWidth -gt 20
+    }
+    catch {
+        $screen.Live = $false
+    }
+
+    function Get-Width {
+        try { return [Math]::Max(40, [Console]::WindowWidth - 1) } catch { return 79 }
+    }
+
+    # Takes the bar off the screen.
+    function Clear-Bar {
+        if ($screen.Live) {
+            [Console]::Write("`r" + (' ' * (Get-Width)) + "`r")
+        }
+    }
+
+    # Draws the bar on the last line, over the one that was there.
+    function Show-Bar {
+        if (-not $screen.Live) { return }
+        $width = 30
+        $filled = [int][Math]::Floor($screen.Percent * $width / 100)
+        $line = '[' + ('#' * $filled) + ('-' * ($width - $filled)) + '] ' +
+            ('{0,3}%' -f $screen.Percent) + '  ' + $screen.Activity
+        $room = Get-Width
+        if ($line.Length -gt $room) { $line = $line.Substring(0, $room) }
+        [Console]::Write("`r" + $line.PadRight($room) + "`r" + $line)
+    }
+
+    # One line of the log. The tag is a word like Downloading.
+    function Write-Log([string]$Tag, [string]$Text, [string]$Color = 'Green') {
+        Clear-Bar
+        Write-Host ('{0,12}' -f $Tag) -ForegroundColor $Color -NoNewline
+        Write-Host (' ' + $Text)
+        Show-Bar
+    }
+
+    # A log line about something that did not stop the installation.
+    function Write-Warn([string]$Tag, [string]$Text) {
+        Write-Log $Tag $Text 'Yellow'
+    }
+
+    function Set-Progress([int]$Percent, [string]$Activity) {
+        $screen.Percent = [Math]::Max(0, [Math]::Min(100, $Percent))
+        $screen.Activity = $Activity
+        Show-Bar
+    }
+
+    # A byte count for people: 1.2 MB.
+    function Format-Bytes([double]$Bytes) {
+        if ($Bytes -ge 1e9) { return '{0:N1} GB' -f ($Bytes / 1e9) }
+        if ($Bytes -ge 1e6) { return '{0:N1} MB' -f ($Bytes / 1e6) }
+        if ($Bytes -ge 1e3) { return '{0:N1} KB' -f ($Bytes / 1e3) }
+        return '{0} B' -f [int]$Bytes
+    }
+
+    # Seconds as minutes and seconds: 1:05.
+    function Format-Clock([int]$Seconds) {
+        return '{0}:{1:00}' -f [Math]::Floor($Seconds / 60), ($Seconds % 60)
+    }
+
     function Have([string]$Name) {
         [bool](Get-Command $Name -ErrorAction SilentlyContinue)
+    }
+
+    # --- steps that both routes share ----------------------------------------
+
+    # Downloads $Url to $Path while the bar moves from $From to $To percent.
+    # Returns whether it worked. Reads the response as it arrives, so the
+    # bar follows the bytes.
+    function Get-File([string]$Url, [string]$Path, [int]$From, [int]$To) {
+        Add-Type -AssemblyName System.Net.Http
+        $client = New-Object System.Net.Http.HttpClient
+        $name = Split-Path $Path -Leaf
+        try {
+            $response = $client.GetAsync($Url, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+            if (-not $response.IsSuccessStatusCode) { return $false }
+            $total = $response.Content.Headers.ContentLength
+            if ($total) {
+                Write-Log 'Downloading' ('{0} ({1})' -f $name, (Format-Bytes $total))
+            }
+            else {
+                Write-Log 'Downloading' $name
+            }
+            $source = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+            $target = [System.IO.File]::Create($Path)
+            try {
+                $buffer = New-Object byte[] 65536
+                $got = 0
+                $drawn = [DateTime]::MinValue
+                while (($read = $source.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                    $target.Write($buffer, 0, $read)
+                    $got += $read
+                    if (([DateTime]::Now - $drawn).TotalMilliseconds -ge 100) {
+                        $drawn = [DateTime]::Now
+                        if ($total) {
+                            $percent = $From + [int](($To - $From) * $got / $total)
+                            Set-Progress $percent ('downloading {0}  {1} / {2}' -f $name, (Format-Bytes $got), (Format-Bytes $total))
+                        }
+                        else {
+                            Set-Progress $From ('downloading {0}  {1}' -f $name, (Format-Bytes $got))
+                        }
+                    }
+                }
+            }
+            finally {
+                $target.Dispose()
+                $source.Dispose()
+            }
+            Write-Log 'Received' ('{0}, {1}' -f $name, (Format-Bytes $got))
+            Set-Progress $To ('downloaded ' + $name)
+            return $true
+        }
+        catch {
+            return $false
+        }
+        finally {
+            $client.Dispose()
+        }
+    }
+
+    # One line that a tool printed, as a line of the log. cargo already
+    # writes a tag and its text.
+    function Show-ToolLine([string]$Line) {
+        $text = $Line.Trim()
+        if (-not $text) { return }
+        if ($text -match '^warning:\s*(.*)$') { Write-Warn 'Warning' $Matches[1]; return }
+        if ($text -match '^error(\[\w+\])?:\s*(.*)$') { Write-Warn 'Error' $Matches[2]; return }
+        $word = ($text -split ' ', 2)[0]
+        $known = @('Compiling', 'Finished', 'Downloading', 'Downloaded', 'Updating', 'Locking', 'Building', 'Checking', 'Fresh')
+        if ($known -contains $word) {
+            Write-Log $word ($text.Substring($word.Length).Trim())
+        }
+        else {
+            Write-Log '' $text
+        }
+    }
+
+    # Reads what was added to $Path since $State.Offset, and shows the whole
+    # lines. A line still being written waits in $State.Partial.
+    function Show-NewLines([string]$Path, [hashtable]$State, [bool]$Final) {
+        if (-not (Test-Path $Path)) { return }
+        $stream = [System.IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+        try {
+            [void]$stream.Seek($State.Offset, 'Begin')
+            $length = $stream.Length - $State.Offset
+            if ($length -le 0 -and -not $Final) { return }
+            $bytes = New-Object byte[] ([Math]::Max(0, $length))
+            $read = $stream.Read($bytes, 0, $bytes.Length)
+            $State.Offset += $read
+            $text = $State.Partial + [System.Text.Encoding]::UTF8.GetString($bytes, 0, $read)
+        }
+        finally {
+            $stream.Dispose()
+        }
+        $lines = $text -split "`r?`n|`r"
+        if ($Final) {
+            $State.Partial = ''
+        }
+        else {
+            $State.Partial = $lines[-1]
+            $lines = if ($lines.Count -gt 1) { $lines[0..($lines.Count - 2)] } else { @() }
+        }
+        foreach ($line in $lines) { Show-ToolLine $line }
+    }
+
+    # Runs a program, shows each line it prints in the log, and moves the bar
+    # from $From toward $To while it runs. Nothing measures how far along a
+    # build is, so the bar closes in on $To and slows down as it does: it is
+    # halfway there after a minute. Returns the program's exit code.
+    function Invoke-Logged([int]$From, [int]$To, [string]$Activity, [string]$File, [string[]]$Arguments) {
+        $out = Join-Path $screen.Work 'step.out'
+        $err = Join-Path $screen.Work 'step.err'
+        Remove-Item $out, $err -Force -ErrorAction SilentlyContinue
+        # Start-Process joins the arguments with spaces, so any with a space
+        # in it is quoted here.
+        $quoted = $Arguments | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }
+        $process = Start-Process -FilePath $File -ArgumentList $quoted -NoNewWindow -PassThru `
+            -RedirectStandardOutput $out -RedirectStandardError $err
+        # Reading the handle now keeps the exit code readable later, which
+        # PowerShell otherwise loses for processes started this way.
+        $null = $process.Handle
+        $states = @{ $out = @{ Offset = 0L; Partial = '' }; $err = @{ Offset = 0L; Partial = '' } }
+        $started = Get-Date
+        while ($true) {
+            $finished = $process.HasExited
+            foreach ($path in @($err, $out)) { Show-NewLines $path $states[$path] $finished }
+            if ($finished) { break }
+            $elapsed = [int]((Get-Date) - $started).TotalSeconds
+            Set-Progress ($From + [int](($To - $From) * $elapsed / ($elapsed + 60))) ('{0} ({1})' -f $Activity, (Format-Clock $elapsed))
+            Start-Sleep -Milliseconds 200
+        }
+        $process.WaitForExit()
+        return $process.ExitCode
     }
 
     # Copy $From to $Prefix\smallm.exe, over any smallm.exe already there.
@@ -74,6 +286,8 @@ param([switch]$Uninstall)
         return [bool]($machine -and $machine.PROCESSOR_ARCHITECTURE -eq 'ARM64')
     }
 
+    # --- a ready-made binary ---------------------------------------------------
+
     # The release's zip for this machine, checked and unpacked into $Prefix.
     # Returns whether it worked. A missing release is a reason to build
     # instead. A checksum that does not match is a reason to stop.
@@ -82,49 +296,44 @@ param([switch]$Uninstall)
         if ($slug -match '://' -or $slug -notmatch '^[^/]+/[^/]+$') { return $false }
         $release = if ($Ref -eq 'main') { 'latest/download' } else { "download/$Ref" }
         $base = "https://github.com/$slug/releases/$release"
-        $asset = if (Test-Arm64) { 'smallm-aarch64-pc-windows-msvc.zip' } else { 'smallm-x86_64-pc-windows-msvc.zip' }
-        $work = Join-Path ([IO.Path]::GetTempPath()) ('smallm-' + [Guid]::NewGuid().ToString('N'))
-        New-Item -ItemType Directory -Force -Path $work | Out-Null
-        try {
-            Write-Host 'downloading smallm ... ' -NoNewline
-            # The progress bar of Invoke-WebRequest in 5.1 slows a download
-            # down by an order of magnitude.
-            $ProgressPreference = 'SilentlyContinue'
-            $zip = Join-Path $work $asset
-            try {
-                Invoke-WebRequest -UseBasicParsing -ErrorAction Stop -OutFile $zip -Uri "$base/$asset"
-            }
-            catch {
-                Write-Host 'none published for this machine, so building from source instead'
-                return $false
-            }
-            $sums = Join-Path $work 'SHA256SUMS'
-            try {
-                Invoke-WebRequest -UseBasicParsing -ErrorAction Stop -OutFile $sums -Uri "$base/SHA256SUMS"
-                $actual = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash.ToLower()
-                $line = Get-Content $sums | Where-Object { $_ -match ([regex]::Escape($asset) + '$') } | Select-Object -First 1
-                $expected = if ($line) { ($line -split '\s+')[0].ToLower() } else { '' }
-                if ($expected -ne $actual) {
-                    throw 'the download does not match its checksum. Nothing was installed.'
-                }
-            }
-            catch [System.Net.WebException] {
-                Write-Host '(checksum not verified) ' -NoNewline
-            }
-            Expand-Archive -Path $zip -DestinationPath $work -Force -ErrorAction Stop
-            $exe = Get-ChildItem -Path $work -Filter 'smallm.exe' -Recurse | Select-Object -First 1
-            if (-not $exe) {
-                Write-Host 'the download had no smallm.exe in it, so building instead'
-                return $false
-            }
-            Install-Exe -From $exe.FullName -Prefix $Prefix
-            Write-Host 'done'
-            return $true
+        $target = if (Test-Arm64) { 'aarch64-pc-windows-msvc' } else { 'x86_64-pc-windows-msvc' }
+        $asset = "smallm-$target.zip"
+        $work = $screen.Work
+
+        Write-Log 'Looking' "for a ready-made smallm for $target"
+        Set-Progress 5 'looking for a release'
+        $zip = Join-Path $work $asset
+        if (-not (Get-File "$base/$asset" $zip 10 85)) {
+            Write-Warn 'Missing' 'no release has one for this machine, so it will be built from source'
+            return $false
         }
-        finally {
-            Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
+        $sums = Join-Path $work 'SHA256SUMS'
+        if (Get-File "$base/SHA256SUMS" $sums 85 90) {
+            $actual = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash.ToLower()
+            $line = Get-Content $sums | Where-Object { $_ -match ([regex]::Escape($asset) + '$') } | Select-Object -First 1
+            $expected = if ($line) { ($line -split '\s+')[0].ToLower() } else { '' }
+            if ($expected -ne $actual) {
+                throw 'the download does not match its checksum. Nothing was installed.'
+            }
+            Write-Log 'Verified' ('SHA-256 {0}... matches the release' -f $actual.Substring(0, 16))
         }
+        else {
+            Write-Warn 'Unverified' 'no checksum to compare with'
+        }
+        Set-Progress 93 'unpacking'
+        Expand-Archive -Path $zip -DestinationPath $work -Force -ErrorAction Stop
+        $exe = Get-ChildItem -Path $work -Filter 'smallm.exe' -Recurse | Select-Object -First 1
+        if (-not $exe) {
+            Write-Warn 'Failed' 'the download had no smallm.exe in it, so it will be built from source'
+            return $false
+        }
+        Write-Log 'Unpacked' ('smallm.exe, {0}' -f (Format-Bytes $exe.Length))
+        Set-Progress 97 'installing'
+        Install-Exe -From $exe.FullName -Prefix $Prefix
+        return $true
     }
+
+    # --- build from source -----------------------------------------------------
 
     # Build with cargo from a checkout or a fresh clone.
     function Install-FromSource([string]$Repo, [string]$Ref, [string]$Prefix, [bool]$Checkout) {
@@ -137,37 +346,27 @@ param([switch]$Uninstall)
                 throw 'building from source needs Rust. Install it from https://rustup.rs and run this again'
             }
         }
-        $source = $null
-        $temp = $false
-        try {
-            if ($Checkout) {
-                $source = (Get-Location).Path
-                Write-Host "building from $source"
-            }
-            else {
-                if (-not (Have 'git')) { throw 'git is needed to fetch the source' }
-                $source = Join-Path ([IO.Path]::GetTempPath()) ('smallm-' + [Guid]::NewGuid().ToString('N'))
-                $temp = $true
-                Write-Host "fetching $Repo ($Ref) ... " -NoNewline
-                & git clone --quiet --depth 1 --branch $Ref $Repo $source 2>$null | Out-Null
-                if ($LASTEXITCODE -ne 0) {
-                    Write-Host ''
-                    throw "could not clone $Repo ($Ref)"
-                }
-                Write-Host 'done'
-            }
-            Write-Host 'building (about half a minute)'
-            & cargo build --release --locked --manifest-path (Join-Path $source 'Cargo.toml') --bin smallm
-            if ($LASTEXITCODE -ne 0) { throw 'the build failed. The output above says why' }
-            $exe = Join-Path $source 'target\release\smallm.exe'
-            if (-not (Test-Path $exe)) { throw 'the build finished without leaving a smallm.exe' }
-            Install-Exe -From $exe -Prefix $Prefix
+        Write-Log 'Found' ((& cargo --version) -join ' ')
+        if ($Checkout) {
+            $source = (Get-Location).Path
+            Write-Log 'Building' "the checkout in $source"
         }
-        finally {
-            if ($temp -and $source -and (Test-Path $source)) {
-                Remove-Item -Recurse -Force $source -ErrorAction SilentlyContinue
-            }
+        else {
+            if (-not (Have 'git')) { throw 'git is needed to fetch the source' }
+            $source = Join-Path $screen.Work 'src'
+            $code = Invoke-Logged 42 48 'fetching the source' 'git' @('clone', '--depth', '1', '--branch', $Ref, $Repo, $source)
+            if ($code -ne 0) { throw "could not clone $Repo ($Ref)" }
+            $count = (Get-ChildItem -Path $source -Recurse -File | Where-Object { $_.FullName -notmatch '\\\.git\\' }).Count
+            Write-Log 'Fetched' ('{0} ({1}), {2} files' -f $Repo, $Ref, $count)
         }
+        $manifest = Join-Path $source 'Cargo.toml'
+        $code = Invoke-Logged 50 97 'compiling' 'cargo' @('build', '--release', '--locked', '--manifest-path', $manifest, '--bin', 'smallm')
+        if ($code -ne 0) { throw 'the build failed. The lines above say why' }
+        $exe = Join-Path $source 'target\release\smallm.exe'
+        if (-not (Test-Path $exe)) { throw 'the build finished without leaving a smallm.exe' }
+        Write-Log 'Built' ('smallm.exe, {0}' -f (Format-Bytes (Get-Item $exe).Length))
+        Set-Progress 98 'installing'
+        Install-Exe -From $exe -Prefix $Prefix
     }
 
     # Put $Prefix on the user's PATH, for good and for this window. The user
@@ -179,7 +378,7 @@ param([switch]$Uninstall)
         $parts = @($user -split ';' | Where-Object { $_ })
         if ($parts -notcontains $Prefix) {
             [Environment]::SetEnvironmentVariable('PATH', (@($parts + $Prefix) -join ';'), 'User')
-            Write-Host "added $Prefix to your PATH, so new terminals will find smallm"
+            Write-Log 'Path' "added $Prefix to your PATH, so new terminals will find smallm"
         }
         if (@($env:PATH -split ';') -notcontains $Prefix) {
             $env:PATH = "$env:PATH;$Prefix"
@@ -202,13 +401,13 @@ param([switch]$Uninstall)
         if ($Uninstall) {
             if (Test-Path $binary) {
                 Remove-Item -Force $binary -ErrorAction Stop
-                Write-Host "removed $binary"
+                Write-Log 'Removed' $binary
             }
             else {
-                Write-Host "no smallm.exe in $prefix"
+                Write-Log 'Absent' "no smallm.exe in $prefix"
             }
             Remove-FromPath -Prefix $prefix
-            Write-Host 'Downloaded models are kept, in %LOCALAPPDATA%\smallm. Delete that folder to remove them.'
+            Write-Log 'Kept' 'downloaded models, in %LOCALAPPDATA%\smallm. Delete that folder to remove them.'
             return
         }
 
@@ -227,13 +426,18 @@ param([switch]$Uninstall)
         }
         if (-not (Test-Path $binary)) { throw "expected a binary at $binary" }
 
+        Set-Progress 100 'installed'
+        $version = (& $binary version) -join ' '
+        Write-Log 'Installed' ('{0} in {1}' -f $version, $binary)
+        Clear-Bar
+        $screen.Live = $false
         Add-ToPath -Prefix $prefix
-        Write-Host ''
-        Write-Host "installed $binary"
-        Write-Host 'get a model:   smallm pull bartowski/SmolLM2-135M-Instruct-GGUF'
-        Write-Host 'chat with it:  smallm run SmolLM2-135M'
+        Write-Log 'Next' 'get a model:   smallm pull bartowski/SmolLM2-135M-Instruct-GGUF'
+        Write-Log '' 'chat with it:  smallm run SmolLM2-135M'
     }
 
+    $screen.Work = Join-Path ([IO.Path]::GetTempPath()) ('smallm-' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $screen.Work | Out-Null
     try {
         Install-Smallm
         # A clean code when it worked. The download path runs no program of
@@ -241,10 +445,15 @@ param([switch]$Uninstall)
         $global:LASTEXITCODE = 0
     }
     catch {
-        Write-Host ''
-        Write-Host "install: $($_.Exception.Message)" -ForegroundColor Red
+        Clear-Bar
+        $screen.Live = $false
+        Write-Warn 'Failed' $_.Exception.Message
         # Not exit, which would close the window. A failed exit code is
         # still there for anything that checks: a CI job, a script.
         $global:LASTEXITCODE = 1
+    }
+    finally {
+        Clear-Bar
+        Remove-Item -Recurse -Force $screen.Work -ErrorAction SilentlyContinue
     }
 } $Uninstall.IsPresent

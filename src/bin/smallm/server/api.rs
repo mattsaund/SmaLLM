@@ -267,12 +267,12 @@ impl Server {
             });
             match result {
                 Ok(stats) => {
-                    http::send_event(
-                        out,
-                        &envelope
-                            .chunk(None, None, Some(finish_reason(stats.finish)))
-                            .to_text(),
-                    )?;
+                    log_request(&id, &stats);
+                    let mut last = envelope.chunk(None, None, Some(finish_reason(stats.finish)));
+                    if let Json::Object(members) = &mut last {
+                        members.push(("timings".to_string(), timings(&stats)));
+                    }
+                    http::send_event(out, &last.to_text())?;
                     if job.include_usage {
                         http::send_event(out, &envelope.usage_chunk(&stats).to_text())?;
                     }
@@ -287,7 +287,10 @@ impl Server {
                 true
             });
             match result {
-                Ok(stats) => send_json(out, 200, &envelope.complete(&text, &stats)),
+                Ok(stats) => {
+                    log_request(&id, &stats);
+                    send_json(out, 200, &envelope.complete(&text, &stats))
+                }
                 Err(error) => send_error(out, 500, &error.to_string()),
             }
         }
@@ -481,6 +484,7 @@ impl Envelope<'_> {
         let mut members = self.base(object);
         members.push(("choices".to_string(), Json::Array(vec![choice])));
         members.push(("usage".to_string(), usage(stats)));
+        members.push(("timings".to_string(), timings(stats)));
         Json::Object(members)
     }
 
@@ -541,6 +545,42 @@ fn usage(stats: &Stats) -> Json {
             Json::Number((stats.prompt_tokens + stats.generated_tokens) as f64),
         ),
     ])
+}
+
+/// How long the prompt and the answer took, in the shape llama.cpp's server
+/// reports it, so that clients written for it read the same numbers. The
+/// context fields are SmaLLM's own.
+fn timings(stats: &Stats) -> Json {
+    let prompt_n = stats.prompt_tokens - stats.reused_tokens;
+    let prompt_ms = stats.prompt_time.as_secs_f64() * 1e3;
+    let predicted_ms = stats.generate_time.as_secs_f64() * 1e3;
+    let per_token = |ms: f64, n: usize| if n == 0 { 0.0 } else { ms / n as f64 };
+    Json::object([
+        ("cache_n", Json::Number(stats.reused_tokens as f64)),
+        ("prompt_n", Json::Number(prompt_n as f64)),
+        ("prompt_ms", Json::Number(prompt_ms)),
+        (
+            "prompt_per_token_ms",
+            Json::Number(per_token(prompt_ms, prompt_n)),
+        ),
+        ("prompt_per_second", Json::Number(stats.prompt_speed())),
+        ("predicted_n", Json::Number(stats.generated_tokens as f64)),
+        ("predicted_ms", Json::Number(predicted_ms)),
+        (
+            "predicted_per_token_ms",
+            Json::Number(per_token(predicted_ms, stats.generated_tokens)),
+        ),
+        ("predicted_per_second", Json::Number(stats.generate_speed())),
+        ("context_n", Json::Number(stats.context_tokens as f64)),
+        ("context_size", Json::Number(stats.context_size as f64)),
+        ("context_bytes", Json::Number(stats.context_bytes as f64)),
+    ])
+}
+
+/// Prints one line per answered request on the server's console: its speed
+/// and how full the context is.
+fn log_request(id: &str, stats: &Stats) {
+    eprintln!("{id}: {}", crate::commands::stats_line(stats));
 }
 
 /// The API's name for why a generation ended.
@@ -653,6 +693,9 @@ mod tests {
             generated_tokens: 3,
             generate_time: Duration::ZERO,
             finish: Finish::Length,
+            context_tokens: 8,
+            context_size: 64,
+            context_bytes: 1024,
         }
     }
 
@@ -691,6 +734,10 @@ mod tests {
                 .as_usize(),
             Some(8)
         );
+        let timings = full.get("timings").unwrap();
+        assert_eq!(timings.get("prompt_n").unwrap().as_usize(), Some(5));
+        assert_eq!(timings.get("predicted_n").unwrap().as_usize(), Some(3));
+        assert_eq!(timings.get("context_size").unwrap().as_usize(), Some(64));
 
         let chunk = chat.chunk(None, Some("x"), None);
         let choice = &chunk.get("choices").unwrap().as_array().unwrap()[0];

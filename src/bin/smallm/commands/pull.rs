@@ -1,14 +1,21 @@
 //! `smallm pull`, `list` and `rm`: manage downloaded models.
 //!
 //! Downloads go through `curl`, which every supported system ships. That
-//! keeps a TLS stack and an HTTP client out of this program.
+//! keeps a TLS stack and an HTTP client out of this program. curl hands the
+//! bytes over through a pipe, and this program writes them to disk, hashes
+//! them and draws the progress, so the screen shows one log and one bar
+//! whatever curl would have printed.
 
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
 use crate::args::Args;
 use crate::json::Json;
 use crate::models::{self, human_bytes};
+use crate::screen::{Screen, clock};
+use crate::sha256::Sha256;
 
 /// Quantizations to prefer when the user names none, best first. Q4_K_M is
 /// the usual balance of size and quality.
@@ -160,8 +167,16 @@ fn curl_missing(error: std::io::Error) -> String {
     }
 }
 
-/// Lists the files of a Hugging Face repository as `(path, size)` pairs.
-fn repo_files(repo: &str) -> Result<Vec<(String, u64)>, String> {
+/// One file of a Hugging Face repository.
+struct RepoFile {
+    path: String,
+    size: u64,
+    /// The SHA-256 Hugging Face publishes for large files.
+    sha256: Option<String>,
+}
+
+/// Lists the files of a Hugging Face repository.
+fn repo_files(repo: &str) -> Result<Vec<RepoFile>, String> {
     let listing = curl_text(&format!(
         "https://huggingface.co/api/models/{repo}/tree/main?recursive=true"
     ))?;
@@ -174,40 +189,207 @@ fn repo_files(repo: &str) -> Result<Vec<(String, u64)>, String> {
         .iter()
         .filter(|entry| entry.get("type").and_then(Json::as_str) == Some("file"))
         .filter_map(|entry| {
-            let path = entry.get("path")?.as_str()?.to_string();
-            let size = entry.get("size").and_then(Json::as_f64).unwrap_or(0.0) as u64;
-            Some((path, size))
+            let lfs = entry.get("lfs");
+            Some(RepoFile {
+                path: entry.get("path")?.as_str()?.to_string(),
+                size: entry.get("size").and_then(Json::as_f64).unwrap_or(0.0) as u64,
+                sha256: lfs
+                    .and_then(|lfs| lfs.get("oid"))
+                    .and_then(Json::as_str)
+                    .filter(|oid| oid.len() == 64)
+                    .map(str::to_lowercase),
+            })
         })
         .collect())
 }
 
-/// Downloads `url` to `dest`, resuming a partial download when there is one.
-fn download(url: &str, dest: &Path) -> Result<(), String> {
-    let partial = dest.with_extension("gguf.part");
-    let status = Command::new("curl")
+/// The size of the file at `url`, from the headers of a request that reads
+/// none of it. `None` when the server does not say.
+fn remote_size(url: &str) -> Option<u64> {
+    let output = Command::new("curl")
         .args([
             "--fail",
+            "--silent",
             "--location",
-            "--progress-bar",
-            "--continue-at",
-            "-",
-            "--output",
+            "--head",
+            "--max-time",
+            "60",
+            url,
         ])
-        .arg(&partial)
-        .arg(url)
         .stdin(Stdio::null())
-        .status()
+        .output()
+        .ok()?;
+    // After redirects, the last length is the file's own.
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .rev()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse().ok())?
+        })
+}
+
+/// What to fetch, and what is known about it in advance.
+struct Download<'a> {
+    url: &'a str,
+    /// Bytes in all, or zero when unknown.
+    size: u64,
+    sha256: Option<&'a str>,
+}
+
+/// Downloads to `dest`, resuming a partial download when there is one.
+///
+/// The bytes come through curl's output, so this function writes them,
+/// hashes them and reports progress itself. A download that is cut off
+/// stays as `<name>.gguf.part`, and running the command again resumes it.
+fn download(screen: &mut Screen, item: &Download<'_>, dest: &Path) -> Result<(), String> {
+    let partial = dest.with_extension("gguf.part");
+    let mut already = std::fs::metadata(&partial).map_or(0, |meta| meta.len());
+    if item.size > 0 && already > item.size {
+        // Longer than the file can be: not a piece of it.
+        let _ = std::fs::remove_file(&partial);
+        already = 0;
+    }
+
+    // A resumed download hashes the part it already has.
+    let mut hasher = Sha256::new();
+    if already > 0 && item.sha256.is_some() {
+        screen.log(
+            "Rereading",
+            &format!("{} already downloaded", human_bytes(already)),
+        );
+        let mut file = std::fs::File::open(&partial)
+            .map_err(|error| format!("could not read {}: {error}", partial.display()))?;
+        let mut buffer = vec![0u8; 1 << 20];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .map_err(|error| format!("could not read {}: {error}", partial.display()))?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+    }
+    if already > 0 {
+        screen.log(
+            "Resuming",
+            &format!("at {} of {}", human_bytes(already), human_bytes(item.size)),
+        );
+    }
+
+    let mut command = Command::new("curl");
+    command.args([
+        "--fail",
+        "--location",
+        "--silent",
+        "--show-error",
+        "--retry",
+        "3",
+    ]);
+    if already > 0 {
+        command.args(["--continue-at", &already.to_string()]);
+    }
+    let mut child = command
+        .arg(item.url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(curl_missing)?;
+    let mut output = child.stdout.take().ok_or("curl gave no output")?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&partial)
+        .map_err(|error| format!("could not write {}: {error}", partial.display()))?;
+
+    screen.begin(item.size, already);
+    let mut received = already;
+    // A log line every tenth of the way, so the progress also reads as text.
+    let step = (item.size / 10).max(1);
+    let mut next_mark = (already / step + 1) * step;
+    let mut buffer = vec![0u8; 1 << 20];
+    loop {
+        let read = output
+            .read(&mut buffer)
+            .map_err(|error| format!("the download broke off: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        file.write_all(&buffer[..read])
+            .map_err(|error| format!("could not write {}: {error}", partial.display()))?;
+        hasher.update(&buffer[..read]);
+        received += read as u64;
+        screen.advance(read as u64);
+        if item.size > 0 && received >= next_mark && received < item.size {
+            screen.log(
+                "Received",
+                &format!(
+                    "{} of {} ({}%), {}/s",
+                    human_bytes(received),
+                    human_bytes(item.size),
+                    received * 100 / item.size,
+                    human_bytes(screen.speed() as u64)
+                ),
+            );
+            next_mark = (received / step + 1) * step;
+        }
+    }
+    file.flush()
+        .map_err(|error| format!("could not write {}: {error}", partial.display()))?;
+    let mut complaint = String::new();
+    if let Some(mut errors) = child.stderr.take() {
+        let _ = errors.read_to_string(&mut complaint);
+    }
+    let status = child
+        .wait()
+        .map_err(|error| format!("could not run curl: {error}"))?;
     if !status.success() {
         return Err(format!(
-            "the download failed. Run the command again to resume it. ({status})"
+            "the download failed: {}. Run the command again to resume it.",
+            complaint.trim().trim_start_matches("curl: ")
         ));
     }
+    screen.log(
+        "Received",
+        &format!(
+            "{} in {} ({}/s)",
+            human_bytes(received),
+            clock(screen.elapsed()),
+            human_bytes(screen.speed() as u64)
+        ),
+    );
+    if item.size > 0 && received != item.size {
+        return Err(format!(
+            "the download stopped at {} of {}. Run the command again to resume it.",
+            human_bytes(received),
+            human_bytes(item.size)
+        ));
+    }
+
+    if let Some(expected) = item.sha256 {
+        let actual = hasher.finish();
+        if actual != expected {
+            let _ = std::fs::remove_file(&partial);
+            return Err(format!(
+                "the download is damaged: its SHA-256 is {actual}, not {expected}. \
+                 It was deleted. Run the command again to download it anew."
+            ));
+        }
+        screen.log(
+            "Verified",
+            &format!("SHA-256 {} matches Hugging Face", short_hash(&actual)),
+        );
+    }
+
     // A model file starts with the letters GGUF. Anything else is an error
     // page or a wrong link.
     let mut magic = [0u8; 4];
     let is_model = std::fs::File::open(&partial)
-        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut magic))
+        .and_then(|mut file| file.read_exact(&mut magic))
         .is_ok_and(|()| &magic == b"GGUF");
     if !is_model {
         let _ = std::fs::remove_file(&partial);
@@ -217,25 +399,66 @@ fn download(url: &str, dest: &Path) -> Result<(), String> {
         .map_err(|error| format!("could not save {}: {error}", dest.display()))
 }
 
+/// The start and the end of a hash, which is enough to compare by eye.
+fn short_hash(hash: &str) -> String {
+    if hash.len() > 16 {
+        format!("{}...{}", &hash[..8], &hash[hash.len() - 8..])
+    } else {
+        hash.to_string()
+    }
+}
+
 pub fn pull(raw: impl Iterator<Item = String>) -> Result<(), String> {
     let args = Args::parse(raw, &[])?;
     let source = parse_source(args.positional(0).ok_or_else(pull_help)?)?;
-    let (url, file_name) = match source {
+    let mut screen = Screen::new();
+    let (url, file_name, mut size, sha256) = match source {
         Source::Url(url) => {
             let path = url.split(['?', '#']).next().unwrap_or(&url);
             let name = path.rsplit('/').next().unwrap_or_default().to_string();
             if !name.to_lowercase().ends_with(".gguf") {
                 return Err("the URL must point at a .gguf file".to_string());
             }
-            (url, name)
+            (url, name, 0, None)
         }
         Source::Repo { repo, tag } => {
-            eprintln!("looking up {repo} on Hugging Face");
-            let path = choose_file(&repo_files(&repo)?, tag.as_deref())?;
+            screen.log("Resolving", &format!("{repo} on Hugging Face"));
+            let files = repo_files(&repo)?;
+            let models = files
+                .iter()
+                .filter(|file| file.path.to_lowercase().ends_with(".gguf"))
+                .count();
+            screen.log(
+                "Found",
+                &format!("{} files, {models} of them GGUF", files.len()),
+            );
+            let listing: Vec<(String, u64)> = files
+                .iter()
+                .map(|file| (file.path.clone(), file.size))
+                .collect();
+            let path = choose_file(&listing, tag.as_deref())?;
+            let chosen = files
+                .iter()
+                .find(|file| file.path == path)
+                .ok_or("the chosen file is not in the listing")?;
+            screen.log(
+                "Choosing",
+                &format!(
+                    "{path} ({}){}",
+                    human_bytes(chosen.size),
+                    if tag.is_none() {
+                        ", the default size and quality"
+                    } else {
+                        ""
+                    }
+                ),
+            );
             let name = path.rsplit('/').next().unwrap_or(&path).to_string();
             (
                 format!("https://huggingface.co/{repo}/resolve/main/{path}"),
                 name,
+                chosen.size,
+                chosen.sha256.clone(),
             )
         }
     };
@@ -244,14 +467,54 @@ pub fn pull(raw: impl Iterator<Item = String>) -> Result<(), String> {
     std::fs::create_dir_all(&dir)
         .map_err(|error| format!("could not create {}: {error}", dir.display()))?;
     let dest = dir.join(&file_name);
-    let name = file_name.strip_suffix(".gguf").unwrap_or(&file_name);
+    let name = file_name
+        .strip_suffix(".gguf")
+        .unwrap_or(&file_name)
+        .to_string();
     if dest.is_file() {
-        println!("{name} is already downloaded. Run it with: smallm run {name}");
+        screen.log(
+            "Present",
+            &format!("{} is already downloaded", dest.display()),
+        );
+        screen.finish();
+        println!("Run it with: smallm run {name}");
         return Ok(());
     }
-    eprintln!("downloading {file_name} to {}", dir.display());
-    download(&url, &dest)?;
-    println!("downloaded {name}. Run it with: smallm run {name}");
+    if size == 0 {
+        screen.log("Asking", &format!("{url} for its size"));
+        size = remote_size(&url).unwrap_or(0);
+    }
+    screen.log("Downloading", &url);
+    screen.log(
+        "Into",
+        &format!(
+            "{}{}",
+            dest.display(),
+            if size > 0 {
+                format!(", {}", human_bytes(size))
+            } else {
+                String::new()
+            }
+        ),
+    );
+    let item = Download {
+        url: &url,
+        size,
+        sha256: sha256.as_deref(),
+    };
+    download(&mut screen, &item, &dest)?;
+
+    // Say whether this version of the engine can run what arrived.
+    match smallm::Model::load(&dest) {
+        Ok(model) => screen.log("Checked", &super::describe(&model)),
+        Err(error) => screen.warn(
+            "Warning",
+            &format!("this version of smallm cannot run it yet: {error}"),
+        ),
+    }
+    screen.log("Saved", &dest.display().to_string());
+    screen.finish();
+    println!("Run it with: smallm run {name}");
     Ok(())
 }
 
