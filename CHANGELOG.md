@@ -15,9 +15,14 @@ Each version is a `v` tag, with ready-made binaries and libraries on its
   llama.cpp's (cosine similarity 0.9999996 or better).
 - **Encoder tokenizers.** WordPiece (BERT) and Unigram (T5, XLM-RoBERTa),
   both matching llama.cpp token for token on its test texts.
-- **Gemma 2 and Phi-3.** `gemma2` caps attention scores and windows every
+- **Weight formats.** The i-quants IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S,
+  IQ3_XXS, IQ3_S and IQ4_XS, the ternary TQ1_0 and TQ2_0, and MXFP4. Each
+  expands to exactly ggml's numbers, which a test checks for every format.
+- **Gemma 2 and Phi.** `gemma2` caps attention scores and windows every
   other layer. `phi3` covers Phi-3, Phi-3.5 and Phi-4-mini, with LongRoPE's
-  two sets of rotary divisors chosen by the context length.
+  two sets of rotary divisors chosen by the context length. `phi2` covers
+  Phi-2 and Phi-1.5: LayerNorm, and attention and the feed-forward network
+  side by side.
 - **gpt-oss.** Attention sinks, biased experts, OpenAI's clamped SwiGLU and
   the Harmony chat format.
 - **YaRN** position scaling, which gpt-oss and DeepSeek use and some Qwen

@@ -258,8 +258,14 @@ fn phi_2_q4_k_m() {
 }
 
 #[test]
+fn gpt_oss_20b_mxfp4() {
+    check("gpt-oss-20b-MXFP4");
+}
+
+#[test]
 fn every_golden_file_has_a_test() {
     let tested = [
+        "gpt-oss-20b-MXFP4",
         "phi-2.Q4_K_M",
         "gemma-2-2b-it-Q4_K_M",
         "microsoft_Phi-4-mini-instruct-Q4_K_M",
