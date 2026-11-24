@@ -24,9 +24,10 @@
 use super::TensorType;
 use super::f16::{bf16_to_f32, f16_to_f32};
 use super::iq_tables::{
-    IQ1S_GRID, IQ1S_LEVELS, IQ2_LEVELS, IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3S_LEVELS,
-    IQ3XXS_GRID, IQ3XXS_LEVELS, MXFP4_LEVELS,
+    IQ1S_GRID, IQ1S_LEVELS, IQ2_LEVELS, IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID,
 };
+// The SIMD kernels look MXFP4 levels up themselves.
+pub(crate) use super::iq_tables::MXFP4_LEVELS;
 
 /// One decoded group of weights. Formats with blocks of 32 fill the first
 /// 32 values of `q` and the first 2 scales and offsets. Formats with blocks
@@ -279,12 +280,33 @@ impl Tile {
     }
 
     /// A row of `row_bytes` zero bytes. In every format it decodes to
-    /// weights of zero.
+    /// weights of zero, though not always to integer weights of zero: a
+    /// zero nibble of IQ4_NL is the level -127, times a scale of zero.
     pub fn blank_row(&mut self, row_bytes: usize) -> &[u8] {
         if self.blank.len() < row_bytes {
             self.blank.resize(row_bytes, 0);
         }
         &self.blank[..row_bytes]
+    }
+
+    /// Zeroes the weights, scales and offsets of rows `first..height`. That
+    /// is how [`fill`](Self::fill) leaves the rows it is not given, so a
+    /// faster fill that reads them from a [`blank_row`](Self::blank_row)
+    /// calls this to end up with the same tile.
+    pub fn clear_rows(&mut self, first: usize) {
+        let height = self.height;
+        if first >= height {
+            return;
+        }
+        for run in self.q.chunks_exact_mut(4 * height) {
+            run[4 * first..].fill(0);
+        }
+        for scales in self.scale.chunks_exact_mut(height) {
+            scales[first..].fill(0.0);
+        }
+        for offsets in self.offset.chunks_exact_mut(height) {
+            offsets[first..].fill(0.0);
+        }
     }
 
     /// Fills the tile with the rows stored in `data`, `row_bytes` apart.
@@ -657,37 +679,89 @@ fn even_signs(stored: u32) -> u8 {
     seven | (((seven.count_ones() & 1) as u8) << 7)
 }
 
-/// Writes eight weights to the start of `out`, negating those whose bit is
-/// set in `signs`.
+// The grid decoders handle a group of eight weights as the eight bytes of
+// a 64-bit word, first weight in the lowest byte. Expanding a grid code,
+// applying signs and storing then take a few word operations for all
+// eight weights together.
+
+/// Builds the table that expands one byte of a packed grid code, four
+/// 2-bit indices into `levels`, into a word of those four levels, first
+/// level in the lowest byte. Runs when compiling.
+const fn quads(levels: [i8; 4]) -> [u32; 256] {
+    let mut table = [0u32; 256];
+    let mut byte = 0;
+    while byte < 256 {
+        let mut j = 0;
+        while j < 4 {
+            let level = levels[(byte >> (2 * j)) & 3] as u8;
+            table[byte] |= (level as u32) << (8 * j);
+            j += 1;
+        }
+        byte += 1;
+    }
+    table
+}
+
+/// Eight times each of `levels`. See [`put_iq1`].
+const fn eight_times(levels: [i8; 4]) -> [i8; 4] {
+    let mut j = 0;
+    let mut times = [0i8; 4];
+    while j < 4 {
+        times[j] = 8 * levels[j];
+        j += 1;
+    }
+    times
+}
+
+/// The four magnitudes of each byte of an IQ2 grid code.
+static IQ2_QUADS: [u32; 256] = quads(IQ2_LEVELS);
+
+/// Eight times the four values of each byte of an IQ1 grid code.
+static IQ1_QUADS: [u32; 256] = quads(eight_times(IQ1S_LEVELS));
+
+/// Expands a packed grid code to its eight values, through a table of
+/// [`quads`].
 #[inline(always)]
-fn put_signed(out: &mut [i8], values: [i8; 8], signs: u8) {
-    for (j, (out, value)) in out[..8].iter_mut().zip(values).enumerate() {
-        *out = if signs & (1 << j) != 0 { -value } else { value };
+fn expand(quads: &[u32; 256], code: u16) -> u64 {
+    quads[(code & 0xff) as usize] as u64 | (quads[(code >> 8) as usize] as u64) << 32
+}
+
+/// Negates the weights of a group whose bit is set in `signs`, all eight at
+/// once. Every byte must lie between 1 and 127, so that negating one never
+/// borrows from its neighbor. The grid magnitudes all do.
+#[inline(always)]
+fn apply_signs(values: u64, signs: u8) -> u64 {
+    // Byte `j` keeps bit `j` of the signs.
+    let spread = (signs as u64).wrapping_mul(0x0101_0101_0101_0101) & 0x8040_2010_0804_0201;
+    // Adding 0x7f sets the top bit of the bytes whose bit is set, and no
+    // byte overflows into the next.
+    let top = (spread + 0x7f7f_7f7f_7f7f_7f7f) & 0x8080_8080_8080_8080;
+    let mask = (top >> 7) * 0xff;
+    // Negating is inverting and adding one.
+    (values ^ mask) + (mask & 0x0101_0101_0101_0101)
+}
+
+/// Adds two groups of eight weights byte by byte, without carries from one
+/// byte into the next: the low 7 bits are added, and the top bit of each
+/// byte is worked out on its own.
+#[inline(always)]
+fn add_bytes(a: u64, b: u64) -> u64 {
+    const TOP: u64 = 0x8080_8080_8080_8080;
+    ((a & !TOP) + (b & !TOP)) ^ ((a ^ b) & TOP)
+}
+
+/// Writes a group of eight weights to the start of `out`.
+#[inline(always)]
+fn put8(out: &mut [i8], group: u64) {
+    for (out, byte) in out[..8].iter_mut().zip(group.to_le_bytes()) {
+        *out = byte as i8;
     }
 }
 
-/// The eight magnitudes of an IQ2 grid code, 2 bits each, first weight in
-/// the lowest bits.
+/// The eight magnitudes of an IQ3 group: two grid entries of four.
 #[inline(always)]
-fn iq2_values(code: u16) -> [i8; 8] {
-    let mut values = [0; 8];
-    for (j, value) in values.iter_mut().enumerate() {
-        *value = IQ2_LEVELS[(code >> (2 * j)) as usize & 3];
-    }
-    values
-}
-
-/// The eight magnitudes of two IQ3 grid codes, `first` then `second`, each
-/// four weights of 3 bits read through `levels`. The IQ3 formats take a
-/// group of eight from two codes.
-#[inline(always)]
-fn iq3_values(levels: &[i8; 8], first: u16, second: u16) -> [i8; 8] {
-    let mut values = [0; 8];
-    for j in 0..4 {
-        values[j] = levels[(first >> (3 * j)) as usize & 7];
-        values[j + 4] = levels[(second >> (3 * j)) as usize & 7];
-    }
-    values
+fn iq3_pair(grid: &[u32], first: usize, second: usize) -> u64 {
+    grid[first] as u64 | (grid[second] as u64) << 32
 }
 
 /// The scale of a group in IQ2 and IQ3_XXS, `d * (0.5 + nibble) * factor`.
@@ -710,9 +784,9 @@ pub(crate) fn decode_iq2_xxs(block: &[u8], out: &mut Group) {
         let word = u32::from_le_bytes([b[at + 4], b[at + 5], b[at + 6], b[at + 7]]);
         set_affine(out, 2 * ib, 2, half_step_scale(d, word >> 28, 0.25), 0.0);
         for l in 0..4 {
-            let values = iq2_values(IQ2XXS_GRID[b[at + l] as usize]);
+            let values = expand(&IQ2_QUADS, IQ2XXS_GRID[b[at + l] as usize]);
             let signs = even_signs(word >> (7 * l));
-            put_signed(&mut out.q[32 * ib + 8 * l..], values, signs);
+            put8(&mut out.q[32 * ib + 8 * l..], apply_signs(values, signs));
         }
     }
 }
@@ -739,9 +813,9 @@ pub(crate) fn decode_iq2_xs(block: &[u8], out: &mut Group) {
         for l in 0..4 {
             let at = 2 + 2 * (4 * ib + l);
             let word = u16::from_le_bytes([b[at], b[at + 1]]);
-            let values = iq2_values(IQ2XS_GRID[(word & 511) as usize]);
+            let values = expand(&IQ2_QUADS, IQ2XS_GRID[(word & 511) as usize]);
             let signs = even_signs((word >> 9) as u32);
-            put_signed(&mut out.q[32 * ib + 8 * l..], values, signs);
+            put8(&mut out.q[32 * ib + 8 * l..], apply_signs(values, signs));
         }
     }
 }
@@ -760,8 +834,9 @@ pub(crate) fn decode_iq2_s(block: &[u8], out: &mut Group) {
         let high = b[66 + ib] as usize;
         for l in 0..4 {
             let index = b[2 + 4 * ib + l] as usize | ((high << (8 - 2 * l)) & 0x300);
-            let values = iq2_values(IQ2S_GRID[index]);
-            put_signed(&mut out.q[32 * ib + 8 * l..], values, b[34 + 4 * ib + l]);
+            let values = expand(&IQ2_QUADS, IQ2S_GRID[index]);
+            let signs = b[34 + 4 * ib + l];
+            put8(&mut out.q[32 * ib + 8 * l..], apply_signs(values, signs));
         }
     }
 }
@@ -778,11 +853,11 @@ pub(crate) fn decode_iq3_xxs(block: &[u8], out: &mut Group) {
         let word = u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
         set_affine(out, 2 * ib, 2, half_step_scale(d, word >> 28, 0.5), 0.0);
         for l in 0..4 {
-            let first = IQ3XXS_GRID[b[2 + 8 * ib + 2 * l] as usize];
-            let second = IQ3XXS_GRID[b[3 + 8 * ib + 2 * l] as usize];
-            let values = iq3_values(&IQ3XXS_LEVELS, first, second);
+            let first = b[2 + 8 * ib + 2 * l] as usize;
+            let second = b[3 + 8 * ib + 2 * l] as usize;
+            let values = iq3_pair(&IQ3XXS_GRID, first, second);
             let signs = even_signs(word >> (7 * l));
-            put_signed(&mut out.q[32 * ib + 8 * l..], values, signs);
+            put8(&mut out.q[32 * ib + 8 * l..], apply_signs(values, signs));
         }
     }
 }
@@ -803,31 +878,34 @@ pub(crate) fn decode_iq3_s(block: &[u8], out: &mut Group) {
         for l in 0..4 {
             let first = b[2 + 8 * ib + 2 * l] as usize | ((high << (8 - 2 * l)) & 256);
             let second = b[3 + 8 * ib + 2 * l] as usize | ((high << (7 - 2 * l)) & 256);
-            let values = iq3_values(&IQ3S_LEVELS, IQ3S_GRID[first], IQ3S_GRID[second]);
-            put_signed(&mut out.q[32 * ib + 8 * l..], values, b[74 + 4 * ib + l]);
+            let values = iq3_pair(&IQ3S_GRID, first, second);
+            let signs = b[74 + 4 * ib + l];
+            put8(&mut out.q[32 * ib + 8 * l..], apply_signs(values, signs));
         }
     }
 }
 
 /// Writes the eight weights of an IQ1 grid code to the start of `out`, as
-/// `8 * grid + delta`.
+/// `8 * grid + delta`. `delta` is [`iq1_delta`].
 ///
 /// IQ1 weights are `dl * (grid + delta / 8)`, with grid values of -1, 0 or
 /// 1 and a delta of -1 or 1. Eight times `grid + delta / 8` is a small
 /// integer, and the scale becomes `dl / 8`. Both steps are exact, so the
 /// weight comes out as the same float ggml computes.
 #[inline(always)]
-fn put_iq1(out: &mut [i8], code: u16, delta: i8) {
-    for (j, out) in out[..8].iter_mut().enumerate() {
-        *out = 8 * IQ1S_LEVELS[(code >> (2 * j)) as usize & 3] + delta;
-    }
+fn put_iq1(out: &mut [i8], code: u16, delta: u64) {
+    put8(out, add_bytes(expand(&IQ1_QUADS, code), delta));
 }
 
-/// The delta of an IQ1 group of 8, in eighths: -1 when its sign bit is
-/// set, else 1. See [`put_iq1`].
+/// The delta of an IQ1 group of 8, in eighths, in each of eight bytes: -1
+/// when its sign bit is set, else 1. See [`put_iq1`].
 #[inline(always)]
-fn iq1_delta(negative: bool) -> i8 {
-    if negative { -1 } else { 1 }
+fn iq1_delta(negative: bool) -> u64 {
+    if negative {
+        u64::MAX
+    } else {
+        0x0101_0101_0101_0101
+    }
 }
 
 /// IQ1_S, 50 bytes: half scale, 32 bytes of low index bits, then a 16-bit
@@ -905,41 +983,45 @@ pub(crate) fn decode_tq2_0(block: &[u8], out: &mut Group) {
     set_affine(out, 0, 16, half(b, 64), 0.0);
 }
 
-/// Digit `n` of a TQ1_0 byte, as -1, 0 or 1.
-///
-/// A byte holds up to five base-3 digits as a fraction of 256, the first
-/// digit most significant. Multiplying by 3 to the `n`, modulo 256, moves
-/// digit `n` to the top, and 3 times that, over 256, is the digit.
-#[inline(always)]
-fn trit(byte: u8, n: usize) -> i8 {
-    const POWERS: [u8; 5] = [1, 3, 9, 27, 81];
-    let shifted = byte.wrapping_mul(POWERS[n]);
-    ((shifted as u16 * 3) >> 8) as i8 - 1
-}
-
 /// TQ1_0, 54 bytes: 48 bytes of five weights each, 4 bytes of four weights
 /// each, then a half scale. The bytes come in runs of 32, 16 and 4. Digit
 /// `n` of byte `m` in a run is weight `n * run + m` of that run's weights.
 /// weight = d * digit
 pub(crate) fn decode_tq1_0(block: &[u8], out: &mut Group) {
     let b: &[u8; 54] = block.try_into().expect("TQ1_0 block is 54 bytes");
-    let mut at = 0;
-    for (start, len, digits) in [(0, 32, 5), (32, 16, 5), (48, 4, 4)] {
-        for n in 0..digits {
-            for &byte in &b[start..start + len] {
-                out.q[at] = trit(byte, n);
-                at += 1;
-            }
+    let (first, rest) = out.q.split_at_mut(160);
+    let (second, third) = rest.split_at_mut(80);
+    put_trits::<32>(b[..32].try_into().expect("a run of 32"), 5, first);
+    put_trits::<16>(b[32..48].try_into().expect("a run of 16"), 5, second);
+    put_trits::<4>(b[48..52].try_into().expect("a run of 4"), 4, third);
+    set_affine(out, 0, 16, half(b, 52), 0.0);
+}
+
+/// Writes `digits` digits of each byte of a TQ1_0 run as -1, 0 or 1: digit
+/// `n` of byte `m` goes to `out[n * LEN + m]`.
+///
+/// A byte holds its digits as a fraction of 256, the first digit most
+/// significant. Tripling the byte carries the next digit into the high
+/// byte of the product, and leaves the digits still to come in the low
+/// byte. This is ggml's `byte * 3^n` modulo 256, one factor at a time.
+/// Each digit is one loop over the run, which the compiler vectorizes.
+#[inline(always)]
+fn put_trits<const LEN: usize>(bytes: &[u8; LEN], digits: usize, out: &mut [i8]) {
+    let mut rest = *bytes;
+    for weights in out.chunks_exact_mut(LEN).take(digits) {
+        for (weight, rest) in weights.iter_mut().zip(rest.iter_mut()) {
+            let tripled = *rest as u16 * 3;
+            *weight = (tripled >> 8) as i8 - 1;
+            *rest = tripled as u8;
         }
     }
-    set_affine(out, 0, 16, half(b, 52), 0.0);
 }
 
 /// Reads an E8M0 exponent `e` as 2 to the `e - 128`, half the power of two
 /// it stands for. The MXFP4 levels are doubled, and this halves them back.
 /// The two smallest exponents give subnormal floats, as in ggml.
 #[inline]
-fn e8m0_half(e: u8) -> f32 {
+pub(crate) fn e8m0_half(e: u8) -> f32 {
     let bits = if e < 2 {
         0x0020_0000u32 << e
     } else {
@@ -1147,29 +1229,28 @@ mod tests {
 
     /// The 64-bit FNV-1a hash, which `tools/gen_iq_tables.py` records for
     /// each of ggml's grids.
-    fn fnv1a(bytes: impl IntoIterator<Item = i8>) -> u64 {
+    fn fnv1a(bytes: impl IntoIterator<Item = u8>) -> u64 {
         bytes.into_iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
-            (hash ^ byte as u8 as u64).wrapping_mul(0x0100_0000_01b3)
+            (hash ^ byte as u64).wrapping_mul(0x0100_0000_01b3)
         })
     }
 
     #[test]
     fn grid_codes_unpack_to_the_bytes_of_ggml_grids() {
         use crate::tensor::iq_tables::GRID_HASHES;
-        // Each grid unpacked with the helper its decoders use.
-        let iq2 = |grid: &[u16]| -> Vec<i8> { grid.iter().flat_map(|&c| iq2_values(c)).collect() };
-        let iq3 = |levels: &[i8; 8], grid: &[u16]| -> Vec<i8> {
-            let quads = grid.iter().map(|&code| iq3_values(levels, code, code));
-            quads
-                .flat_map(|values| values.into_iter().take(4))
-                .collect()
+        // Each grid expanded with the helpers its decoders use.
+        let iq2 = |grid: &[u16]| -> Vec<u8> {
+            let groups = grid.iter().map(|&code| expand(&IQ2_QUADS, code));
+            groups.flat_map(u64::to_le_bytes).collect()
         };
-        let iq1 = |grid: &[u16]| -> Vec<i8> {
+        let iq3 = |grid: &[u32]| -> Vec<u8> { grid.iter().flat_map(|w| w.to_le_bytes()).collect() };
+        let iq1 = |grid: &[u16]| -> Vec<u8> {
             let mut weights = [0i8; 8];
             let mut all = Vec::new();
             for &code in grid {
+                // A delta of zero leaves eight times the grid values.
                 put_iq1(&mut weights, code, 0);
-                all.extend(weights.iter().map(|weight| weight / 8));
+                all.extend(weights.iter().map(|weight| (weight / 8) as u8));
             }
             all
         };
@@ -1178,12 +1259,39 @@ mod tests {
                 "IQ2XXS" => iq2(&IQ2XXS_GRID),
                 "IQ2XS" => iq2(&IQ2XS_GRID),
                 "IQ2S" => iq2(&IQ2S_GRID),
-                "IQ3XXS" => iq3(&IQ3XXS_LEVELS, &IQ3XXS_GRID),
-                "IQ3S" => iq3(&IQ3S_LEVELS, &IQ3S_GRID),
+                "IQ3XXS" => iq3(&IQ3XXS_GRID),
+                "IQ3S" => iq3(&IQ3S_GRID),
                 "IQ1S" => iq1(&IQ1S_GRID),
                 _ => panic!("no grid named {name}"),
             };
             assert_eq!(fnv1a(unpacked), hash, "{name}");
+        }
+    }
+
+    #[test]
+    fn word_operations_match_byte_by_byte_ones() {
+        // Every sign byte on magnitudes from 1 to 127, and byte sums that
+        // cross zero in both directions.
+        let magnitudes = [1u8, 8, 25, 43, 62, 127, 4, 15];
+        let values = u64::from_le_bytes(magnitudes);
+        for signs in 0..=255u8 {
+            let got = apply_signs(values, signs).to_le_bytes();
+            for j in 0..8 {
+                let expected = if signs & (1 << j) != 0 {
+                    -(magnitudes[j] as i8)
+                } else {
+                    magnitudes[j] as i8
+                };
+                assert_eq!(got[j] as i8, expected, "signs {signs:#04x} byte {j}");
+            }
+        }
+        let a = [-8i8, 0, 8, -8, 0, 8, 127, -128];
+        for b in [[1i8; 8], [-1i8; 8], [5, -5, 7, -7, 1, -1, 0, 0]] {
+            let word = |bytes: [i8; 8]| u64::from_le_bytes(bytes.map(|v| v as u8));
+            let got = add_bytes(word(a), word(b)).to_le_bytes();
+            for j in 0..8 {
+                assert_eq!(got[j] as i8, a[j].wrapping_add(b[j]), "{a:?} + {b:?}");
+            }
         }
     }
 
