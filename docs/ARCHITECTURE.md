@@ -117,6 +117,24 @@ y      = sum over taps i of kernel[i] * (b * s)[position - taps + 1 + i]
 mix    = (c * y) * Wout
 ```
 
+Mamba blocks (Mamba, Falcon Mamba, Mamba 2, and most blocks of Granite 4.0
+H) carry a state of fixed size from one position to the next, and most
+Mamba models have no feed-forward network:
+
+```
+x z    = h * Wx, h * Wz
+x      = silu(conv(x) + bias)            over the last few positions
+dt     = softplus(time step)             per head and token
+s      = s * exp(dt * A) + dt * x * B    a row of the state per channel
+mix    = [norm] ((s . C + D * x) * silu(z)) * Wout
+```
+
+The scan runs the tokens in order, but its heads are independent, so the
+threads split it by heads, and each takes its heads through the whole
+batch while their state stays in its cache. The projections around it read
+the batch at once, like every other multiply. `model/forward/mamba.rs` has
+the details.
+
 A few architectures change the block a little. Switches cover them, not
 code of their own:
 

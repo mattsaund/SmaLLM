@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 use crate::gguf::Gguf;
 
 /// Architectures this engine runs, as named in `general.architecture`.
-pub const ARCHITECTURES: [&str; 18] = [
+pub const ARCHITECTURES: [&str; 21] = [
     "llama",
     "qwen2",
     "qwen3",
@@ -30,6 +30,9 @@ pub const ARCHITECTURES: [&str; 18] = [
     "phi3",
     "gpt-oss",
     "phi2",
+    "mamba",
+    "mamba2",
+    "granitehybrid",
 ];
 
 /// Which two elements of an attention head a rotary embedding rotates
@@ -103,6 +106,66 @@ pub enum Mixer {
     /// A short causal convolution over the last few positions, gated, as in
     /// Liquid AI's LFM models. It keeps a small state instead of a cache.
     ShortConv,
+    /// A Mamba block: a short convolution, then a scan that folds every
+    /// position into a recurrent state of fixed size (see `forward/mamba.rs`).
+    Mamba(Ssm),
+}
+
+/// The shape of a Mamba block, a selective state space model.
+///
+/// The block widens the hidden state to `inner` channels. A short causal
+/// convolution mixes each channel with its last few positions, and a scan
+/// then carries a state of `state` floats per channel from one position to
+/// the next. How fast that state decays depends on the token, through a
+/// time step the block computes for each one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ssm {
+    /// Mamba 2: the channels form heads, and the state of a head decays by
+    /// one rate per token. In Mamba 1, every channel is a head of its own,
+    /// and each element of its state decays at its own rate.
+    pub mamba2: bool,
+    /// Channels of the widened signal.
+    pub inner: usize,
+    /// Floats of state per channel.
+    pub state: usize,
+    /// Positions the convolution sums, the current one included.
+    pub conv_kernel: usize,
+    /// Mamba 1: the width the time step is projected down to and back up
+    /// from. Mamba 2: the number of heads, each with one time step.
+    pub dt_rank: usize,
+    /// Groups of heads that share the input and output maps of the state,
+    /// B and C. One in Mamba 1.
+    pub groups: usize,
+    /// The time step, B and C are RMS-normalized, without gains, before
+    /// they are used (Falcon Mamba).
+    pub dt_b_c_norm: bool,
+}
+
+impl Ssm {
+    /// Heads, each with one time step per token.
+    pub fn heads(&self) -> usize {
+        if self.mamba2 {
+            self.dt_rank
+        } else {
+            self.inner
+        }
+    }
+
+    /// Channels the convolution mixes: the signal, and in Mamba 2 also the
+    /// B and C of every group, which go through it with the signal.
+    pub fn conv_channels(&self) -> usize {
+        if self.mamba2 {
+            self.inner + 2 * self.groups * self.state
+        } else {
+            self.inner
+        }
+    }
+
+    /// Floats a block keeps between positions: the convolution's inputs at
+    /// the last `conv_kernel - 1` positions, then the scan's state.
+    pub fn state_floats(&self) -> usize {
+        (self.conv_kernel - 1) * self.conv_channels() + self.inner * self.state
+    }
 }
 
 /// The shape of one block.
@@ -258,7 +321,13 @@ impl Config {
         let n_ff = meta
             .per_layer("feed_forward_length", n_layer)
             .unwrap_or_else(|_| vec![0; n_layer]);
-        if n_head.iter().any(|&heads| heads == 0 || heads > 1 << 16) {
+        // Mamba models have no attention, which their files say with zero
+        // heads.
+        let attention_free = matches!(arch.as_str(), "mamba" | "mamba2");
+        if n_head
+            .iter()
+            .any(|&heads| (heads == 0 && !attention_free) || heads > 1 << 16)
+        {
             return Err(Error::format(format!(
                 "missing or invalid metadata: {arch}.attention.head_count"
             )));
@@ -270,7 +339,7 @@ impl Config {
         let head_dim = meta
             .usize("attention.key_length")
             .filter(|&width| width > 0)
-            .unwrap_or(n_embd / n_head[0]);
+            .unwrap_or(n_embd / n_head[0].max(1));
         let head_dim_local = meta.usize("attention.key_length_swa").unwrap_or(head_dim);
         for (key, width) in [
             ("attention.value_length", head_dim),
@@ -353,6 +422,14 @@ impl Config {
             layer.rope_factors = false;
             layer.attention_scale = 1.0 / (head_dim_local as f32).sqrt();
         };
+        // Turns a layer into a Mamba block, which has no attention heads.
+        let make_mamba = |layer: &mut LayerSpec, ssm: Ssm| {
+            layer.mixer = Mixer::Mamba(ssm);
+            layer.n_head = 0;
+            layer.n_head_kv = 0;
+            layer.rope_dims = 0;
+            layer.rope_factors = false;
+        };
 
         match arch.as_str() {
             // Llama weights are stored so that neighbors rotate together.
@@ -366,7 +443,7 @@ impl Config {
                     layer.rope_dims = 0;
                 }
             }
-            "granite" | "granitemoe" => {
+            "granite" | "granitemoe" | "granitehybrid" => {
                 config.rope = Rope::Pairs;
                 config.embedding_scale = meta.f32("embedding_scale").unwrap_or(1.0);
                 config.residual_scale = meta.f32("residual_scale").unwrap_or(1.0);
@@ -375,6 +452,32 @@ impl Config {
                     for layer in &mut config.layers {
                         layer.attention_scale = scale;
                     }
+                }
+                // Granite 4.0 H: a layer without key/value heads is a
+                // Mamba 2 block. The attention blocks rotate only when the
+                // file says the model was trained with rotation, as llama.cpp
+                // reads it.
+                if arch == "granitehybrid" {
+                    let ssm = meta.ssm(true)?;
+                    let rotates = file
+                        .get_bool(&meta.key("rope.scaling.finetuned"))
+                        .unwrap_or(true);
+                    for layer in &mut config.layers {
+                        if layer.n_head_kv == 0 {
+                            make_mamba(layer, ssm);
+                        } else if !rotates {
+                            layer.rope_dims = 0;
+                            layer.rope_factors = false;
+                        }
+                    }
+                }
+            }
+            // Mamba, Falcon Mamba and Mamba 2: every block is a Mamba block,
+            // with no feed-forward network after it.
+            "mamba" | "mamba2" => {
+                let ssm = meta.ssm(arch == "mamba2")?;
+                for layer in &mut config.layers {
+                    make_mamba(layer, ssm);
                 }
             }
             "gemma2" => {
@@ -624,12 +727,13 @@ impl Config {
 
     /// Number of blocks of each mixer: attention, then convolution.
     pub fn mixers(&self) -> (usize, usize) {
-        let attention = self
-            .layers
-            .iter()
-            .filter(|layer| layer.mixer == Mixer::Attention)
-            .count();
-        (attention, self.n_layer - attention)
+        let count = |mixer: Mixer| {
+            self.layers
+                .iter()
+                .filter(|layer| layer.mixer == mixer)
+                .count()
+        };
+        (count(Mixer::Attention), count(Mixer::ShortConv))
     }
 }
 
@@ -735,6 +839,43 @@ impl Meta<'_> {
                 .filter(|&scale| scale != 0.0)
                 .unwrap_or(1.0),
         }))
+    }
+
+    /// The shape of the model's Mamba blocks, checked so that the buffers
+    /// and loops of the forward pass can rely on it.
+    fn ssm(&self, mamba2: bool) -> Result<Ssm> {
+        let ssm = Ssm {
+            mamba2,
+            inner: self.required("ssm.inner_size")?,
+            state: self.required("ssm.state_size")?,
+            conv_kernel: self.required("ssm.conv_kernel")?,
+            dt_rank: self.required("ssm.time_step_rank")?,
+            groups: if mamba2 {
+                self.required("ssm.group_count")?
+            } else {
+                1
+            },
+            dt_b_c_norm: self
+                .file
+                .get_bool(&self.key("ssm.dt_b_c_rms"))
+                .unwrap_or(false),
+        };
+        let heads = ssm.heads();
+        let fits = ssm.inner <= 1 << 16
+            && ssm.state <= 1 << 12
+            && ssm.inner * ssm.state <= 1 << 24
+            && ssm.conv_kernel <= 64
+            && ssm.dt_rank <= ssm.inner
+            && ssm.inner % heads == 0
+            && heads % ssm.groups == 0;
+        if !fits {
+            return Err(Error::format(format!(
+                "a Mamba block of {} channels with a state of {}, a convolution of {}, \
+                 {} heads and {} groups",
+                ssm.inner, ssm.state, ssm.conv_kernel, heads, ssm.groups
+            )));
+        }
+        Ok(ssm)
     }
 
     /// The rotary scaling type the file names, linear by default.
@@ -892,6 +1033,84 @@ mod tests {
         assert_eq!((c.conv_kernel, c.mixers()), (3, (1, 3)));
     }
 
+    /// A Mamba model's metadata, with the shape of its blocks: `[inner,
+    /// state, time step rank or heads, groups]`, and `heads` of attention.
+    fn mamba(arch: &str, shape: [u32; 4], heads: u32) -> Builder {
+        let key = |suffix: &str| format!("{arch}.{suffix}");
+        let mut builder = Builder::new();
+        builder
+            .string("general.architecture", arch)
+            .u32(&key("context_length"), 2048)
+            .u32(&key("embedding_length"), 64)
+            .u32(&key("block_count"), 3)
+            .u32(&key("attention.head_count"), heads)
+            .u32(&key("ssm.conv_kernel"), 4)
+            .u32(&key("ssm.inner_size"), shape[0])
+            .u32(&key("ssm.state_size"), shape[1])
+            .u32(&key("ssm.time_step_rank"), shape[2])
+            .u32(&key("ssm.group_count"), shape[3]);
+        builder
+    }
+
+    #[test]
+    fn mamba_blocks_have_their_shape() {
+        let c = config(&mamba("mamba2", [128, 16, 8, 2], 0)).unwrap();
+        let ssm = Ssm {
+            mamba2: true,
+            inner: 128,
+            state: 16,
+            conv_kernel: 4,
+            dt_rank: 8,
+            groups: 2,
+            dt_b_c_norm: false,
+        };
+        assert!(
+            c.layers
+                .iter()
+                .all(|layer| layer.mixer == Mixer::Mamba(ssm))
+        );
+        // B and C of each group go through the convolution with the signal.
+        assert_eq!(
+            (ssm.heads(), ssm.conv_channels(), ssm.state_floats()),
+            (8, 192, 3 * 192 + 128 * 16)
+        );
+        // Mamba 1 makes every channel a head, and ignores groups.
+        let mut builder = mamba("mamba", [128, 16, 4, 3], 0);
+        builder.bool("mamba.ssm.dt_b_c_rms", true);
+        let Mixer::Mamba(ssm) = config(&builder).unwrap().layers[0].mixer else {
+            panic!("a Mamba block");
+        };
+        assert_eq!((ssm.heads(), ssm.groups, ssm.dt_b_c_norm), (128, 1, true));
+        assert_eq!(ssm.state_floats(), 3 * 128 + 128 * 16);
+
+        // Heads must split the channels, and groups the heads.
+        for shape in [
+            [128, 16, 7, 1],
+            [128, 16, 8, 3],
+            [128, 0, 8, 1],
+            [1 << 20, 16, 8, 1],
+        ] {
+            assert!(config(&mamba("mamba2", shape, 0)).is_err(), "{shape:?}");
+        }
+    }
+
+    #[test]
+    fn granite_hybrids_mix_mamba_and_attention() {
+        let mut builder = mamba("granitehybrid", [128, 16, 8, 1], 8);
+        builder
+            .i32s("granitehybrid.attention.head_count_kv", &[0, 4, 0])
+            .bool("granitehybrid.rope.scaling.finetuned", false)
+            .f32("granitehybrid.residual_scale", 0.25);
+        let c = config(&builder).unwrap();
+        assert!(matches!(c.layers[0].mixer, Mixer::Mamba(ssm) if ssm.mamba2));
+        assert!(matches!(c.layers[2].mixer, Mixer::Mamba(_)));
+        // The attention block does not rotate, as the file asks.
+        let attention = &c.layers[1];
+        assert_eq!(attention.mixer, Mixer::Attention);
+        assert_eq!((attention.n_head_kv, attention.rope_dims), (4, 0));
+        assert_eq!((c.rope, c.residual_scale), (Rope::Pairs, 0.25));
+    }
+
     #[test]
     fn gemma4_layers_differ_by_kind_and_share_caches() {
         let mut builder = Builder::new();
@@ -923,9 +1142,9 @@ mod tests {
 
     #[test]
     fn unsupported_models_are_named() {
-        let error = config(&base("mamba")).unwrap_err().to_string();
+        let error = config(&base("bloom")).unwrap_err().to_string();
         assert!(
-            error.contains("mamba") && error.contains("qwen2"),
+            error.contains("bloom") && error.contains("qwen2"),
             "{error}"
         );
 

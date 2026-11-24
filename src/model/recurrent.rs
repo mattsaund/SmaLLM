@@ -13,7 +13,7 @@
 //! the state after the last prompt comes back and the reply is read again
 //! as one batch, which is quick.
 
-use super::config::Config;
+use super::config::{Config, Mixer};
 
 /// Saved states kept. Older ones are dropped first.
 pub const CHECKPOINTS: usize = 3;
@@ -21,7 +21,14 @@ pub const CHECKPOINTS: usize = 3;
 /// The floats of state each block keeps, zero for blocks that are not
 /// recurrent. Each recurrent mixer adds its arm here.
 pub fn state_sizes(config: &Config) -> Vec<usize> {
-    config.layers.iter().map(|_| 0).collect()
+    config
+        .layers
+        .iter()
+        .map(|layer| match layer.mixer {
+            Mixer::Mamba(ssm) => ssm.state_floats(),
+            _ => 0,
+        })
+        .collect()
 }
 
 /// The states of a session's recurrent blocks.
@@ -60,8 +67,6 @@ impl RecurrentState {
     }
 
     /// Block `layer`'s state, to read and update in place.
-    // The first recurrent mixer to use this removes the allowance.
-    #[allow(dead_code)]
     pub fn block(&mut self, layer: usize) -> &mut [f32] {
         let (start, size) = self.slots[layer];
         &mut self.state[start..start + size]

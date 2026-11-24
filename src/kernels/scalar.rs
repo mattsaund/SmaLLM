@@ -174,7 +174,7 @@ pub(super) unsafe fn mix_rows_impl(
 /// polynomial for `exp(r)`, and scales by `2^k` through the float's exponent
 /// bits. Inputs are clamped to the range where the result is a normal float.
 #[inline(always)]
-pub(super) fn exp_approx(x: f32) -> f32 {
+pub(crate) fn exp_approx(x: f32) -> f32 {
     const LOG2_E: f32 = std::f32::consts::LOG2_E;
     // ln(2) split in two so that `k * LN2_HIGH` is exact.
     const LN2_HIGH: f32 = 0.693_145_75;
@@ -184,7 +184,8 @@ pub(super) fn exp_approx(x: f32) -> f32 {
     const ROUND: f32 = 12_582_912.0;
 
     let x = x.clamp(-87.0, 88.0);
-    let k = (x * LOG2_E + ROUND) - ROUND;
+    let shifted = x * LOG2_E + ROUND;
+    let k = shifted - ROUND;
     let r = (x - k * LN2_HIGH) - k * LN2_LOW;
     // Taylor series of exp(r) to the sixth power, in Horner form.
     let mut p = 1.0 / 720.0;
@@ -194,7 +195,12 @@ pub(super) fn exp_approx(x: f32) -> f32 {
     p = p * r + 0.5;
     p = p * r + 1.0;
     p = p * r + 1.0;
-    let two_k = f32::from_bits(((k as i32 + 127) as u32) << 23);
+    // `shifted` holds `k` in its low bits, above the bits of `ROUND`, so
+    // `2^k` comes from integer arithmetic on them. A float to integer cast
+    // gives the same result, but Rust's cast saturates, which costs extra
+    // steps and kept loops from vectorizing well on plain x86-64.
+    let biased = shifted.to_bits().wrapping_sub(ROUND.to_bits() - 127);
+    let two_k = f32::from_bits(biased << 23);
     p * two_k
 }
 
