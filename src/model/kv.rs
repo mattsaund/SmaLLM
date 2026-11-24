@@ -12,9 +12,100 @@
 //! without a cache of its own, such as a convolution block, takes no space.
 //! Values may be narrower than keys, or absent: latent attention reads its
 //! values out of its keys.
+//!
+//! Keys and values are stored as 16-bit floats by default, which halves the
+//! memory and the reading of a long context. That is the precision
+//! llama.cpp keeps too. 32-bit floats keep them exactly as computed, which
+//! the tests that compare against exact math use.
+
+use std::ops::Range;
+
+use crate::kernels::{Kernels, Rows};
+use crate::tensor::f16::f16_to_f32;
 
 /// Positions held by one chunk.
 pub const CHUNK_POSITIONS: usize = 256;
+
+/// What the cache stores keys and values as.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CacheType {
+    /// IEEE 16-bit floats, rounded to nearest.
+    #[default]
+    F16,
+    /// 32-bit floats, as computed.
+    F32,
+}
+
+impl CacheType {
+    /// The name used on the command line and in the settings file.
+    pub fn name(self) -> &'static str {
+        match self {
+            CacheType::F16 => "f16",
+            CacheType::F32 => "f32",
+        }
+    }
+
+    /// The type a name stands for.
+    pub fn from_name(name: &str) -> Option<CacheType> {
+        match name {
+            "f16" => Some(CacheType::F16),
+            "f32" => Some(CacheType::F32),
+            _ => None,
+        }
+    }
+}
+
+/// One chunk of keys or values, in the cache's type.
+enum Chunk {
+    F32(Box<[f32]>),
+    F16(Box<[u16]>),
+}
+
+impl Chunk {
+    /// A chunk of `len` zeros. An empty chunk allocates nothing.
+    fn new(ty: CacheType, len: usize) -> Chunk {
+        match ty {
+            CacheType::F32 => Chunk::F32(vec![0.0; len].into_boxed_slice()),
+            CacheType::F16 => Chunk::F16(vec![0; len].into_boxed_slice()),
+        }
+    }
+
+    /// Bytes the chunk holds.
+    fn bytes(&self) -> usize {
+        match self {
+            Chunk::F32(values) => values.len() * size_of::<f32>(),
+            Chunk::F16(values) => values.len() * size_of::<u16>(),
+        }
+    }
+
+    /// The elements in `range`, for the attention kernels.
+    fn rows(&self, range: Range<usize>) -> Rows<'_> {
+        match self {
+            Chunk::F32(values) => Rows::F32(&values[range]),
+            Chunk::F16(values) => Rows::F16(&values[range]),
+        }
+    }
+
+    /// Stores `values` from element `at` on.
+    fn put(&mut self, at: usize, values: &[f32], kernels: &Kernels) {
+        match self {
+            Chunk::F32(stored) => stored[at..at + values.len()].copy_from_slice(values),
+            Chunk::F16(stored) => kernels.to_half(values, &mut stored[at..at + values.len()]),
+        }
+    }
+
+    /// Reads `out.len()` elements from element `at` on, widened.
+    fn get(&self, at: usize, out: &mut [f32]) {
+        match self {
+            Chunk::F32(stored) => out.copy_from_slice(&stored[at..at + out.len()]),
+            Chunk::F16(stored) => {
+                for (out, &half) in out.iter_mut().zip(&stored[at..]) {
+                    *out = f16_to_f32(half);
+                }
+            }
+        }
+    }
+}
 
 /// The keys and values of one head of one layer, as a list of chunks.
 ///
@@ -22,8 +113,8 @@ pub const CHUNK_POSITIONS: usize = 256;
 /// Attention reads one head at a time, so it walks a plain sequential run.
 #[derive(Default)]
 struct HeadCache {
-    keys: Vec<Box<[f32]>>,
-    values: Vec<Box<[f32]>>,
+    keys: Vec<Chunk>,
+    values: Vec<Chunk>,
 }
 
 /// Where one layer's heads are in the cache.
@@ -50,14 +141,22 @@ pub struct KvCache {
     value_dims: Vec<usize>,
     /// Positions that hold valid data.
     len: usize,
+    ty: CacheType,
+    /// Rounds keys and values to 16-bit floats.
+    kernels: &'static Kernels,
 }
 
 impl KvCache {
     /// An empty cache. `shapes` gives each layer's number of key/value
     /// heads, the width of their keys and the width of their values. Zero
     /// heads means the layer has no cache, and a value width of zero that
-    /// it keeps keys only.
-    pub fn new(shapes: &[(usize, usize, usize)]) -> KvCache {
+    /// it keeps keys only. `ty` says what keys and values are stored as, and
+    /// `kernels` does the rounding to 16-bit floats.
+    pub fn new(
+        shapes: &[(usize, usize, usize)],
+        ty: CacheType,
+        kernels: &'static Kernels,
+    ) -> KvCache {
         let mut layers = Vec::with_capacity(shapes.len());
         let mut head_dims = Vec::new();
         let mut value_dims = Vec::new();
@@ -77,6 +176,8 @@ impl KvCache {
             head_dims,
             value_dims,
             len: 0,
+            ty,
+            kernels,
         }
     }
 
@@ -89,12 +190,9 @@ impl KvCache {
     pub fn allocated_bytes(&self) -> usize {
         self.heads
             .iter()
-            .zip(self.head_dims.iter().zip(&self.value_dims))
-            .map(|(head, (dim, value_dim))| {
-                (head.keys.len() * dim + head.values.len() * value_dim) * CHUNK_POSITIONS
-            })
-            .sum::<usize>()
-            * std::mem::size_of::<f32>()
+            .flat_map(|head| head.keys.iter().chain(&head.values))
+            .map(Chunk::bytes)
+            .sum()
     }
 
     /// Makes room for positions `0..positions` in every layer.
@@ -103,11 +201,9 @@ impl KvCache {
         let dims = self.head_dims.iter().zip(&self.value_dims);
         for (head, (&dim, &value_dim)) in self.heads.iter_mut().zip(dims) {
             while head.keys.len() < chunks {
-                head.keys
-                    .push(vec![0.0; CHUNK_POSITIONS * dim].into_boxed_slice());
-                // An empty chunk allocates nothing.
+                head.keys.push(Chunk::new(self.ty, CHUNK_POSITIONS * dim));
                 head.values
-                    .push(vec![0.0; CHUNK_POSITIONS * value_dim].into_boxed_slice());
+                    .push(Chunk::new(self.ty, CHUNK_POSITIONS * value_dim));
             }
         }
     }
@@ -156,22 +252,24 @@ impl KvCache {
                 (position % CHUNK_POSITIONS) * dim,
             )
         };
+        let kernels = self.kernels;
         for (layer, shape) in self.layers.iter().enumerate() {
             let (dim, value_dim) = (shape.head_dim, shape.value_dim);
             let (mut row, mut value_row) = (vec![0.0; dim], vec![0.0; value_dim]);
             for head in &mut self.heads[shape.first..shape.first + shape.n_heads] {
                 // Moving down in increasing order never overwrites a row
-                // that is still to be moved.
+                // that is still to be moved. A 16-bit key is widened to be
+                // rotated and rounded again. A value comes back exactly.
                 for from in keep + discard..len {
                     let ((source, start), (target, place)) =
                         (at(from, dim), at(from - discard, dim));
-                    row.copy_from_slice(&head.keys[source][start..start + dim]);
+                    head.keys[source].get(start, &mut row);
                     fix_key(layer, &mut row);
-                    head.keys[target][place..place + dim].copy_from_slice(&row);
+                    head.keys[target].put(place, &row, kernels);
                     let ((source, start), (target, place)) =
                         (at(from, value_dim), at(from - discard, value_dim));
-                    value_row.copy_from_slice(&head.values[source][start..start + value_dim]);
-                    head.values[target][place..place + value_dim].copy_from_slice(&value_row);
+                    head.values[source].get(start, &mut value_row);
+                    head.values[target].put(place, &value_row, kernels);
                 }
             }
         }
@@ -189,24 +287,29 @@ impl KvCache {
             (position % CHUNK_POSITIONS) * dim,
             (position % CHUNK_POSITIONS) * value_dim,
         );
+        let kernels = self.kernels;
         let heads = &mut self.heads[shape.first..shape.first + shape.n_heads];
         for (index, head) in heads.iter_mut().enumerate() {
-            head.keys[chunk][start..start + dim].copy_from_slice(&key[index * dim..][..dim]);
-            head.values[chunk][value_start..value_start + value_dim]
-                .copy_from_slice(&value[index * value_dim..][..value_dim]);
+            head.keys[chunk].put(start, &key[index * dim..][..dim], kernels);
+            head.values[chunk].put(
+                value_start,
+                &value[index * value_dim..][..value_dim],
+                kernels,
+            );
         }
     }
 
     /// Calls `visit` with each stretch of contiguous positions in
     /// `first..end` of one head: the first position of the stretch, then
-    /// its keys and values, `head_dim` and `value_dim` floats per position.
+    /// its keys and values, `head_dim` and `value_dim` elements per
+    /// position, in the cache's type.
     pub fn for_each_run(
         &self,
         layer: usize,
         head: usize,
         first: usize,
         end: usize,
-        mut visit: impl FnMut(usize, &[f32], &[f32]),
+        mut visit: impl FnMut(usize, Rows<'_>, Rows<'_>),
     ) {
         let shape = self.layers[layer];
         let cache = &self.heads[shape.first + head];
@@ -219,8 +322,8 @@ impl KvCache {
             let run = run_end - position;
             visit(
                 position,
-                &cache.keys[chunk][offset * dim..(offset + run) * dim],
-                &cache.values[chunk][offset * value_dim..(offset + run) * value_dim],
+                cache.keys[chunk].rows(offset * dim..(offset + run) * dim),
+                cache.values[chunk].rows(offset * value_dim..(offset + run) * value_dim),
             );
             position = run_end;
         }
@@ -230,6 +333,21 @@ impl KvCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernels;
+
+    /// A cache that stores floats exactly, so tests can read back what
+    /// they wrote.
+    fn exact(shapes: &[(usize, usize, usize)]) -> KvCache {
+        KvCache::new(shapes, CacheType::F32, kernels::best())
+    }
+
+    /// Rows of either type as floats.
+    fn floats(rows: Rows<'_>) -> Vec<f32> {
+        match rows {
+            Rows::F32(values) => values.to_vec(),
+            Rows::F16(values) => values.iter().map(|&half| f16_to_f32(half)).collect(),
+        }
+    }
 
     /// A recognizable vector for a layer, head and position.
     fn pattern(layer: usize, head: usize, position: usize, dim: usize, offset: f32) -> Vec<f32> {
@@ -260,7 +378,7 @@ mod tests {
     #[test]
     fn written_positions_read_back_across_chunks() {
         let (layers, heads, dim, positions) = (2, 3, 4, CHUNK_POSITIONS * 2 + 17);
-        let mut cache = KvCache::new(&[(heads, dim, dim); 2]);
+        let mut cache = exact(&[(heads, dim, dim); 2]);
         assert_eq!(cache.len(), 0);
         fill(&mut cache, layers, heads, positions, dim);
         assert_eq!(cache.len(), positions);
@@ -269,6 +387,7 @@ mod tests {
             for head in 0..heads {
                 let mut seen = 0;
                 cache.for_each_run(layer, head, 0, positions, |first, keys, values| {
+                    let (keys, values) = (floats(keys), floats(values));
                     assert_eq!(first, seen);
                     for (i, (key, value)) in keys
                         .chunks_exact(dim)
@@ -288,7 +407,7 @@ mod tests {
     #[test]
     fn runs_respect_the_requested_window() {
         let dim = 2;
-        let mut cache = KvCache::new(&[(2, dim, dim)]);
+        let mut cache = exact(&[(2, dim, dim)]);
         fill(&mut cache, 1, 2, CHUNK_POSITIONS + 10, dim);
         let mut runs = Vec::new();
         cache.for_each_run(
@@ -297,6 +416,7 @@ mod tests {
             CHUNK_POSITIONS - 3,
             CHUNK_POSITIONS + 4,
             |first, keys, _| {
+                let keys = floats(keys);
                 runs.push((first, keys.len() / dim));
                 assert_eq!(&keys[..dim], pattern(0, 1, first, dim, 0.0));
             },
@@ -308,7 +428,7 @@ mod tests {
     #[test]
     fn memory_follows_the_filled_length() {
         let (layers, heads, dim) = (3, 2, 4);
-        let mut cache = KvCache::new(&[(heads, dim, dim); 3]);
+        let mut cache = exact(&[(heads, dim, dim); 3]);
         assert_eq!(cache.allocated_bytes(), 0);
         fill(&mut cache, layers, heads, 1, dim);
         let one_chunk = layers * heads * 2 * CHUNK_POSITIONS * dim * 4;
@@ -328,7 +448,7 @@ mod tests {
 
     #[test]
     fn shifting_closes_the_gap() {
-        let mut cache = KvCache::new(&[(1, 2, 2), (0, 0, 0)]);
+        let mut cache = exact(&[(1, 2, 2), (0, 0, 0)]);
         let positions = CHUNK_POSITIONS + 10;
         cache.reserve(positions);
         for position in 0..positions {
@@ -344,6 +464,7 @@ mod tests {
         assert_eq!(cache.len(), positions - 100);
         let mut seen = Vec::new();
         cache.for_each_run(0, 0, 0, cache.len(), |_, keys, values| {
+            let (keys, values) = (floats(keys), floats(values));
             for (key, value) in keys.chunks_exact(2).zip(values.chunks_exact(2)) {
                 seen.push((key[0], key[1], value[0]));
             }
@@ -359,16 +480,18 @@ mod tests {
     #[test]
     fn layers_can_differ_or_have_no_cache() {
         // A wide layer, a layer without a cache, and a narrow one.
-        let mut cache = KvCache::new(&[(1, 8, 8), (0, 0, 0), (2, 4, 4)]);
+        let mut cache = exact(&[(1, 8, 8), (0, 0, 0), (2, 4, 4)]);
         cache.reserve(1);
         cache.write(0, 0, &[1.0; 8], &[2.0; 8]);
         cache.write(2, 0, &[3.0; 8], &[4.0; 8]);
         cache.set_len(1);
         cache.for_each_run(0, 0, 0, 1, |_, keys, values| {
-            assert_eq!((keys, values), (&[1.0; 8][..], &[2.0; 8][..]));
+            let (keys, values) = (floats(keys), floats(values));
+            assert_eq!((keys, values), (vec![1.0; 8], vec![2.0; 8]));
         });
         cache.for_each_run(2, 1, 0, 1, |_, keys, values| {
-            assert_eq!((keys, values), (&[3.0; 4][..], &[4.0; 4][..]));
+            let (keys, values) = (floats(keys), floats(values));
+            assert_eq!((keys, values), (vec![3.0; 4], vec![4.0; 4]));
         });
         // Three heads of eight or four floats, keys and values.
         assert_eq!(
@@ -381,7 +504,7 @@ mod tests {
     fn values_can_be_narrower_than_keys_or_absent() {
         // A layer that keeps keys only, as latent attention does, and one
         // whose two heads have values half as wide as their keys.
-        let mut cache = KvCache::new(&[(1, 6, 0), (2, 4, 2)]);
+        let mut cache = exact(&[(1, 6, 0), (2, 4, 2)]);
         let positions = CHUNK_POSITIONS + 5;
         cache.reserve(positions);
         for position in 0..positions {
@@ -400,6 +523,7 @@ mod tests {
         cache.shift(2, 100, |_, key| key[0] += 1000.0);
         let mut seen = Vec::new();
         cache.for_each_run(0, 0, 0, cache.len(), |first, keys, values| {
+            let (keys, values) = (floats(keys), floats(values));
             assert!(values.is_empty());
             for (index, key) in keys.chunks_exact(6).enumerate() {
                 seen.push((first + index, key[0], key[5]));
@@ -409,6 +533,7 @@ mod tests {
         assert_eq!(seen[1], (1, 1.0, 1.0));
         assert_eq!(seen[2], (2, 1102.0, 102.0));
         cache.for_each_run(1, 1, 0, cache.len(), |first, keys, values| {
+            let (keys, values) = (floats(keys), floats(values));
             for (index, (key, value)) in
                 keys.chunks_exact(4).zip(values.chunks_exact(2)).enumerate()
             {
@@ -421,6 +546,38 @@ mod tests {
                 assert_eq!(key, [-p + moved, -p, -p, -p]);
                 assert_eq!(value, [-p - 0.5, -p - 0.5]);
             }
+        });
+    }
+
+    #[test]
+    fn half_caches_round_to_nearest_and_halve_the_memory() {
+        let shapes = [(2, 4, 4), (0, 0, 0)];
+        let mut half = KvCache::new(&shapes, CacheType::F16, kernels::best());
+        let mut full = exact(&shapes);
+        let key = [1.0, -0.5, 1.0 + 1.0 / 4096.0, 65504.0, 3.0, 1e-3, -2.0, 0.1];
+        let value = [0.25, 7.0, -7.0, 0.0, 1.0, 2.0, 3.0, 4.0];
+        for cache in [&mut half, &mut full] {
+            cache.reserve(3);
+            for position in 0..3 {
+                cache.write(0, position, &key, &value);
+            }
+            cache.set_len(3);
+        }
+        assert_eq!(half.allocated_bytes() * 2, full.allocated_bytes());
+        half.for_each_run(0, 1, 0, 3, |_, keys, values| {
+            let (keys, values) = (floats(keys), floats(values));
+            for (got, want) in keys.iter().zip(key[4..].iter().cycle()) {
+                assert_eq!(*got, f16_to_f32(crate::tensor::f16::f32_to_f16(*want)));
+            }
+            assert_eq!(values, [1.0, 2.0, 3.0, 4.0].repeat(3));
+        });
+        // Shifting keeps values exactly and rounds rotated keys again.
+        half.shift(0, 1, |_, key| key.iter_mut().for_each(|k| *k *= 2.0));
+        assert_eq!(half.len(), 2);
+        half.for_each_run(0, 0, 0, 2, |_, keys, values| {
+            let (keys, values) = (floats(keys), floats(values));
+            assert_eq!(keys[0], 2.0);
+            assert_eq!(values, [0.25, 7.0, -7.0, 0.0].repeat(2));
         });
     }
 }

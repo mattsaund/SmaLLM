@@ -22,7 +22,7 @@ use std::slice;
 use super::scalar;
 use super::{ActRef, DotQuant, Kernels, TileDot};
 use crate::tensor::TensorType;
-use crate::tensor::f16::f16_to_f32;
+use crate::tensor::f16::{f16_to_f32, f32_to_f16};
 use crate::tensor::quant::{self, Decoder, Group, Tile};
 
 /// Kernels for every CPU with AVX2.
@@ -40,6 +40,9 @@ const fn kernels(name: &'static str, tile_dot: TileDot) -> Kernels {
         sum_squares,
         dot_rows,
         mix_rows,
+        dot_rows_half,
+        mix_rows_half,
+        to_half,
         silu_mul,
         gelu_mul,
         softmax,
@@ -972,6 +975,180 @@ unsafe fn mix_rows(
                 }
             }
             h += group;
+        }
+    }
+}
+
+/// Eight 16-bit floats at `p`, widened to 32 bits by F16C.
+#[target_feature(enable = "avx2,fma,f16c")]
+#[inline]
+unsafe fn load_halves(p: *const u16) -> __m256 {
+    // SAFETY: the caller guarantees eight readable halves at `p`.
+    unsafe { _mm256_cvtph_ps(_mm_loadu_si128(p.cast())) }
+}
+
+/// [`dot_rows_group`] with rows of 16-bit floats.
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn dot_rows_half_group<const G: usize>(
+    queries: *const f32,
+    rows: *const u16,
+    n: usize,
+    len: usize,
+    scores: *mut f32,
+    stride: usize,
+) {
+    // SAFETY: as in `dot_rows_group`, with `n` rows of `len` halves.
+    unsafe {
+        for j in 0..n {
+            let row = rows.add(j * len);
+            let mut acc = [_mm256_setzero_ps(); G];
+            let mut i = 0;
+            while i + 8 <= len {
+                let values = load_halves(row.add(i));
+                for (g, acc) in acc.iter_mut().enumerate() {
+                    *acc = _mm256_fmadd_ps(values, _mm256_loadu_ps(queries.add(g * len + i)), *acc);
+                }
+                i += 8;
+            }
+            for (g, acc) in acc.iter().enumerate() {
+                let mut sum = hsum(*acc);
+                for t in i..len {
+                    sum += f16_to_f32(*row.add(t)) * *queries.add(g * len + t);
+                }
+                *scores.add(g * stride + j) = sum;
+            }
+        }
+    }
+}
+
+/// See [`Kernels::dot_rows_any`]. Queries are taken four at a time.
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn dot_rows_half(
+    queries: *const f32,
+    n_queries: usize,
+    rows: *const u16,
+    n: usize,
+    len: usize,
+    scores: *mut f32,
+    stride: usize,
+) {
+    let mut h = 0;
+    // SAFETY: forwarded contract, one group of queries at a time.
+    unsafe {
+        while h < n_queries {
+            let (q, s) = (queries.add(h * len), scores.add(h * stride));
+            match n_queries - h {
+                1 => dot_rows_half_group::<1>(q, rows, n, len, s, stride),
+                2 => dot_rows_half_group::<2>(q, rows, n, len, s, stride),
+                3 => dot_rows_half_group::<3>(q, rows, n, len, s, stride),
+                _ => dot_rows_half_group::<4>(q, rows, n, len, s, stride),
+            }
+            h += 4;
+        }
+    }
+}
+
+/// [`mix_rows_block`] with rows of 16-bit floats.
+#[target_feature(enable = "avx2,fma,f16c")]
+#[inline]
+unsafe fn mix_rows_half_block<const G: usize, const K: usize>(
+    weights: *const f32,
+    rows: *const u16,
+    n: usize,
+    len: usize,
+    outs: *mut f32,
+    stride: usize,
+) {
+    // SAFETY: as in `mix_rows_block`, with rows of halves.
+    unsafe {
+        let mut acc = [[_mm256_setzero_ps(); K]; G];
+        for (g, out) in acc.iter_mut().enumerate() {
+            for (k, part) in out.iter_mut().enumerate() {
+                *part = _mm256_loadu_ps(outs.add(g * len + k * 8));
+            }
+        }
+        for j in 0..n {
+            let row = rows.add(j * len);
+            let mut values = [_mm256_setzero_ps(); K];
+            for (k, value) in values.iter_mut().enumerate() {
+                *value = load_halves(row.add(k * 8));
+            }
+            for (g, out) in acc.iter_mut().enumerate() {
+                let weight = broadcast(weights.add(g * stride + j));
+                for (part, value) in out.iter_mut().zip(&values) {
+                    *part = _mm256_fmadd_ps(weight, *value, *part);
+                }
+            }
+        }
+        for (g, out) in acc.iter().enumerate() {
+            for (k, part) in out.iter().enumerate() {
+                _mm256_storeu_ps(outs.add(g * len + k * 8), *part);
+            }
+        }
+    }
+}
+
+/// See [`Kernels::mix_rows_any`]. Laid out like [`mix_rows`].
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn mix_rows_half(
+    weights: *const f32,
+    n_queries: usize,
+    rows: *const u16,
+    n: usize,
+    len: usize,
+    outs: *mut f32,
+    stride: usize,
+) {
+    let mut h = 0;
+    // SAFETY: forwarded contract, as in `mix_rows`.
+    unsafe {
+        while h < n_queries {
+            let group = (n_queries - h).min(3);
+            let (w, o) = (weights.add(h * stride), outs.add(h * len));
+            let mut i = 0;
+            while i + 32 <= len {
+                match group {
+                    1 => mix_rows_half_block::<1, 4>(w, rows.add(i), n, len, o.add(i), stride),
+                    2 => mix_rows_half_block::<2, 4>(w, rows.add(i), n, len, o.add(i), stride),
+                    _ => mix_rows_half_block::<3, 4>(w, rows.add(i), n, len, o.add(i), stride),
+                }
+                i += 32;
+            }
+            while i + 8 <= len {
+                match group {
+                    1 => mix_rows_half_block::<1, 1>(w, rows.add(i), n, len, o.add(i), stride),
+                    2 => mix_rows_half_block::<2, 1>(w, rows.add(i), n, len, o.add(i), stride),
+                    _ => mix_rows_half_block::<3, 1>(w, rows.add(i), n, len, o.add(i), stride),
+                }
+                i += 8;
+            }
+            for g in 0..group {
+                for j in 0..n {
+                    let weight = *w.add(g * stride + j);
+                    for t in i..len {
+                        *o.add(g * len + t) += weight * f16_to_f32(*rows.add(j * len + t));
+                    }
+                }
+            }
+            h += group;
+        }
+    }
+}
+
+/// See [`Kernels::to_half`]. F16C rounds to nearest, ties to even, as the
+/// portable conversion does.
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn to_half(x: *const f32, out: *mut u16, n: usize) {
+    let mut i = 0;
+    // SAFETY: the caller guarantees `n` reads and `n` writes.
+    unsafe {
+        while i + 8 <= n {
+            let halves = _mm256_cvtps_ph::<_MM_FROUND_TO_NEAREST_INT>(_mm256_loadu_ps(x.add(i)));
+            _mm_storeu_si128(out.add(i).cast(), halves);
+            i += 8;
+        }
+        for t in i..n {
+            *out.add(t) = f32_to_f16(*x.add(t));
         }
     }
 }

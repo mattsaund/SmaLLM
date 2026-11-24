@@ -15,6 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use smallm::chat::Template;
 use smallm::generate::{Finish, Overflow, Stats};
+use smallm::model::CacheType;
 use smallm::tensor::type_name;
 use smallm::{Model, SamplerConfig, SessionConfig};
 
@@ -22,7 +23,7 @@ use crate::args::{Args, Spec, switch, value};
 use crate::models;
 
 /// Options of every command that runs a model.
-pub const SESSION_SPECS: [Spec; 4] = [
+pub const SESSION_SPECS: [Spec; 5] = [
     value(
         "threads",
         Some('t'),
@@ -42,6 +43,11 @@ pub const SESSION_SPECS: [Spec; 4] = [
         "batch",
         Some('b'),
         "Prompt tokens evaluated together (default: 32)",
+    ),
+    value(
+        "cache-type",
+        None,
+        "What the key/value cache keeps: f16 (default, half the memory) or f32",
     ),
 ];
 
@@ -179,6 +185,11 @@ pub fn session_config(args: &Args) -> Result<SessionConfig, String> {
         batch_threads: args.number("threads-batch")?.unwrap_or(0),
         batch: args.number("batch")?.unwrap_or(0),
         kernels: None,
+        cache: match args.get("cache-type") {
+            None => CacheType::default(),
+            Some(name) => CacheType::from_name(name)
+                .ok_or_else(|| format!("unknown cache type '{name}'. Known: f16, f32"))?,
+        },
     })
 }
 

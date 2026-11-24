@@ -57,7 +57,7 @@ use crate::threads::{ThreadPool, default_batch_threads, default_threads};
 use super::Model;
 use super::config::{Activation, Config, Gating, LayerSpec, Mixer, Rope, Routing, Yarn};
 use super::conv::ConvState;
-use super::kv::KvCache;
+use super::kv::{CacheType, KvCache};
 use super::matmul::{ActScratch, Engine, Target};
 use super::recurrent::{self, RecurrentState};
 use super::rwkv::{self, RwkvScratch};
@@ -197,6 +197,9 @@ pub struct SessionConfig {
     pub batch: usize,
     /// The kernel backend. `None` picks the fastest one the CPU supports.
     pub kernels: Option<&'static Kernels>,
+    /// What the key/value cache stores: 16-bit floats by default, half the
+    /// memory of 32-bit ones.
+    pub cache: CacheType,
 }
 
 /// The rotary tables of one set of rotary settings.
@@ -746,7 +749,7 @@ impl Session {
             kernels,
             pool,
             batch_pool,
-            kv: KvCache::new(&shapes),
+            kv: KvCache::new(&shapes, config.cache, kernels),
             conv,
             recurrent,
             n_ctx,
@@ -1925,7 +1928,7 @@ fn attend(
         scores.resize(shared * stride, 0.0);
 
         kv.for_each_run(layer, kv_head, first, end, |run_first, keys, _| {
-            kernels.dot_rows(
+            kernels.dot_rows_any(
                 scaled,
                 keys,
                 head_dim,
@@ -1949,7 +1952,7 @@ fn attend(
         }
         out.fill(0.0);
         kv.for_each_run(layer, kv_head, first, end, |run_first, _, values| {
-            kernels.mix_rows(&scores[run_first - first..], values, head_dim, out, stride);
+            kernels.mix_rows_any(&scores[run_first - first..], values, head_dim, out, stride);
         });
     };
 

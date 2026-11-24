@@ -11,7 +11,7 @@ use std::slice;
 
 use super::{ActRef, DotQuant, Kernels};
 use crate::tensor::TensorType;
-use crate::tensor::f16::{bf16_to_f32, f16_to_f32};
+use crate::tensor::f16::{bf16_to_f32, f16_to_f32, f32_to_f16};
 use crate::tensor::quant::{self, Group, Tile};
 
 pub static KERNELS: Kernels = Kernels {
@@ -21,6 +21,9 @@ pub static KERNELS: Kernels = Kernels {
     sum_squares,
     dot_rows,
     mix_rows,
+    dot_rows_half,
+    mix_rows_half,
+    to_half,
     silu_mul,
     gelu_mul,
     softmax,
@@ -47,6 +50,9 @@ pub static EXACT: Kernels = Kernels {
     sum_squares,
     dot_rows,
     mix_rows,
+    dot_rows_half,
+    mix_rows_half,
+    to_half,
     silu_mul,
     gelu_mul,
     softmax,
@@ -138,6 +144,90 @@ pub(super) unsafe fn dot_rows_impl(
             unsafe {
                 *scores.add(h * stride + j) = dot_impl(queries.add(h * len), rows.add(j * len), len)
             };
+        }
+    }
+}
+
+/// Widens IEEE 16-bit float bits to an f32 without branches, so that the
+/// loops that use it vectorize. Exact for every input, like `f16_to_f32`:
+/// the magnitude bits are placed in an f32 and the exponent is rebiased by
+/// a multiply, which also turns half subnormals into f32 normals. Infinity
+/// and NaN come out of the multiply at 2^16 or more, and get the f32 top
+/// exponent back. This is Fabian Giesen's method.
+#[inline(always)]
+pub(super) fn half_to_f32(half: u16) -> f32 {
+    // 2^112: the difference of the two exponent biases.
+    const REBIAS: f32 = f32::from_bits((254 - 15) << 23);
+    // 2^16: halves with the top exponent land here or above.
+    const INF_NAN: f32 = f32::from_bits((127 + 16) << 23);
+    let magnitude = f32::from_bits(((half & 0x7fff) as u32) << 13) * REBIAS;
+    let mut bits = magnitude.to_bits();
+    if magnitude >= INF_NAN {
+        bits |= 255 << 23;
+    }
+    f32::from_bits(bits | (((half & 0x8000) as u32) << 16))
+}
+
+/// See [`Kernels::dot_rows_any`].
+#[inline(always)]
+pub(super) unsafe fn dot_rows_half_impl(
+    queries: *const f32,
+    n_queries: usize,
+    rows: *const u16,
+    n: usize,
+    len: usize,
+    scores: *mut f32,
+    stride: usize,
+) {
+    for j in 0..n {
+        // SAFETY: the caller guarantees `n` rows of `len` halves.
+        let row = unsafe { slice::from_raw_parts(rows.add(j * len), len) };
+        for h in 0..n_queries {
+            // SAFETY: the caller guarantees `n_queries` queries of `len`
+            // floats, and room for every score.
+            let query = unsafe { slice::from_raw_parts(queries.add(h * len), len) };
+            let mut lanes = [0.0f32; LANES];
+            let (mut q_chunks, mut r_chunks) = (query.chunks_exact(LANES), row.chunks_exact(LANES));
+            for (q, r) in (&mut q_chunks).zip(&mut r_chunks) {
+                for l in 0..LANES {
+                    lanes[l] += q[l] * half_to_f32(r[l]);
+                }
+            }
+            let mut sum = reduce(lanes);
+            for (q, r) in q_chunks.remainder().iter().zip(r_chunks.remainder()) {
+                sum += q * half_to_f32(*r);
+            }
+            // SAFETY: see above.
+            unsafe { *scores.add(h * stride + j) = sum };
+        }
+    }
+}
+
+/// See [`Kernels::mix_rows_any`].
+#[inline(always)]
+pub(super) unsafe fn mix_rows_half_impl(
+    weights: *const f32,
+    n_queries: usize,
+    rows: *const u16,
+    n: usize,
+    len: usize,
+    outs: *mut f32,
+    stride: usize,
+) {
+    for h in 0..n_queries {
+        // SAFETY: the caller guarantees `n_queries` outputs of `len` floats.
+        let out = unsafe { slice::from_raw_parts_mut(outs.add(h * len), len) };
+        for j in 0..n {
+            // SAFETY: as in `dot_rows_half_impl`.
+            let (weight, row) = unsafe {
+                (
+                    *weights.add(h * stride + j),
+                    slice::from_raw_parts(rows.add(j * len), len),
+                )
+            };
+            for (out, value) in out.iter_mut().zip(row) {
+                *out += weight * half_to_f32(*value);
+            }
         }
     }
 }
@@ -378,6 +468,40 @@ pub(super) unsafe fn dot_rows(
 ) {
     // SAFETY: forwarded contract.
     unsafe { dot_rows_impl(queries, n_queries, rows, n, len, scores, stride) }
+}
+
+pub(super) unsafe fn dot_rows_half(
+    queries: *const f32,
+    n_queries: usize,
+    rows: *const u16,
+    n: usize,
+    len: usize,
+    scores: *mut f32,
+    stride: usize,
+) {
+    // SAFETY: forwarded contract.
+    unsafe { dot_rows_half_impl(queries, n_queries, rows, n, len, scores, stride) }
+}
+
+pub(super) unsafe fn mix_rows_half(
+    weights: *const f32,
+    n_queries: usize,
+    rows: *const u16,
+    n: usize,
+    len: usize,
+    outs: *mut f32,
+    stride: usize,
+) {
+    // SAFETY: forwarded contract.
+    unsafe { mix_rows_half_impl(weights, n_queries, rows, n, len, outs, stride) }
+}
+
+/// See [`Kernels::to_half`].
+pub(super) unsafe fn to_half(x: *const f32, out: *mut u16, n: usize) {
+    for i in 0..n {
+        // SAFETY: the caller guarantees `n` reads and `n` writes.
+        unsafe { *out.add(i) = f32_to_f16(*x.add(i)) };
+    }
 }
 
 pub(super) unsafe fn mix_rows(

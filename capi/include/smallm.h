@@ -64,6 +64,8 @@ typedef struct smallm_session_params {
     uint32_t device;    /* Where to compute. 0 is the CPU, the only device. */
     uint32_t n_threads_batch; /* Threads to read prompts with. 0 picks every
                                  physical core, or n_threads when that is set. */
+    uint32_t cache_type; /* What the key/value cache keeps: 0 for 16-bit
+                            floats, half the memory, 1 for 32-bit floats. */
 } smallm_session_params;
 
 /* Options for choosing tokens. */

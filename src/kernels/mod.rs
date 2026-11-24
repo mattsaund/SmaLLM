@@ -94,6 +94,9 @@ pub struct Kernels {
     sum_squares: unsafe fn(x: *const f32, n: usize) -> f32,
     dot_rows: RowsFn,
     mix_rows: RowsFn,
+    dot_rows_half: RowsHalfFn,
+    mix_rows_half: RowsHalfFn,
+    to_half: unsafe fn(x: *const f32, out: *mut u16, n: usize),
     silu_mul: unsafe fn(gate: *mut f32, up: *const f32, n: usize),
     gelu_mul: unsafe fn(gate: *mut f32, up: *const f32, n: usize),
     softmax: unsafe fn(x: *mut f32, n: usize),
@@ -121,6 +124,41 @@ type RowsFn = unsafe fn(
     out: *mut f32,
     stride: usize,
 );
+
+/// [`RowsFn`] with rows of 16-bit floats, as a half-precision key/value
+/// cache holds them.
+type RowsHalfFn = unsafe fn(
+    per_query: *const f32,
+    n_queries: usize,
+    rows: *const u16,
+    n: usize,
+    len: usize,
+    out: *mut f32,
+    stride: usize,
+);
+
+/// Rows for the attention kernels, in 32-bit floats or in IEEE 16-bit
+/// floats stored as their bits.
+#[derive(Clone, Copy, Debug)]
+pub enum Rows<'a> {
+    F32(&'a [f32]),
+    F16(&'a [u16]),
+}
+
+impl Rows<'_> {
+    /// Elements in all the rows together.
+    pub fn len(&self) -> usize {
+        match self {
+            Rows::F32(rows) => rows.len(),
+            Rows::F16(rows) => rows.len(),
+        }
+    }
+
+    /// True when there are no elements.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
 
 /// Quantizes `n` floats to 8-bit integers in groups of `group` elements.
 ///
@@ -231,6 +269,80 @@ impl Kernels {
                 stride,
             )
         }
+    }
+
+    /// [`dot_rows`](Self::dot_rows) on rows of either precision.
+    #[inline]
+    pub fn dot_rows_any(
+        &self,
+        queries: &[f32],
+        rows: Rows<'_>,
+        len: usize,
+        scores: &mut [f32],
+        stride: usize,
+    ) {
+        let rows = match rows {
+            Rows::F32(rows) => return self.dot_rows(queries, rows, len, scores, stride),
+            Rows::F16(rows) => rows,
+        };
+        let (n_queries, n) = (queries.len() / len, rows.len() / len);
+        if n_queries == 0 || n == 0 {
+            return;
+        }
+        assert!(stride >= n && scores.len() >= (n_queries - 1) * stride + n);
+        // SAFETY: as in `dot_rows`.
+        unsafe {
+            (self.dot_rows_half)(
+                queries.as_ptr(),
+                n_queries,
+                rows.as_ptr(),
+                n,
+                len,
+                scores.as_mut_ptr(),
+                stride,
+            )
+        }
+    }
+
+    /// [`mix_rows`](Self::mix_rows) on rows of either precision.
+    #[inline]
+    pub fn mix_rows_any(
+        &self,
+        weights: &[f32],
+        rows: Rows<'_>,
+        len: usize,
+        outs: &mut [f32],
+        stride: usize,
+    ) {
+        let rows = match rows {
+            Rows::F32(rows) => return self.mix_rows(weights, rows, len, outs, stride),
+            Rows::F16(rows) => rows,
+        };
+        let (n_queries, n) = (outs.len() / len, rows.len() / len);
+        if n_queries == 0 || n == 0 {
+            return;
+        }
+        assert!(stride >= n && weights.len() >= (n_queries - 1) * stride + n);
+        // SAFETY: as in `dot_rows`.
+        unsafe {
+            (self.mix_rows_half)(
+                weights.as_ptr(),
+                n_queries,
+                rows.as_ptr(),
+                n,
+                len,
+                outs.as_mut_ptr(),
+                stride,
+            )
+        }
+    }
+
+    /// Rounds `x` to 16-bit floats in `out`, to nearest with ties to even.
+    #[inline]
+    pub fn to_half(&self, x: &[f32], out: &mut [u16]) {
+        let n = x.len().min(out.len());
+        // SAFETY: `x` is valid for `n` reads and `out` for `n` writes.
+        unsafe { (self.to_half)(x.as_ptr(), out.as_mut_ptr(), n) }
     }
 
     /// `gate[i] = silu(gate[i]) * up[i]`, the SwiGLU gate.

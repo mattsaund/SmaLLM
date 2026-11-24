@@ -16,6 +16,7 @@
 
 use std::sync::Arc;
 
+use smallm::model::CacheType;
 use smallm::{Model, Session, SessionConfig};
 
 /// How the logits compare.
@@ -65,6 +66,13 @@ fn logits(model: &Arc<Model>, ids: &[u32], batch: usize, exact: bool) -> Vec<f32
         n_ctx: ids.len() + 8,
         batch,
         kernels: exact.then(smallm::kernels::exact),
+        // Float math keeps the cache exact too. Otherwise the default
+        // 16-bit cache is used, as llama.cpp's is.
+        cache: if exact {
+            CacheType::F32
+        } else {
+            CacheType::F16
+        },
         ..Default::default()
     };
     let mut session = Session::new(Arc::clone(model), config).expect("session");

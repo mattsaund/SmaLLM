@@ -39,6 +39,7 @@ pub use config::{
 };
 pub use encoder::{ENCODERS, Embedder, Pooling, normalize};
 pub use forward::{Phase, Profile, Session, SessionConfig};
+pub use kv::CacheType;
 pub use weights::{
     Absorb, AttentionWeights, ChannelMix, ConvWeights, Dense, ExpertMatrix, Experts, FeedForward,
     HeadMatrix, Layer, Linear, LowRank, MambaWeights, Matrix, MixerWeights, MlaWeights,

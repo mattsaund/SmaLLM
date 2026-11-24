@@ -76,6 +76,8 @@ fn load(spec: &TinyModel) -> Arc<Model> {
     Arc::new(Model::from_bytes(spec.build()).expect("the synthetic model loads"))
 }
 
+/// A session whose cache keeps keys and values exactly, so that it can be
+/// held to the f64 oracle.
 fn session(
     model: &Arc<Model>,
     threads: usize,
@@ -87,6 +89,7 @@ fn session(
         threads,
         batch,
         kernels,
+        cache: CacheType::F32,
         ..Default::default()
     };
     Session::new(Arc::clone(model), config).unwrap()
@@ -1380,6 +1383,7 @@ fn batching_and_threads_do_not_change_the_result() {
             threads: 1,
             batch_threads: 5,
             batch: 32,
+            cache: CacheType::F32,
             ..Default::default()
         };
         let mut split = Session::new(Arc::clone(&model), config).unwrap();
@@ -2001,4 +2005,39 @@ fn recurrent_states_are_saved_where_chats_go_back_to() {
     session.eval(&next[11..]).unwrap();
     assert_eq!(session.tokens(), &next[..]);
     assert_eq!(session.saved_positions(), [next.len() - 1]);
+}
+
+/// The default cache rounds keys and values to 16-bit floats. That moves
+/// the logits by about a thousandth, as in llama.cpp, and no more.
+#[test]
+fn half_caches_stay_close_to_the_oracle() {
+    for arch in [
+        "llama",
+        "qwen3",
+        "gemma3",
+        "gpt-oss",
+        "deepseek2",
+        "granitehybrid",
+    ] {
+        let model = load(&TinyModel::new(arch, TensorType::F32));
+        let expected = oracle::logits(&model, &LONG_PROMPT);
+        let config = SessionConfig {
+            threads: 2,
+            ..Default::default()
+        };
+        assert_eq!(config.cache, CacheType::F16);
+        let mut session = Session::new(Arc::clone(&model), config).unwrap();
+        session.eval(&LONG_PROMPT).unwrap();
+        let error = relative_error(session.logits(), &expected);
+        assert!(error < 1e-2, "{arch}: error {error}");
+        // Half the memory of the exact cache. Granite 4.0 H also keeps a
+        // recurrent state, which stays in 32-bit floats.
+        let mut exact = self::session(&model, 2, 32, None);
+        exact.eval(&LONG_PROMPT).unwrap();
+        if arch == "granitehybrid" {
+            assert!(session.cache_bytes() < exact.cache_bytes(), "{arch}");
+        } else {
+            assert_eq!(session.cache_bytes() * 2, exact.cache_bytes(), "{arch}");
+        }
+    }
 }

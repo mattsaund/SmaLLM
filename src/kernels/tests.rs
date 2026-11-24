@@ -721,3 +721,94 @@ fn kernel_speed() {
         println!("{line}");
     }
 }
+
+#[test]
+fn half_attention_kernels_match_the_definition() {
+    let mut rng = Rng(23);
+    for kernels in available() {
+        for len in [1, 7, 8, 9, 24, 32, 40, 64, 71, 576] {
+            for n_queries in [1, 2, 3, 4, 5, 8] {
+                for n in [0, 1, 2, 5, 33] {
+                    let queries = rng.floats(n_queries * len, -2.0, 2.0);
+                    let halves: Vec<u16> = rng
+                        .floats(n * len, -2.0, 2.0)
+                        .iter()
+                        .map(|&value| f32_to_f16(value))
+                        .collect();
+                    let rows: Vec<f64> = halves.iter().map(|&h| f16_to_f32(h) as f64).collect();
+                    let stride = n + 1;
+                    let what = format!("{} len {len} queries {n_queries} rows {n}", kernels.name);
+
+                    let mut scores = vec![-7.0f32; n_queries * stride];
+                    kernels.dot_rows_any(&queries, Rows::F16(&halves), len, &mut scores, stride);
+                    for h in 0..n_queries {
+                        for j in 0..n {
+                            let expected: f64 = (0..len)
+                                .map(|i| queries[h * len + i] as f64 * rows[j * len + i])
+                                .sum();
+                            assert_close(scores[h * stride + j], expected, len as f64, &what);
+                        }
+                        assert_eq!(scores[h * stride + n], -7.0, "{what}: wrote past the rows");
+                    }
+
+                    let weights = rng.floats(n_queries * stride, -1.0, 1.0);
+                    let start = rng.floats(n_queries * len, -1.0, 1.0);
+                    let mut outs = start.clone();
+                    kernels.mix_rows_any(&weights, Rows::F16(&halves), len, &mut outs, stride);
+                    for h in 0..n_queries {
+                        for i in 0..len {
+                            let mixed: f64 = (0..n)
+                                .map(|j| weights[h * stride + j] as f64 * rows[j * len + i])
+                                .sum();
+                            let expected = start[h * len + i] as f64 + mixed;
+                            assert_close(outs[h * len + i], expected, n as f64 + 1.0, &what);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn half_conversions_are_exact() {
+    // Every half widens exactly, through the branch-free conversion too.
+    for half in 0..=u16::MAX {
+        let (slow, fast) = (f16_to_f32(half), scalar::half_to_f32(half));
+        if slow.is_nan() {
+            assert!(fast.is_nan(), "{half:#06x}");
+        } else {
+            assert_eq!(slow.to_bits(), fast.to_bits(), "{half:#06x}");
+        }
+    }
+    // Rounding to halves agrees with the portable conversion on every
+    // backend, ties and the edges of the range included.
+    let mut values = vec![
+        0.0f32,
+        -0.0,
+        1.0,
+        -1.0,
+        65504.0,
+        65520.0,
+        1e9,
+        -1e9,
+        6.1e-5,
+        5.96e-8,
+        2.98e-8,
+        1e-10,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        1.0 + 1.0 / 2048.0,
+        1.0 + 3.0 / 2048.0,
+    ];
+    let mut rng = Rng(29);
+    values.extend(rng.floats(4093, -70000.0, 70000.0));
+    values.extend(rng.floats(1000, -1e-4, 1e-4));
+    for kernels in available() {
+        let mut out = vec![0u16; values.len()];
+        kernels.to_half(&values, &mut out);
+        for (value, half) in values.iter().zip(&out) {
+            assert_eq!(*half, f32_to_f16(*value), "{} {value}", kernels.name);
+        }
+    }
+}

@@ -306,7 +306,7 @@ left out.
 - [ ] Speculative decoding with a small draft model.
 - [ ] Saving a session's context to a file and loading it again.
 - [x] Sliding the context window when it fills, or keeping its start and dropping the middle.
-- [ ] A half-precision key/value cache, to halve the memory of long contexts.
+- [x] A half-precision key/value cache, to halve the memory of long contexts.
 
 **Server**
 

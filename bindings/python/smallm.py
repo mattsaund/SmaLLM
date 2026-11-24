@@ -36,6 +36,7 @@ class _SessionParams(ctypes.Structure):
         ("n_batch", ctypes.c_uint32),
         ("device", ctypes.c_uint32),
         ("n_threads_batch", ctypes.c_uint32),
+        ("cache_type", ctypes.c_uint32),
     ]
 
 

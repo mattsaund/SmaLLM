@@ -12,7 +12,7 @@ use std::sync::OnceLock;
 
 /// Every setting the file can hold: its name, its default and what it
 /// does. The names are those of the command-line options they stand for.
-pub const SETTINGS: [(&str, &str, &str); 22] = [
+pub const SETTINGS: [(&str, &str, &str); 23] = [
     (
         "ctx",
         "auto",
@@ -32,6 +32,11 @@ pub const SETTINGS: [(&str, &str, &str); 22] = [
         "batch",
         "32",
         "Prompt tokens read together. More reads prompts faster and takes more memory.",
+    ),
+    (
+        "cache-type",
+        "f16",
+        "What the key/value cache keeps. f16: half the memory. f32: exact.",
     ),
     (
         "overflow",

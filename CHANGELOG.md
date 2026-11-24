@@ -25,6 +25,11 @@ Each version is a `v` tag, with ready-made binaries and libraries on its
   side by side.
 - **gpt-oss.** Attention sinks, biased experts, OpenAI's clamped SwiGLU and
   the Harmony chat format.
+- **Half the cache memory.** The key/value cache keeps 16-bit floats, as
+  llama.cpp does. A full 4,096-token context of Llama 3.2 1B now holds
+  176 MB of SmaLLM's own memory instead of 310 MB (llama.cpp: 636 MB), and
+  generation there is about 14 percent faster. `--cache-type f32` (and the
+  `cache-type` setting, and `cache_type` in the C API) keeps 32-bit floats.
 - **YaRN** position scaling, which gpt-oss and DeepSeek use and some Qwen
   files ask for.
 - **Reasoning.** What thinking models write before their answer (between

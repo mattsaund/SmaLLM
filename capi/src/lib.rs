@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use smallm::chat::{Message, Role, Template};
 use smallm::generate::{self, Finish, Options, Overflow};
+use smallm::model::CacheType;
 use smallm::{Error, Model, Sampler, SamplerConfig, Session, SessionConfig};
 
 /// Result codes. Zero is success, negative values are failures.
@@ -124,6 +125,9 @@ pub struct SmallmSessionParams {
     pub device: u32,
     /// Threads to read prompts with.
     pub n_threads_batch: u32,
+    /// What the key/value cache keeps: 0 for 16-bit floats, half the
+    /// memory, or 1 for 32-bit floats.
+    pub cache_type: u32,
 }
 
 /// Options for sampling. See `smallm_sampler_default_params`.
@@ -420,6 +424,7 @@ pub extern "C" fn smallm_session_default_params() -> SmallmSessionParams {
         n_batch: 0,
         device: 0,
         n_threads_batch: 0,
+        cache_type: 0,
     }
 }
 
@@ -447,12 +452,21 @@ pub unsafe extern "C" fn smallm_session_new(
         fail(Status::Unsupported, "only device 0, the CPU, is available");
         return std::ptr::null_mut();
     }
+    let cache = match params.cache_type {
+        0 => CacheType::F16,
+        1 => CacheType::F32,
+        _ => {
+            fail(Status::Invalid, "cache_type is 0 (16-bit) or 1 (32-bit)");
+            return std::ptr::null_mut();
+        }
+    };
     let config = SessionConfig {
         n_ctx: params.n_ctx as usize,
         threads: params.n_threads as usize,
         batch_threads: params.n_threads_batch as usize,
         batch: params.n_batch as usize,
         kernels: None,
+        cache,
     };
     match Session::new(Arc::clone(&model.0), config) {
         Ok(session) => Box::into_raw(Box::new(SmallmSession(session))),
@@ -1050,6 +1064,7 @@ mod tests {
                 n_batch: 0,
                 device: 0,
                 n_threads_batch: 3,
+                cache_type: 1,
             };
             let session = smallm_session_new(model, &params);
             assert!(!session.is_null(), "{}", last_error());

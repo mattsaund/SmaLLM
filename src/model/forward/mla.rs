@@ -436,7 +436,7 @@ fn attend_latent(
         scores.clear();
         scores.resize(heads.len() * visible, 0.0);
         kv.for_each_run(layer, 0, 0, visible, |run_first, rows, _| {
-            kernels.dot_rows(scaled, rows, width, &mut scores[run_first..], visible);
+            kernels.dot_rows_any(scaled, rows, width, &mut scores[run_first..], visible);
         });
         for head_scores in scores.chunks_exact_mut(visible) {
             kernels.softmax(head_scores);
@@ -445,7 +445,7 @@ fn attend_latent(
         // left unused.
         out.fill(0.0);
         kv.for_each_run(layer, 0, 0, visible, |run_first, rows, _| {
-            kernels.mix_rows(&scores[run_first..], rows, width, out, visible);
+            kernels.mix_rows_any(&scores[run_first..], rows, width, out, visible);
         });
     };
 
