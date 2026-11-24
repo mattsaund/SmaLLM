@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 use crate::gguf::Gguf;
 
 /// Architectures this engine runs, as named in `general.architecture`.
-pub const ARCHITECTURES: [&str; 16] = [
+pub const ARCHITECTURES: [&str; 18] = [
     "llama",
     "qwen2",
     "qwen3",
@@ -28,6 +28,8 @@ pub const ARCHITECTURES: [&str; 16] = [
     "smollm3",
     "gemma2",
     "phi3",
+    "rwkv6",
+    "rwkv7",
 ];
 
 /// Which two elements of an attention head a rotary embedding rotates
@@ -97,6 +99,22 @@ pub enum Mixer {
     /// A short causal convolution over the last few positions, gated, as in
     /// Liquid AI's LFM models. It keeps a small state instead of a cache.
     ShortConv,
+    /// RWKV-6's time mixing ("Finch"): a recurrent state per head that
+    /// every token decays and adds to. See `rwkv.rs`.
+    Rwkv6,
+    /// RWKV-7's time mixing ("Goose"), which also removes from the state
+    /// what a token replaces.
+    Rwkv7,
+}
+
+/// The settings of RWKV blocks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rwkv {
+    /// Width of one head. Each head keeps a square matrix of this width.
+    pub head_size: usize,
+    /// The hidden state is halved after every this many blocks (RWKV-6).
+    /// Zero for never.
+    pub rescale_every: usize,
 }
 
 /// The shape of one block.
@@ -208,6 +226,8 @@ pub struct Config {
     pub yarn: Option<Yarn>,
     /// The expert settings, for models with mixture-of-experts layers.
     pub routing: Option<Routing>,
+    /// The settings of RWKV blocks, for RWKV models.
+    pub rwkv: Option<Rwkv>,
 }
 
 impl Config {
@@ -237,7 +257,12 @@ impl Config {
                 )));
             }
         }
-        let n_head = meta.per_layer("attention.head_count", n_layer)?;
+        let mut n_head = meta.per_layer("attention.head_count", n_layer)?;
+        // RWKV files give the width of a head and a head count of zero.
+        let rwkv_head_size = meta.usize("wkv.head_size").unwrap_or(0);
+        if rwkv_head_size > 0 && n_head.iter().all(|&heads| heads == 0) {
+            n_head = vec![n_embd / rwkv_head_size; n_layer];
+        }
         let n_head_kv = meta
             .per_layer("attention.head_count_kv", n_layer)
             .unwrap_or_else(|_| n_head.clone());
@@ -318,6 +343,7 @@ impl Config {
             long_context_after: 0,
             yarn: meta.yarn(n_ctx_train),
             routing,
+            rwkv: None,
             arch: arch.clone(),
         };
 
@@ -480,6 +506,33 @@ impl Config {
                     }
                 }
             }
+            // Every RWKV block mixes time with a recurrent state and
+            // normalizes with layer norms.
+            "rwkv6" | "rwkv7" => {
+                let head_size = rwkv_head_size;
+                if head_size == 0 || n_embd % head_size != 0 || head_size > 1024 {
+                    return Err(Error::format(format!(
+                        "RWKV heads of {head_size} do not fit a width of {n_embd}"
+                    )));
+                }
+                config.rwkv = Some(Rwkv {
+                    head_size,
+                    rescale_every: meta.usize("rescale_every_n_layers").unwrap_or(0),
+                });
+                config.norm_eps = meta.f32("attention.layer_norm_epsilon").unwrap_or(1e-5);
+                let mixer = if arch == "rwkv6" {
+                    Mixer::Rwkv6
+                } else {
+                    Mixer::Rwkv7
+                };
+                for layer in &mut config.layers {
+                    layer.mixer = mixer;
+                    layer.n_head = 0;
+                    layer.n_head_kv = 0;
+                    layer.rope_dims = 0;
+                    layer.rope_factors = false;
+                }
+            }
             _ => unreachable!("architecture was checked above"),
         }
         config.check()?;
@@ -573,12 +626,13 @@ impl Config {
 
     /// Number of blocks of each mixer: attention, then convolution.
     pub fn mixers(&self) -> (usize, usize) {
-        let attention = self
-            .layers
-            .iter()
-            .filter(|layer| layer.mixer == Mixer::Attention)
-            .count();
-        (attention, self.n_layer - attention)
+        let count = |mixer: Mixer| {
+            self.layers
+                .iter()
+                .filter(|layer| layer.mixer == mixer)
+                .count()
+        };
+        (count(Mixer::Attention), count(Mixer::ShortConv))
     }
 }
 
@@ -839,6 +893,30 @@ mod tests {
         use Mixer::*;
         assert_eq!(mixers, [ShortConv, ShortConv, Attention, ShortConv]);
         assert_eq!((c.conv_kernel, c.mixers()), (3, (1, 3)));
+    }
+
+    #[test]
+    fn rwkv_heads_come_from_the_head_size() {
+        let rwkv = |head_size: u32| {
+            let mut builder = Builder::new();
+            builder
+                .string("general.architecture", "rwkv7")
+                .u32("rwkv7.context_length", 1 << 20)
+                .u32("rwkv7.embedding_length", 64)
+                .u32("rwkv7.block_count", 3)
+                .u32("rwkv7.attention.head_count", 0)
+                .u32("rwkv7.wkv.head_size", head_size)
+                .f32("rwkv7.attention.layer_norm_epsilon", 1e-4);
+            config(&builder)
+        };
+        let c = rwkv(16).unwrap();
+        assert_eq!(c.rwkv.map(|rwkv| rwkv.head_size), Some(16));
+        assert!(c.layers.iter().all(|layer| layer.mixer == Mixer::Rwkv7));
+        assert_eq!((c.max_q_dim(), c.max_kv_dim(), c.mixers()), (0, 0, (0, 0)));
+        assert_eq!(c.norm_eps, 1e-4);
+        assert!(c.attention().is_none());
+        // Heads must divide the width.
+        assert!(rwkv(24).is_err());
     }
 
     #[test]

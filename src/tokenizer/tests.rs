@@ -212,6 +212,80 @@ fn bpe_whole_word_tokens_skip_merging_when_the_family_says_so() {
     assert_eq!(whole.encode("abab", false, false), [3]);
 }
 
+/// A small RWKV World vocabulary, spelled as the converter writes it:
+/// control token `<s>` first, then tokens with escapes and without.
+fn small_rwkv() -> Tokenizer {
+    let spellings: [&[u8]; 14] = [
+        b"<s>",
+        b"\\n",
+        b"\\n\\n",
+        b"a",
+        b"b",
+        b"ab",
+        b"abc",
+        b" ",
+        b" a",
+        b"\\xc3\\xa9",
+        b"\\\\",
+        b"\\'",
+        b"<",
+        b"s",
+    ];
+    let mut types = vec![1; spellings.len()];
+    types[0] = 3;
+    let mut builder = Builder::new();
+    builder
+        .string("tokenizer.ggml.model", "rwkv")
+        .strings("tokenizer.ggml.tokens", &spellings)
+        .i32s("tokenizer.ggml.token_type", &types)
+        .u32("tokenizer.ggml.bos_token_id", 0)
+        .u32("tokenizer.ggml.eos_token_id", 0)
+        .u32("tokenizer.ggml.eot_token_id", 2);
+    Tokenizer::from_gguf(&Gguf::from_bytes(builder.build()).unwrap()).unwrap()
+}
+
+#[test]
+fn rwkv_takes_the_longest_token_from_the_left() {
+    let tokenizer = small_rwkv();
+    assert_eq!(tokenizer.kind(), Kind::Rwkv);
+    // "abc" is a token, so it beats "ab" then "c". Without "c" the rest
+    // falls back to the longest tokens that do exist.
+    assert_eq!(tokenizer.encode("abcab a", false, false), [6, 5, 8]);
+    assert_eq!(tokenizer.encode("aab", false, false), [3, 5]);
+    // Escaped spellings stand for their bytes.
+    assert_eq!(tokenizer.encode("a\n\n\n", false, false), [3, 2, 1]);
+    assert_eq!(tokenizer.encode("\u{e9}\\'", false, false), [9, 10, 11]);
+    // A byte no token starts with is skipped, as the model has no unknown
+    // token.
+    assert_eq!(tokenizer.encode("azb", false, false), [3, 4]);
+    // No start token is added.
+    assert!(!tokenizer.adds_bos());
+    assert_eq!(tokenizer.encode("b", true, false), [4]);
+}
+
+#[test]
+fn rwkv_matches_control_tokens_as_text_too() {
+    let tokenizer = small_rwkv();
+    // The longest match finds the control token even when special tokens
+    // are not parsed, as llama.cpp's trie does.
+    assert_eq!(tokenizer.encode("a<s>", false, false), [3, 0]);
+    assert_eq!(tokenizer.encode("a<s>", false, true), [3, 0]);
+    assert_eq!(tokenizer.encode("<sa", false, false), [12, 13, 3]);
+    assert_eq!(tokenizer.decode(&[0, 3], false), "a");
+    assert_eq!(tokenizer.decode(&[0, 3], true), "<s>a");
+}
+
+#[test]
+fn rwkv_ends_turns_with_a_paragraph_break_that_stays_text() {
+    let tokenizer = small_rwkv();
+    assert!(tokenizer.is_end(2) && tokenizer.is_end(0));
+    assert!(!tokenizer.is_control(2));
+    assert_eq!(tokenizer.eot(), Some(2));
+    // The break is text when parsed as markup, and decodes to itself.
+    assert_eq!(tokenizer.encode("a\n\nb", false, true), [3, 2, 4]);
+    assert_eq!(tokenizer.decode(&[3, 2, 4, 9, 10], false), "a\n\nb\u{e9}\\");
+}
+
 #[test]
 fn unknown_pre_tokenizers_are_reported() {
     assert_eq!(small_bpe().pre_tokenizer(), ("gpt-2", true));
@@ -258,7 +332,7 @@ fn malformed_tokenizers_are_rejected() {
     // A tokenizer type this engine does not know.
     let mut builder = Builder::new();
     builder
-        .string("tokenizer.ggml.model", "rwkv")
+        .string("tokenizer.ggml.model", "plamo2")
         .strings("tokenizer.ggml.tokens", &[b"a"]);
     assert!(Tokenizer::from_gguf(&Gguf::from_bytes(builder.build()).unwrap()).is_err());
 

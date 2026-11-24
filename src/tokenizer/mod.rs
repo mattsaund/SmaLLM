@@ -13,12 +13,16 @@
 //! split text into words first, each family in its own way (see
 //! `pretok.rs`).
 //!
+//! RWKV World vocabularies (`rwkv`, used by RWKV-6 and RWKV-7) merge
+//! nothing. They take the longest token that matches (see `rwkv.rs`).
+//!
 //! The vocabulary is never copied out of the model file. See `vocab.rs`.
 
 mod merge;
 mod pretok;
 mod pretok_table;
 mod regex;
+mod rwkv;
 mod unicode;
 mod unicode_maps;
 mod unicode_tables;
@@ -45,6 +49,9 @@ pub enum Kind {
     /// The tokens whose scores add up highest cover the text (T5 and
     /// XLM-RoBERTa).
     Unigram,
+    /// The longest token that matches, from the left, over arbitrary
+    /// bytes (RWKV World).
+    Rwkv,
 }
 
 /// What a token is for, as bit flags.
@@ -133,6 +140,8 @@ pub struct Tokenizer {
     normalizer: wordpiece::Normalizer,
     /// The normalization map and settings of a Unigram tokenizer.
     unigram: Option<unigram::Unigram>,
+    /// The tokens an RWKV World vocabulary spells with escapes.
+    rwkv: Option<rwkv::Escaped>,
 }
 
 impl Tokenizer {
@@ -144,7 +153,8 @@ impl Tokenizer {
             "gpt2" | "gemma4" => Kind::Bpe,
             "bert" => Kind::WordPiece,
             "t5" => Kind::Unigram,
-            "rwkv" | "plamo2" | "plamo3" => {
+            "rwkv" => Kind::Rwkv,
+            "plamo2" | "plamo3" => {
                 return Err(Error::unsupported(format!(
                     "tokenizer type '{model}', which only models this engine cannot run yet use"
                 )));
@@ -215,7 +225,7 @@ impl Tokenizer {
                 merges = Some((table, index));
                 pre = PreTokenizer::for_name(&pre_name)?;
             }
-            Kind::WordPiece => {}
+            Kind::WordPiece | Kind::Rwkv => {}
         }
 
         // Special token ids: defaults by kind, then the file's own values.
@@ -231,6 +241,7 @@ impl Tokenizer {
             Kind::Bpe => (None, None),
             Kind::WordPiece => (Some(101), None),
             Kind::Unigram => (None, Some(1)),
+            Kind::Rwkv => (None, None),
         };
         let bos = read_id("tokenizer.ggml.bos_token_id", default_bos).filter(|_| !pre.no_bos);
         let eos = read_id("tokenizer.ggml.eos_token_id", default_eos);
@@ -303,6 +314,7 @@ impl Tokenizer {
             max_token_len: 0,
             normalizer,
             unigram: None,
+            rwkv: None,
         };
         if matches!(kind, Kind::WordPiece | Kind::Unigram) {
             tokenizer.max_token_len = (0..n_tokens)
@@ -327,6 +339,10 @@ impl Tokenizer {
             settings.treat_whitespace_as_suffix =
                 flag("tokenizer.ggml.treat_whitespace_as_suffix", false);
             tokenizer.unigram = Some(settings);
+        }
+        if kind == Kind::Rwkv {
+            let spellings = (0..n_tokens).map(|id| tokenizer.tokens.get(id));
+            tokenizer.rwkv = Some(rwkv::Escaped::new(spellings));
         }
 
         // Generation stops at the model's own end tokens and at any token
@@ -364,6 +380,11 @@ impl Tokenizer {
         }
         end_tokens.retain(|id| !ordinary.iter().any(|(other, _)| other == id));
         for &id in &end_tokens {
+            // An RWKV World model ends a turn with a paragraph break, which
+            // stays ordinary text, as in llama.cpp.
+            if kind == Kind::Rwkv && !marked.contains(&id) {
+                continue;
+            }
             tokenizer.attrs[id as usize] |= attr::CONTROL;
         }
         for &(id, flags) in &ordinary {
@@ -517,6 +538,11 @@ impl Tokenizer {
                                 self.encode_unigram(unigram, &bytes[range], &mut out);
                             }
                         }
+                        Kind::Rwkv => {
+                            if let Some(escaped) = &self.rwkv {
+                                self.encode_rwkv(escaped, &bytes[range], &mut out);
+                            }
+                        }
                     }
                     after_special = false;
                 }
@@ -568,7 +594,11 @@ impl Tokenizer {
             return;
         }
         let text = self.tokens.get(token as usize);
-        if flags & attr::SPECIAL != 0 {
+        // Every RWKV World token stands for the bytes it spells, whatever
+        // its type.
+        if self.kind == Kind::Rwkv {
+            rwkv::unescape(text, out);
+        } else if flags & attr::SPECIAL != 0 {
             out.extend_from_slice(text);
         } else if flags & attr::NORMAL != 0 {
             if matches!(

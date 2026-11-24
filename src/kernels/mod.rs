@@ -27,6 +27,9 @@ use std::sync::OnceLock;
 use crate::tensor::TensorType;
 use crate::tensor::quant::Tile;
 
+/// A fast `exp` that loops vectorize, for model code outside the kernels.
+pub(crate) use scalar::exp_approx;
+
 /// One activation vector, quantized for integer dot products.
 ///
 /// The vector is split into groups of 32 or 256 values to match the weight

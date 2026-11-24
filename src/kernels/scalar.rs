@@ -174,7 +174,7 @@ pub(super) unsafe fn mix_rows_impl(
 /// polynomial for `exp(r)`, and scales by `2^k` through the float's exponent
 /// bits. Inputs are clamped to the range where the result is a normal float.
 #[inline(always)]
-pub(super) fn exp_approx(x: f32) -> f32 {
+pub(crate) fn exp_approx(x: f32) -> f32 {
     const LOG2_E: f32 = std::f32::consts::LOG2_E;
     // ln(2) split in two so that `k * LN2_HIGH` is exact.
     const LN2_HIGH: f32 = 0.693_145_75;

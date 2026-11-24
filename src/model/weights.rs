@@ -76,10 +76,88 @@ pub struct ConvWeights {
     pub out_proj: Linear,
 }
 
+/// RWKV's time mixing, the part of an RWKV block that mixes positions.
+///
+/// Every projection reads the block's normalized input moved part of the
+/// way toward the previous token's, by a learned amount per channel. This is
+/// called token shift. A recurrent state per head takes the place of
+/// attention. See `rwkv.rs`.
+pub struct TimeMix {
+    /// The bias of the block's first norm, which makes it a layer norm.
+    pub norm_bias: Vec<f32>,
+    pub receptance: Linear,
+    pub key: Linear,
+    pub value: Linear,
+    pub output: Linear,
+    /// Weight and bias of the norm of each head's output.
+    pub head_norm: (Vec<f32>, Vec<f32>),
+    pub version: TimeMixVersion,
+}
+
+/// What differs between the time mixing of RWKV versions.
+pub enum TimeMixVersion {
+    V6(TimeMix6),
+    V7(TimeMix7),
+}
+
+/// The parts of RWKV-6's time mixing. How far each input moves toward the
+/// previous token depends on the token: a low-rank map adds to the learned
+/// amounts. So does the decay of the state.
+pub struct TimeMix6 {
+    /// How far the input of that low-rank map moves.
+    pub lerp_x: Vec<f32>,
+    /// The low-rank map: down to five times its rank, then one map back up
+    /// for each of the five inputs.
+    pub mix_down: Linear,
+    pub mix_up: [Linear; 5],
+    /// The learned amounts of the five inputs, one after another: decay,
+    /// key, value, receptance and gate.
+    pub lerp: Vec<f32>,
+    pub gate: Linear,
+    /// The decay: this base plus a low-rank map of the decay's input.
+    pub decay: Vec<f32>,
+    pub decay_down: Linear,
+    pub decay_up: Linear,
+    /// The bonus each head gives the current token, per key channel.
+    pub first: Vec<f32>,
+}
+
+/// The parts of RWKV-7's time mixing. Its low-rank maps each take an input
+/// of their own: `{name}0 + {name}2 * f({name}1 * x)`.
+pub struct TimeMix7 {
+    /// How far each input moves toward the previous token: receptance,
+    /// decay, key, value, in-context learning rate, then gate when there is
+    /// one.
+    pub lerp: Vec<f32>,
+    /// The decay.
+    pub w0: Vec<f32>,
+    pub w1: Linear,
+    pub w2: Linear,
+    /// The in-context learning rate: how much of what a key held a token
+    /// replaces.
+    pub a0: Vec<f32>,
+    pub a1: Linear,
+    pub a2: Linear,
+    /// How much of the first block's value each channel takes. `None` in
+    /// the first block.
+    pub value_mix: Option<(Vec<f32>, Linear, Linear)>,
+    /// The gate on the output.
+    pub g1: Linear,
+    pub g2: Linear,
+    /// Per-channel scales of the normalized key that is removed from the
+    /// state, of the key's change by the learning rate, and of the bonus
+    /// for the current token.
+    pub k_k: Vec<f32>,
+    pub k_a: Vec<f32>,
+    pub r_k: Vec<f32>,
+}
+
 /// What a block mixes positions with.
 pub enum MixerWeights {
     Attention(AttentionWeights),
     ShortConv(ConvWeights),
+    /// RWKV blocks run a path of their own, in `rwkv.rs`.
+    Rwkv(Box<TimeMix>),
 }
 
 /// A layer's part of the per-layer token embeddings (Gemma 4).
@@ -138,10 +216,27 @@ pub struct Experts {
     pub shared: Option<(Dense, Option<Linear>)>,
 }
 
+/// RWKV's channel mixing, its feed-forward network:
+/// `value(relu(key(x))^2)`. Its inputs move toward the previous token's, as
+/// in the time mixing.
+pub struct ChannelMix {
+    /// The bias of the norm before it, which makes it a layer norm.
+    pub norm_bias: Vec<f32>,
+    /// How far the key's input moves toward the previous token.
+    pub lerp_k: Vec<f32>,
+    pub key: Linear,
+    pub value: Linear,
+    /// RWKV-6 scales the output by the sigmoid of a receptance, whose input
+    /// moves by its own amounts.
+    pub receptance: Option<(Vec<f32>, Linear)>,
+}
+
 /// The feed-forward part of a block.
 pub enum FeedForward {
     Dense(Box<Dense>),
     Experts(Box<Experts>),
+    /// RWKV blocks run a path of their own, in `rwkv.rs`.
+    ChannelMix(Box<ChannelMix>),
 }
 
 /// The weights of one block.
@@ -184,6 +279,10 @@ pub struct Weights {
     pub rope_factors_long: Option<Vec<f32>>,
     pub layers: Vec<Layer>,
     pub per_layer_inputs: Option<PerLayerInputs>,
+    /// Weight and bias of a layer norm of the token embeddings (RWKV).
+    pub embd_norm: Option<(Vec<f32>, Vec<f32>)>,
+    /// The bias of the final norm, which makes it a layer norm (RWKV).
+    pub output_norm_bias: Option<Vec<f32>>,
 }
 
 impl Weights {
@@ -246,6 +345,18 @@ impl Weights {
             })
         } else {
             None
+        };
+        // RWKV normalizes the embeddings, and ends with a layer norm.
+        let (embd_norm, output_norm_bias) = if config.rwkv.is_some() {
+            (
+                Some((
+                    vector(file, "token_embd_norm.weight", d)?,
+                    vector(file, "token_embd_norm.bias", d)?,
+                )),
+                Some(vector(file, "output_norm.bias", d)?),
+            )
+        } else {
+            (None, None)
         };
 
         let mut layers = Vec::with_capacity(config.n_layer);
@@ -339,9 +450,18 @@ impl Weights {
                         out_proj: layer_whole("shortconv.out_proj", d, d)?,
                     })
                 }
+                Mixer::Rwkv6 | Mixer::Rwkv7 => {
+                    MixerWeights::Rwkv(Box::new(time_mix(file, index, spec.mixer, d)?))
+                }
             };
 
             let ffn = match &config.routing {
+                // RWKV blocks end with a channel mix.
+                _ if matches!(spec.mixer, Mixer::Rwkv6 | Mixer::Rwkv7) => {
+                    let mix = channel_mix(file, index, d, spec.mixer)?;
+                    spec.n_ff = mix.key.rows;
+                    FeedForward::ChannelMix(Box::new(mix))
+                }
                 Some(routing) if file.tensor(&name("ffn_gate_inp.weight")).is_some() => {
                     let experts = experts(file, index, d, routing.count)?;
                     spec.n_ff_expert = experts.gate.rows;
@@ -377,11 +497,16 @@ impl Weights {
                 None
             };
 
+            // RWKV names the norm before its channel mix after attention.
+            let ffn_norm = match ffn {
+                FeedForward::ChannelMix(_) => "attn_norm_2.weight",
+                _ => "ffn_norm.weight",
+            };
             layers.push(Layer {
                 attn_norm: vector(file, &name("attn_norm.weight"), d)?,
                 mixer,
                 attn_post_norm: optional_vector(file, &name("post_attention_norm.weight"), d)?,
-                ffn_norm: vector(file, &name("ffn_norm.weight"), d)?,
+                ffn_norm: vector(file, &name(ffn_norm), d)?,
                 ffn,
                 ffn_post_norm: optional_vector(file, &name("post_ffw_norm.weight"), d)?,
                 per_layer: per_layer_weights,
@@ -397,6 +522,8 @@ impl Weights {
             rope_factors_long,
             layers,
             per_layer_inputs,
+            embd_norm,
+            output_norm_bias,
         })
     }
 }
@@ -418,8 +545,151 @@ impl Weights {
             rope_factors_long: None,
             layers: Vec::new(),
             per_layer_inputs: None,
+            embd_norm: None,
+            output_norm_bias: None,
         }
     }
+}
+
+/// Binds the time mixing of RWKV block `index`.
+fn time_mix(file: &Gguf, index: usize, mixer: Mixer, d: usize) -> Result<TimeMix> {
+    let name = |part: &str| format!("blk.{index}.{part}");
+    let square = |part: &str| whole(file, &name(part), d, d);
+    let version = if mixer == Mixer::Rwkv6 {
+        TimeMixVersion::V6(time_mix6(file, index, d)?)
+    } else {
+        TimeMixVersion::V7(time_mix7(file, index, d)?)
+    };
+    Ok(TimeMix {
+        norm_bias: vector(file, &name("attn_norm.bias"), d)?,
+        receptance: square("time_mix_receptance")?,
+        key: square("time_mix_key")?,
+        value: square("time_mix_value")?,
+        output: square("time_mix_output")?,
+        head_norm: (
+            vector(file, &name("time_mix_ln.weight"), d)?,
+            vector(file, &name("time_mix_ln.bias"), d)?,
+        ),
+        version,
+    })
+}
+
+/// Binds the parts of RWKV-6's time mixing in block `index`.
+fn time_mix6(file: &Gguf, index: usize, d: usize) -> Result<TimeMix6> {
+    let name = |part: &str| format!("blk.{index}.{part}");
+    // The low-rank map of the token shift: five parts of the same rank.
+    let mix_down = from_width(file, &name("time_mix_w1"), d)?;
+    if mix_down.rows % 5 != 0 {
+        return Err(Error::format(format!(
+            "{} cannot split into five parts",
+            name("time_mix_w1.weight")
+        )));
+    }
+    let rank = mix_down.rows / 5;
+    let up = stacked(file, &name("time_mix_w2.weight"), 5, d, rank)?;
+    let mix_up = std::array::from_fn(|part| Linear {
+        matrix: up,
+        first_row: part * d,
+        rows: d,
+        bias: None,
+    });
+    // Newer files store the five learned amounts as one tensor.
+    let lerp = match file.tensor(&name("time_mix_lerp_fused.weight")) {
+        Some(_) => vector(file, &name("time_mix_lerp_fused.weight"), 5 * d)?,
+        None => {
+            let mut fused = Vec::with_capacity(5 * d);
+            for part in ["w", "k", "v", "r", "g"] {
+                fused.extend(vector(
+                    file,
+                    &name(&format!("time_mix_lerp_{part}.weight")),
+                    d,
+                )?);
+            }
+            fused
+        }
+    };
+    let decay_down = from_width(file, &name("time_mix_decay_w1"), d)?;
+    Ok(TimeMix6 {
+        lerp_x: vector(file, &name("time_mix_lerp_x.weight"), d)?,
+        mix_down,
+        mix_up,
+        lerp,
+        gate: whole(file, &name("time_mix_gate"), d, d)?,
+        decay: vector(file, &name("time_mix_decay.weight"), d)?,
+        decay_up: whole(file, &name("time_mix_decay_w2"), d, decay_down.rows)?,
+        decay_down,
+        first: vector(file, &name("time_mix_first.weight"), d)?,
+    })
+}
+
+/// Binds the parts of RWKV-7's time mixing in block `index`. The first
+/// block's files hold stand-ins for the value mix, which it does not use.
+fn time_mix7(file: &Gguf, index: usize, d: usize) -> Result<TimeMix7> {
+    let name = |part: &str| format!("blk.{index}.{part}");
+    // A low-rank map: down to the rank the file has, then back up to `d`.
+    let low_rank = |letter: &str| -> Result<(Linear, Linear)> {
+        let down = from_width(file, &name(&format!("time_mix_{letter}1")), d)?;
+        let up = whole(file, &name(&format!("time_mix_{letter}2")), d, down.rows)?;
+        Ok((down, up))
+    };
+    let base = |letter: &str| vector(file, &name(&format!("time_mix_{letter}0.weight")), d);
+    let (w1, w2) = low_rank("w")?;
+    let (a1, a2) = low_rank("a")?;
+    let (g1, g2) = low_rank("g")?;
+    let value_mix = match index {
+        0 => None,
+        _ => {
+            let (v1, v2) = low_rank("v")?;
+            Some((base("v")?, v1, v2))
+        }
+    };
+    Ok(TimeMix7 {
+        lerp: vector(file, &name("time_mix_lerp_fused.weight"), 6 * d)?,
+        w0: base("w")?,
+        w1,
+        w2,
+        a0: base("a")?,
+        a1,
+        a2,
+        value_mix,
+        g1,
+        g2,
+        k_k: vector(file, &name("time_mix_k_k.weight"), d)?,
+        k_a: vector(file, &name("time_mix_k_a.weight"), d)?,
+        r_k: vector(file, &name("time_mix_r_k.weight"), d)?,
+    })
+}
+
+/// Binds the matrix `{base}.weight` that maps `d` inputs to as many outputs
+/// as the file has rows.
+fn from_width(file: &Gguf, base: &str, d: usize) -> Result<Linear> {
+    let name = format!("{base}.weight");
+    let rows = file
+        .tensor(&name)
+        .map(TensorInfo::rows)
+        .filter(|&rows| rows > 0)
+        .ok_or_else(|| Error::format(format!("missing or empty tensor: {name}")))?;
+    whole(file, base, rows, d)
+}
+
+/// Binds the channel mixing of RWKV block `index`.
+fn channel_mix(file: &Gguf, index: usize, d: usize, mixer: Mixer) -> Result<ChannelMix> {
+    let name = |part: &str| format!("blk.{index}.{part}");
+    let key = from_width(file, &name("channel_mix_key"), d)?;
+    let receptance = match mixer {
+        Mixer::Rwkv6 => Some((
+            vector(file, &name("channel_mix_lerp_r.weight"), d)?,
+            whole(file, &name("channel_mix_receptance"), d, d)?,
+        )),
+        _ => None,
+    };
+    Ok(ChannelMix {
+        norm_bias: vector(file, &name("attn_norm_2.bias"), d)?,
+        lerp_k: vector(file, &name("channel_mix_lerp_k.weight"), d)?,
+        value: whole(file, &name("channel_mix_value"), d, key.rows)?,
+        key,
+        receptance,
+    })
 }
 
 /// Binds a gated feed-forward network: `{prefix}_gate{suffix}`,

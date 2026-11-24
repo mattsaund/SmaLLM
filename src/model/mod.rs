@@ -9,6 +9,7 @@
 //! | `encoder.rs` | Encoder models, for embeddings and reranking.            |
 //! | `matmul.rs`  | The parallel matrix multiply.                            |
 //! | `forward.rs` | The forward pass and the [`Session`] type.               |
+//! | `rwkv.rs`    | RWKV blocks: time and channel mixing with a state.       |
 
 mod config;
 mod conv;
@@ -17,6 +18,7 @@ mod forward;
 mod kv;
 mod matmul;
 mod recurrent;
+mod rwkv;
 mod weights;
 
 #[cfg(test)]
@@ -29,13 +31,14 @@ use crate::gguf::Gguf;
 use crate::tokenizer::Tokenizer;
 
 pub use config::{
-    ARCHITECTURES, Activation, Config, Gating, LayerSpec, Mixer, Rope, Routing, Yarn,
+    ARCHITECTURES, Activation, Config, Gating, LayerSpec, Mixer, Rope, Routing, Rwkv, Yarn,
 };
 pub use encoder::{ENCODERS, Embedder, Pooling, normalize};
 pub use forward::{Phase, Profile, Session, SessionConfig};
 pub use weights::{
-    AttentionWeights, ConvWeights, Dense, ExpertMatrix, Experts, FeedForward, Layer, Linear,
-    Matrix, MixerWeights, PerLayerInputs, PerLayerWeights, Weights,
+    AttentionWeights, ChannelMix, ConvWeights, Dense, ExpertMatrix, Experts, FeedForward, Layer,
+    Linear, Matrix, MixerWeights, PerLayerInputs, PerLayerWeights, TimeMix, TimeMix6, TimeMix7,
+    TimeMixVersion, Weights,
 };
 
 /// A model file, opened and ready to run.

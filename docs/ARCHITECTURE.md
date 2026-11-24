@@ -110,6 +110,13 @@ y      = sum over taps i of kernel[i] * (b * s)[position - taps + 1 + i]
 mix    = (c * y) * Wout
 ```
 
+RWKV models have no attention. Each head keeps a square matrix that every
+token decays and writes its key and value into, and the token's output is
+that matrix read with its receptance. RWKV-7 also removes what the matrix
+held for a key before it writes the new value. The blocks normalize with
+layer norms, and every input moves part of the way toward the previous
+token's. They run a path of their own, in `model/rwkv.rs`.
+
 `model/config.rs` turns the architecture name and its metadata into a few
 model-wide switches (how positions are rotated, the activation, embedding
 and logit scaling) and one `LayerSpec` per block. A layer's spec says how it
@@ -257,6 +264,13 @@ a cache, a few kilobytes. Rolling it back needs inputs that are gone, so
 `model/conv.rs` keeps the last eight positions' inputs as well, and saves
 every layer's state each 256 positions. A short rollback costs nothing. A
 longer one restores the last saved state before the cut and reads the
+tokens after it again.
+
+An RWKV block keeps a fixed state instead of a cache: its heads' matrices
+and the previous token's inputs, about 0.5 MB per block in a 1.5B model,
+whatever the length of the context. A state cannot be taken apart again,
+so `model/recurrent.rs` saves it at the end of each prompt and keeps the
+last three. A rollback restores the last one before the cut and reads the
 tokens after it again.
 
 When the window is full, the session drops the oldest tokens after a kept

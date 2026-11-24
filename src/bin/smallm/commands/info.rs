@@ -90,6 +90,21 @@ pub fn main(raw: impl Iterator<Item = String>) -> Result<(), String> {
             format!("{n_attention} attention, {n_conv} short convolution"),
         );
     }
+    if let Some(rwkv) = &config.rwkv {
+        let version = match config.layers.first().map(|layer| layer.mixer) {
+            Some(Mixer::Rwkv6) => "RWKV-6",
+            _ => "RWKV-7",
+        };
+        row(
+            "blocks",
+            format!(
+                "{} {version}, {} heads of {} with a recurrent state",
+                config.n_layer,
+                config.n_embd / rwkv.head_size,
+                rwkv.head_size
+            ),
+        );
+    }
     let windowed: Vec<usize> = attention
         .iter()
         .filter(|layer| layer.window > 0)
@@ -124,6 +139,7 @@ pub fn main(raw: impl Iterator<Item = String>) -> Result<(), String> {
         Kind::Bpe => format!("BPE ({})", tokenizer.pre_tokenizer().0),
         Kind::WordPiece => "WordPiece".to_string(),
         Kind::Unigram => "Unigram".to_string(),
+        Kind::Rwkv => "RWKV World".to_string(),
     };
     row(
         "tokenizer",

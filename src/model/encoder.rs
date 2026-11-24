@@ -292,6 +292,7 @@ impl Encoder {
             long_context_after: 0,
             yarn: None,
             routing: None,
+            rwkv: None,
         };
         Ok((config, encoder))
     }

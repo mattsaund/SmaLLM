@@ -52,6 +52,7 @@ use super::conv::ConvState;
 use super::kv::KvCache;
 use super::matmul::{ActScratch, Engine, Target};
 use super::recurrent::{self, RecurrentState};
+use super::rwkv::{self, RwkvScratch};
 use super::weights::{
     AttentionWeights, ConvWeights, Dense, Experts, FeedForward, Linear, Matrix, MixerWeights,
     PerLayerInputs, PerLayerWeights,
@@ -70,7 +71,9 @@ const INLINE_ATTENTION_WORK: usize = 64 * 1024;
 ///
 /// Convolution blocks are timed with the attention stages: their input
 /// projection as `Project`, the convolution as `Attention` and their output
-/// projection as `AttentionOut`.
+/// projection as `AttentionOut`. RWKV blocks too, with the state update as
+/// `Attention` and the work between projections and update as `Rotate`.
+/// Their channel mixing is timed as the feed-forward stages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
     /// Token embedding lookup and rotary tables.
@@ -490,6 +493,7 @@ struct Scratch {
     up: Vec<f32>,
     experts: ExpertScratch,
     per_layer: PerLayerScratch,
+    rwkv: RwkvScratch,
     acts: ActScratch,
     rope: RopeTables,
 }
@@ -643,9 +647,11 @@ impl Session {
             },
             conv: conv_scratch,
             gate: vec![0.0; batch * n_ff],
-            up: vec![0.0; batch * n_ff],
+            // RWKV's channel mixing has no up projection.
+            up: vec![0.0; if c.rwkv.is_some() { 0 } else { batch * n_ff }],
             experts,
             per_layer,
+            rwkv: RwkvScratch::new(c, model.weights(), batch),
             acts: ActScratch::default(),
             rope: RopeTables::new(c, rope_factors(&model, n_ctx)),
         };
@@ -883,6 +889,7 @@ impl Session {
             up,
             experts,
             per_layer,
+            rwkv: rwkv_scratch,
             acts,
             rope,
         } = scratch;
@@ -897,6 +904,9 @@ impl Session {
             if config.embedding_scale != 1.0 {
                 row.iter_mut()
                     .for_each(|value| *value *= config.embedding_scale);
+            }
+            if let Some((weight, bias)) = &weights.embd_norm {
+                rwkv::layer_norm(row, weight, bias, eps);
             }
         }
         rope.fill(first_position, count);
@@ -946,6 +956,11 @@ impl Session {
                 inputs,
                 active,
             };
+            // RWKV blocks take a path of their own.
+            if let MixerWeights::Rwkv(_) = &layer.mixer {
+                pass.rwkv_block(&run, layer, x, h, rwkv_scratch, gate);
+                continue;
+            }
 
             // The mixer: attention or a convolution over positions.
             for token in run.inputs.clone() {
@@ -956,6 +971,7 @@ impl Session {
             match &layer.mixer {
                 MixerWeights::Attention(weights) => pass.attention(&run, weights, h, attention),
                 MixerWeights::ShortConv(weights) => pass.short_conv(&run, weights, h, conv_scratch),
+                MixerWeights::Rwkv(_) => unreachable!("RWKV blocks took their own path"),
             }
             let n_active = run.active.len();
             if n_active == 0 {
@@ -983,6 +999,7 @@ impl Session {
                 FeedForward::Experts(weights) => {
                     pass.experts(weights, spec, h_active, (gate, up), experts)
                 }
+                FeedForward::ChannelMix(_) => unreachable!("RWKV blocks took their own path"),
             }
             add_residual(
                 kernels,
@@ -1010,7 +1027,13 @@ impl Session {
         if want_logits {
             let last = &x[(count - 1) * d..count * d];
             let normalized = &mut h[..d];
-            rms_norm(kernels, last, &weights.output_norm, eps, normalized);
+            match &weights.output_norm_bias {
+                Some(bias) => {
+                    normalized.copy_from_slice(last);
+                    rwkv::layer_norm(normalized, &weights.output_norm, bias, eps);
+                }
+                None => rms_norm(kernels, last, &weights.output_norm, eps, normalized),
+            }
             pass.multiply(
                 normalized,
                 d,
@@ -1032,38 +1055,38 @@ impl Session {
 }
 
 /// What the steps of one forward pass share.
-struct Pass<'a> {
-    engine: Engine<'a>,
-    config: &'a Config,
+pub(super) struct Pass<'a> {
+    pub(super) engine: Engine<'a>,
+    pub(super) config: &'a Config,
     rope: &'a RopeTables,
     kv: &'a mut KvCache,
     conv: &'a mut ConvState,
-    recurrent: &'a mut RecurrentState,
+    pub(super) recurrent: &'a mut RecurrentState,
     acts: &'a mut ActScratch,
     profile: &'a mut Option<Profile>,
     /// Tokens in the batch.
-    count: usize,
+    pub(super) count: usize,
     /// Context position of the batch's first token.
     first_position: usize,
 }
 
 /// One block's share of a batch.
-struct LayerRun<'a> {
-    index: usize,
+pub(super) struct LayerRun<'a> {
+    pub(super) index: usize,
     spec: &'a LayerSpec,
     /// Rows the block reads: every row when it keeps state for later
     /// tokens, otherwise the active rows.
     inputs: Range<usize>,
     /// Rows whose output is needed.
-    active: Range<usize>,
+    pub(super) active: Range<usize>,
 }
 
 impl Pass<'_> {
-    fn lap(&mut self, phase: Phase) {
+    pub(super) fn lap(&mut self, phase: Phase) {
         lap(self.profile, phase);
     }
 
-    fn multiply(&mut self, x: &[f32], cols: usize, targets: &mut [Target<'_>]) {
+    pub(super) fn multiply(&mut self, x: &[f32], cols: usize, targets: &mut [Target<'_>]) {
         self.engine.multiply(self.acts, x, cols, targets);
     }
 
