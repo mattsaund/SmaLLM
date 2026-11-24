@@ -280,12 +280,33 @@ impl Tile {
     }
 
     /// A row of `row_bytes` zero bytes. In every format it decodes to
-    /// weights of zero.
+    /// weights of zero, though not always to integer weights of zero: a
+    /// zero nibble of IQ4_NL is the level -127, times a scale of zero.
     pub fn blank_row(&mut self, row_bytes: usize) -> &[u8] {
         if self.blank.len() < row_bytes {
             self.blank.resize(row_bytes, 0);
         }
         &self.blank[..row_bytes]
+    }
+
+    /// Zeroes the weights, scales and offsets of rows `first..height`. That
+    /// is how [`fill`](Self::fill) leaves the rows it is not given, so a
+    /// faster fill that reads them from a [`blank_row`](Self::blank_row)
+    /// calls this to end up with the same tile.
+    pub fn clear_rows(&mut self, first: usize) {
+        let height = self.height;
+        if first >= height {
+            return;
+        }
+        for run in self.q.chunks_exact_mut(4 * height) {
+            run[4 * first..].fill(0);
+        }
+        for scales in self.scale.chunks_exact_mut(height) {
+            scales[first..].fill(0.0);
+        }
+        for offsets in self.offset.chunks_exact_mut(height) {
+            offsets[first..].fill(0.0);
+        }
     }
 
     /// Fills the tile with the rows stored in `data`, `row_bytes` apart.
