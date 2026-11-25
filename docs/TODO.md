@@ -72,9 +72,11 @@ Bugs the first board found (the Allwinner A733, 2026-11-24).
 - [ ] NEON kernels for 32-bit ARM, and vector kernels for RISC-V.
 - [ ] NEON kernels for the formats that have none: IQ1, IQ2, IQ3, TQ1_0, TQ2_0, Q2_K and Q3_K.
 - [ ] A model split across machines over the network, as llama.cpp's RPC backend does.
-- [ ] `--cpus`, to run on a chosen set of CPUs (one cluster) without `taskset`, as llama.cpp's `--cpu-range` does.
-- [ ] `--mlock`, opt-in, to keep the weights resident on boards with slow storage. On an SD card, pages dropped
-      under memory pressure are slow to read again (6.2 GB takes about 95 seconds at 65 MB/s).
+- [x] `--cpus`, to run on a chosen set of CPUs (one cluster) without `taskset`, as llama.cpp's `--cpu-range` does.
+      Linux and Android.
+- [x] `--mlock`, opt-in, to keep the weights resident on boards with slow storage. On an SD card, pages dropped
+      under memory pressure are slow to read again (6.2 GB takes about 95 seconds at 65 MB/s). Unix systems only.
+- [ ] `--mlock` on Windows, through `VirtualLock`.
 - [ ] Reading ahead at load (`MADV_WILLNEED`). Low value: at most 15 percent off a cold start from an SD card.
 
 ## Models
@@ -111,8 +113,9 @@ Bugs the first board found (the Allwinner A733, 2026-11-24).
 - [x] A half-precision key/value cache, to halve the memory of long contexts.
 - [ ] Grammar-constrained output (GBNF), and JSON that follows a schema.
 - [ ] Jinja chat templates, for models whose format is not one of the fifteen built in.
-- [ ] More samplers: Mirostat, typical, DRY, XTC, top-n-sigma and dynamic temperature, presence and frequency
-      penalties, and a bias on chosen tokens.
+- [x] More samplers: Mirostat 1 and 2, typical, XTC, top-n-sigma, dynamic temperature, presence and frequency
+      penalties, and a bias on chosen tokens, in llama.cpp's order and with its option names.
+- [ ] DRY, llama.cpp's sampler against repeated sequences.
 - [ ] Token probabilities in the output.
 - [ ] Speculative decoding: a small draft model, EAGLE3, and prompt lookup.
 - [ ] Saving a session's context to a file and loading it again.
@@ -120,35 +123,39 @@ Bugs the first board found (the Allwinner A733, 2026-11-24).
 - [ ] Freeing the cache of sliding-window layers past their window (Gemma 2, Gemma 3, Gemma 4, gpt-oss), as
       llama.cpp does. High value on boards: Gemma 4 and Nemotron 3.5 Bolt keep 512-position windows in 35 of
       their 42 layers.
-- [ ] Sampling defaults from the model file (`general.sampling.*`: temperature, top-k, top-p, min-p, repetition
-      penalty and its window, and the rest llama.cpp reads), below `smallm.conf` and the command line. Nemotron 3.5
-      Bolt E4B's file asks for temperature 1.0 and top-k 64, where SmaLLM uses 0.8 and 40.
-- [ ] A switch for thinking: `run --think on|off`, and `chat_template_kwargs.enable_thinking` and
-      `reasoning_effort` in the server, for the formats that support it. Qwen3 turns it off with an empty block
-      after the assistant's opening (`<think>\n\n</think>\n\n`), LFM3 with `<think></think>`, SmolLM3 with
-      `/no_think` in the system message, and gpt-oss sets its level on the Harmony `Reasoning:` line, fixed at
-      medium today. On a board, a thinking model can spend tens of seconds before its answer.
+- [x] Sampling defaults from the model file (`general.sampling.*`: temperature, top-k, top-p, min-p, repetition
+      penalty and its window, XTC and Mirostat), below `smallm.conf` and the command line. Nemotron 3.5 Bolt E4B's
+      file asks for temperature 1.0 and top-k 64, where SmaLLM used 0.8 and 40.
+- [x] A switch for thinking: `--think`, and `chat_template_kwargs.enable_thinking` and `reasoning_effort` in the
+      server. Off is written the way the model's own template writes it, found in that template: Qwen3's
+      `<think>\n\n</think>\n\n`, LFM3's `<think></think>`, SmolLM3's and RWKV-7 G1's. Gemma 4 is turned on with
+      `<|think|>`, and gpt-oss takes low, medium or high on its Harmony `Reasoning:` line. On a board, a thinking
+      model can spend tens of seconds before its answer.
+- [ ] SmolLM3's system block (`## Metadata`, with its reasoning mode), which the ChatML format does not write.
 - [ ] `--max-tokens` counting reasoning and answer tokens apart, so that a small limit does not end before the
-      answer begins.
+      answer begins. The help says today that the limit includes reasoning.
+- [ ] The new samplers, the thinking switch and the model file's sampling defaults in the C API and the Python
+      binding.
 
 ## Speed
 
 Gaps the measurements in PARITY.md and DEVELOPMENT.md show.
 
-- [ ] Q4_0 prompt reading on NEON with the dot product extension: 3.6 times slower than llama.cpp on the A733's
-      A76 cores (12.5 against 44.5 tokens per second). The matrix multiplies take 96 percent of the time, and the
-      batch size is not the cause. Rework the NEON tile kernel's register blocking (4 rows by 4 tokens of
+- [ ] Q4_0 prompt reading on NEON with the dot product extension: 3.5 times slower than llama.cpp b12711 on the
+      A733's A76 cores (12.8 against 44.6 tokens per second). The matrix multiplies take 96 percent of the time, and
+      the batch size is not the cause. Rework the NEON tile kernel's register blocking (4 rows by 4 tokens of
       accumulators, `sdot` by lane, as llama.cpp's Q4_0 GEMM does), or add an opt-in repack at load for boards
       with memory to spare.
-- [ ] Q4_0 generation on NEON, 7 percent behind llama.cpp on the A733 (7.4 against 8.0 tokens per second). Both
-      are memory-bound, at 7.7 against 8.3 GB/s, so the matrix-vector kernel has some headroom. Q4_K_M is 8 percent
-      ahead.
-- [ ] The default prompt batch on ARM: 64 read 6 percent faster than 32 on the A733. Measure the scratch memory
-      first.
-
-- [ ] Prompt reading for mixtures of experts. DeepSeek reads prompts at 0.83x llama.cpp with the default batch of
-      32 tokens, which leaves each of 64 experts about 3 tokens. A batch of 256 reads them 1.6 times as fast as
-      llama.cpp. A larger default for expert models costs scratch memory.
+- [ ] Q4_0 generation on NEON, 14 percent behind llama.cpp b12711 on the A733 (7.5 against 8.7 tokens per second,
+      and 7 percent behind the older build the board first ran). Both are memory-bound, so the matrix-vector kernel
+      leaves bandwidth unused. Q4_K_M is 4 percent ahead (2.8 against 2.7).
+- [x] The default prompt batch on ARM. With runs alternated and started at the same temperature, 64 gained nothing
+      over 32 on the A733 (LFM3 level, Nemotron 3 percent slower) and took 5 to 6 MB more, so ARM keeps 32. x86
+      moved to 64: prompts up to 11 percent faster for 2 to 6 MB.
+- [x] Prompt reading for mixtures of experts. A default batch of 128 tokens for models with experts: on x86
+      DeepSeek reads prompts at 189 tokens per second against llama.cpp's 162 (0.83x before, at 32), and gpt-oss at
+      187 against 103, for 44 and 26 MB of scratch memory.
+- [ ] The prompt batch for expert models on ARM boards, not measured yet (no expert model on the A733).
 - [ ] Generation on one thread, about 5 percent behind llama.cpp on Llama 3.2 1B.
 - [ ] RWKV-7 prompt reading, level with llama.cpp. Its low-rank maps take about 13 percent of single-threaded
       prompt time, because the float route handles their short rows one dot product at a time.
@@ -166,8 +173,7 @@ Gaps the measurements in PARITY.md and DEVELOPMENT.md show.
 - [ ] The Anthropic Messages API and the OpenAI Responses API.
 - [ ] Speech endpoints (transcription and text to speech), with the models above.
 - [ ] The Ollama API next to the OpenAI one, and several models loaded and unloaded on demand.
-- [ ] Sampling options on `serve`, as defaults for requests. Today two servers can only differ through each
-      request or the shared `smallm.conf`.
+- [x] Sampling options on `serve`, as defaults for requests.
 - [ ] A built-in web page, and metrics.
 
 ## Tools

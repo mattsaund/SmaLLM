@@ -81,6 +81,33 @@ impl Mapping {
         !matches!(self.backing, Backing::Heap(_))
     }
 
+    /// Reads every page of the file into memory and keeps it there, so that
+    /// the system cannot drop the weights under memory pressure and read
+    /// them again later. This gives up the on-demand loading, so it is for
+    /// machines with slow storage and memory to spare. It fails when the
+    /// file is larger than the process may lock (`ulimit -l` on Linux).
+    #[cfg(unix)]
+    pub fn lock(&self) -> std::io::Result<()> {
+        if self.len == 0 {
+            return Ok(());
+        }
+        // SAFETY: the range is this mapping's own, which stays valid for
+        // as long as `self` does. Locking only changes how pages are kept.
+        if unsafe { sys::mlock(self.ptr.cast(), self.len) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Locking pages is not supported here yet.
+    #[cfg(not(unix))]
+    pub fn lock(&self) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "locking memory works on Linux, macOS and other Unix systems only",
+        ))
+    }
+
     #[cfg(unix)]
     fn map_file(file: File, len: usize) -> Result<Mapping> {
         use std::os::fd::AsRawFd;
@@ -205,6 +232,7 @@ mod sys {
             offset: Offset,
         ) -> *mut c_void;
         pub fn munmap(addr: *mut c_void, len: usize) -> c_int;
+        pub fn mlock(addr: *const c_void, len: usize) -> c_int;
     }
 }
 
@@ -258,6 +286,21 @@ mod tests {
         assert_eq!(map.as_slice(), b"hello mapping");
         drop(map);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A small file locks within the smallest usual limit (64 KB). A
+    /// mapping that exceeds the limit reports the system's error instead.
+    #[cfg(unix)]
+    #[test]
+    fn a_small_mapping_can_be_locked() {
+        let path = std::env::temp_dir().join(format!("smallm-mmap-lock-{}", std::process::id()));
+        std::fs::write(&path, vec![7u8; 16 * 1024]).unwrap();
+        let map = Mapping::open(&path).unwrap();
+        map.lock().unwrap();
+        assert_eq!(map.as_slice()[16 * 1024 - 1], 7);
+        drop(map);
+        std::fs::remove_file(&path).unwrap();
+        assert!(Mapping::from_vec(Vec::new()).lock().is_ok());
     }
 
     #[test]

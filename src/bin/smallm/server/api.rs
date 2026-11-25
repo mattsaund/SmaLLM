@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use smallm::chat::{Message, Role, Template};
+use smallm::chat::{Format, Message, Role, Thinking};
 use smallm::generate::{self, Finish, Options, Overflow, Stats};
 use smallm::model::{Embedder, Pooling, normalize};
 use smallm::{Model, SamplerConfig, Session};
@@ -45,7 +45,9 @@ pub struct Server {
     pub embedder: Option<Mutex<Embedder>>,
     /// The model either of them runs.
     model: Arc<Model>,
-    pub template: Option<Template>,
+    /// The chat format, with the server's choice about thinking, which a
+    /// request can change.
+    pub template: Option<Format>,
     /// The name clients see for the loaded model.
     pub model_id: String,
     /// When set, requests must carry it as a bearer token.
@@ -55,6 +57,12 @@ pub struct Server {
     /// question, when `keep` is unset.
     pub overflow: Overflow,
     pub keep: Option<usize>,
+    /// Sampling settings for requests that do not give their own: the
+    /// server's options, over the model file's, over the built-in ones.
+    pub sampler: SamplerConfig,
+    /// A seed for every request that gives none. Without it, each request
+    /// draws its own.
+    pub seed: Option<u64>,
     connections: AtomicUsize,
     next_id: AtomicU64,
 }
@@ -62,12 +70,14 @@ pub struct Server {
 impl Server {
     pub fn new(
         session: Session,
-        template: Option<Template>,
+        template: Option<Format>,
         model_id: String,
         api_key: Option<String>,
     ) -> Server {
         Server {
             model: Arc::clone(session.model()),
+            sampler: SamplerConfig::from_model_file(session.model().gguf()),
+            seed: None,
             session: Some(Mutex::new(session)),
             embedder: None,
             template,
@@ -182,6 +192,8 @@ impl Server {
             api_key,
             overflow: Overflow::default(),
             keep: None,
+            sampler: SamplerConfig::default(),
+            seed: None,
             connections: AtomicUsize::new(0),
             next_id: AtomicU64::new(1),
         }
@@ -379,7 +391,7 @@ impl Server {
         let parsed = std::str::from_utf8(&request.body)
             .map_err(|_| "the body is not UTF-8".to_string())
             .and_then(Json::parse)
-            .and_then(|body| Job::from_json(&body, kind));
+            .and_then(|body| Job::from_json(&body, kind, &self.sampler, self.seed));
         let mut job = match parsed {
             Ok(job) => job,
             Err(message) => return send_error(out, 400, &message),
@@ -397,13 +409,16 @@ impl Server {
         let (tokens, system) = match &job.input {
             Input::Text(prompt) => (session.model().tokenizer().encode(prompt, true, true), None),
             Input::Chat(messages) => {
-                let Some(template) = self.template else {
+                let Some(mut template) = self.template else {
                     return send_error(
                         out,
                         400,
                         "this model has no chat format. Use /v1/completions.",
                     );
                 };
+                if let Some(thinking) = job.thinking {
+                    template.thinking = thinking;
+                }
                 let tokenizer = session.model().tokenizer();
                 let tokens = generate::chat_tokens_fitting(
                     tokenizer,
@@ -495,6 +510,42 @@ impl Server {
     }
 }
 
+/// Reads a request's `logit_bias`: OpenAI's object of token ids and
+/// biases, or llama.cpp's list of `[token, bias]` pairs, where `false`
+/// bans the token.
+fn logit_bias(value: &Json) -> Result<Vec<(u32, f32)>, String> {
+    let bias = |value: &Json| match value {
+        Json::Bool(false) => Some(f32::NEG_INFINITY),
+        other => other.as_f64().map(|value| value as f32),
+    };
+    let bad = || "'logit_bias' must map token ids to numbers".to_string();
+    match value {
+        Json::Object(members) => members
+            .iter()
+            .map(|(token, value)| {
+                Ok((
+                    token.parse().map_err(|_| bad())?,
+                    bias(value).ok_or_else(bad)?,
+                ))
+            })
+            .collect(),
+        Json::Array(pairs) => pairs
+            .iter()
+            .map(|pair| match pair.as_array() {
+                Some([token, value]) => Ok((
+                    token
+                        .as_usize()
+                        .and_then(|t| u32::try_from(t).ok())
+                        .ok_or_else(bad)?,
+                    bias(value).ok_or_else(bad)?,
+                )),
+                _ => Err(bad()),
+            })
+            .collect(),
+        _ => Err(bad()),
+    }
+}
+
 /// Which completion endpoint a request came in on.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -523,6 +574,8 @@ enum Input {
 struct Job {
     input: Input,
     options: Options,
+    /// The request's choice about thinking, over the server's.
+    thinking: Option<Thinking>,
     stream: bool,
     /// Send token counts as a last event of a stream.
     include_usage: bool,
@@ -530,8 +583,15 @@ struct Job {
 
 impl Job {
     /// Reads a request body. Unknown fields are ignored, as API clients
-    /// send many that only matter to other servers.
-    fn from_json(body: &Json, kind: Kind) -> Result<Job, String> {
+    /// send many that only matter to other servers. Sampling settings the
+    /// request does not give come from `defaults`, and the seed from
+    /// `seed` or the clock.
+    fn from_json(
+        body: &Json,
+        kind: Kind,
+        defaults: &SamplerConfig,
+        seed: Option<u64>,
+    ) -> Result<Job, String> {
         let input = match kind {
             Kind::Chat => {
                 let list = body
@@ -557,23 +617,39 @@ impl Job {
 
         let number = |name: &str| body.get(name).and_then(Json::as_f64);
         let whole = |name: &str| body.get(name).and_then(Json::as_usize);
-        let defaults = SamplerConfig::default();
+        let float = |name: &str, default: f32| number(name).map_or(default, |value| value as f32);
         let clock_seed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |time| time.as_nanos() as u64);
+        let mirostat = match whole("mirostat") {
+            Some(version) if version > 2 => return Err("'mirostat' is 0, 1 or 2".to_string()),
+            Some(version) => version as u8,
+            None => defaults.mirostat,
+        };
+        let logit_bias = match body.get("logit_bias") {
+            None | Some(Json::Null) => defaults.logit_bias.clone(),
+            Some(bias) => logit_bias(bias)?,
+        };
         let sampler = SamplerConfig {
-            temperature: number("temperature").map_or(defaults.temperature, |value| value as f32),
+            temperature: float("temperature", defaults.temperature),
             top_k: whole("top_k").unwrap_or(defaults.top_k),
-            top_p: number("top_p").map_or(defaults.top_p, |value| value as f32),
-            min_p: number("min_p").map_or(defaults.min_p, |value| value as f32),
-            repeat_penalty: number("repeat_penalty")
-                .map_or(defaults.repeat_penalty, |value| value as f32),
+            top_p: float("top_p", defaults.top_p),
+            min_p: float("min_p", defaults.min_p),
+            repeat_penalty: float("repeat_penalty", defaults.repeat_penalty),
             repeat_last_n: whole("repeat_last_n").unwrap_or(defaults.repeat_last_n),
-            frequency_penalty: number("frequency_penalty")
-                .map_or(defaults.frequency_penalty, |value| value as f32),
-            presence_penalty: number("presence_penalty")
-                .map_or(defaults.presence_penalty, |value| value as f32),
-            seed: whole("seed").map_or(clock_seed, |seed| seed as u64),
+            frequency_penalty: float("frequency_penalty", defaults.frequency_penalty),
+            presence_penalty: float("presence_penalty", defaults.presence_penalty),
+            typical_p: float("typical_p", defaults.typical_p),
+            top_n_sigma: float("top_n_sigma", defaults.top_n_sigma),
+            xtc_probability: float("xtc_probability", defaults.xtc_probability),
+            xtc_threshold: float("xtc_threshold", defaults.xtc_threshold),
+            dynatemp_range: float("dynatemp_range", defaults.dynatemp_range),
+            dynatemp_exponent: float("dynatemp_exponent", defaults.dynatemp_exponent),
+            mirostat,
+            mirostat_tau: float("mirostat_tau", defaults.mirostat_tau),
+            mirostat_eta: float("mirostat_eta", defaults.mirostat_eta),
+            logit_bias,
+            seed: whole("seed").map_or(seed.unwrap_or(clock_seed), |seed| seed as u64),
         };
         let stop = match body.get("stop") {
             Some(Json::String(text)) => vec![text.clone()],
@@ -602,13 +678,48 @@ impl Job {
             .and_then(|o| o.get("include_usage"))
             .and_then(Json::as_bool)
             .unwrap_or(false);
+        // Thinking is switched as llama.cpp's server takes it, through the
+        // template's `enable_thinking`, or set with OpenAI's
+        // `reasoning_effort`, at the top level or among the template's
+        // arguments.
+        let arguments = body.get("chat_template_kwargs");
+        let argument = |name: &str| arguments.and_then(|arguments| arguments.get(name));
+        let effort = body
+            .get("reasoning_effort")
+            .or_else(|| argument("reasoning_effort"))
+            .and_then(Json::as_str);
+        let thinking =
+            thinking_choice(argument("enable_thinking").and_then(Json::as_bool), effort)?;
         Ok(Job {
             input,
             options,
+            thinking,
             stream: body.get("stream").and_then(Json::as_bool).unwrap_or(false),
             include_usage,
         })
     }
+}
+
+/// A request's choice about thinking. `enable_thinking: false` turns it off
+/// and `true` on. `reasoning_effort` sets a level: `none` is off, and
+/// `minimal` is gpt-oss's lowest, `low`.
+fn thinking_choice(enable: Option<bool>, effort: Option<&str>) -> Result<Option<Thinking>, String> {
+    if enable == Some(false) {
+        return Ok(Some(Thinking::Off));
+    }
+    let level = match effort {
+        None => None,
+        Some("none") => Some(Thinking::Off),
+        Some("minimal" | "low") => Some(Thinking::Low),
+        Some("medium") => Some(Thinking::Medium),
+        Some("high") => Some(Thinking::High),
+        Some(other) => {
+            return Err(format!(
+                "'reasoning_effort' is none, minimal, low, medium or high, not '{other}'"
+            ));
+        }
+    };
+    Ok(level.or(enable.map(|_| Thinking::On)))
 }
 
 /// Reads one chat message. Content is a string, or a list of text parts.
@@ -833,7 +944,69 @@ mod tests {
     use super::*;
 
     fn job(body: &str, kind: Kind) -> Result<Job, String> {
-        Job::from_json(&Json::parse(body).unwrap(), kind)
+        Job::from_json(
+            &Json::parse(body).unwrap(),
+            kind,
+            &SamplerConfig::default(),
+            None,
+        )
+    }
+
+    #[test]
+    fn thinking_is_switched_per_request() {
+        let thinking = |body: &str| job(body, Kind::Chat).map(|job| job.thinking);
+        let chat = r#""messages": [{"role": "user", "content": "Hi"}]"#;
+        assert_eq!(thinking(&format!("{{{chat}}}")), Ok(None));
+        let off = format!(r#"{{{chat}, "chat_template_kwargs": {{"enable_thinking": false}}}}"#);
+        assert_eq!(thinking(&off), Ok(Some(Thinking::Off)));
+        let on = format!(r#"{{{chat}, "chat_template_kwargs": {{"enable_thinking": true}}}}"#);
+        assert_eq!(thinking(&on), Ok(Some(Thinking::On)));
+        let high = format!(r#"{{{chat}, "reasoning_effort": "high"}}"#);
+        assert_eq!(thinking(&high), Ok(Some(Thinking::High)));
+        let inside =
+            format!(r#"{{{chat}, "chat_template_kwargs": {{"reasoning_effort": "low"}}}}"#);
+        assert_eq!(thinking(&inside), Ok(Some(Thinking::Low)));
+        assert_eq!(
+            thinking_choice(Some(true), Some("none")),
+            Ok(Some(Thinking::Off))
+        );
+        assert_eq!(
+            thinking_choice(Some(false), Some("high")),
+            Ok(Some(Thinking::Off))
+        );
+        assert!(thinking(&format!(r#"{{{chat}, "reasoning_effort": "max"}}"#)).is_err());
+    }
+
+    #[test]
+    fn new_sampling_fields_and_server_defaults_are_read() {
+        let body = Json::parse(
+            r#"{"prompt": "x", "typical_p": 0.9, "top_n_sigma": 1.5, "mirostat": 2,
+                "logit_bias": {"5": -100, "7": 2.5}}"#,
+        )
+        .unwrap();
+        let defaults = SamplerConfig {
+            temperature: 1.0,
+            top_k: 64,
+            ..SamplerConfig::default()
+        };
+        let job = Job::from_json(&body, Kind::Text, &defaults, Some(42)).unwrap();
+        let sampler = &job.options.sampler;
+        assert_eq!((sampler.temperature, sampler.top_k), (1.0, 64));
+        assert_eq!(
+            (sampler.typical_p, sampler.top_n_sigma, sampler.mirostat),
+            (0.9, 1.5, 2)
+        );
+        assert_eq!(sampler.logit_bias, [(5, -100.0), (7, 2.5)]);
+        assert_eq!(sampler.seed, 42);
+        // llama.cpp's form, where false bans a token.
+        let pairs = Json::parse(r#"[[3, false], [4, 1]]"#).unwrap();
+        assert_eq!(
+            logit_bias(&pairs).unwrap(),
+            [(3, f32::NEG_INFINITY), (4, 1.0)]
+        );
+        assert!(logit_bias(&Json::parse(r#"{"x": 1}"#).unwrap()).is_err());
+        let bad = Json::parse(r#"{"prompt": "x", "mirostat": 3}"#).unwrap();
+        assert!(Job::from_json(&bad, Kind::Text, &defaults, None).is_err());
     }
 
     #[test]

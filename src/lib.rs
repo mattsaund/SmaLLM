@@ -50,6 +50,7 @@ pub mod tokenizer;
 #[cfg(test)]
 mod testing;
 
+pub use chat::{Format, Thinking};
 pub use error::{Error, Result};
 pub use model::{Model, Session, SessionConfig};
 pub use sampler::{Sampler, SamplerConfig};

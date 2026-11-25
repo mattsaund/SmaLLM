@@ -12,7 +12,7 @@ use std::sync::OnceLock;
 
 /// Every setting the file can hold: its name, its default and what it
 /// does. The names are those of the command-line options they stand for.
-pub const SETTINGS: [(&str, &str, &str); 23] = [
+pub const SETTINGS: [(&str, &str, &str); 34] = [
     (
         "ctx",
         "auto",
@@ -30,8 +30,9 @@ pub const SETTINGS: [(&str, &str, &str); 23] = [
     ),
     (
         "batch",
-        "32",
-        "Prompt tokens read together. More reads prompts faster and takes more memory.",
+        "auto",
+        "Prompt tokens read together. More reads prompts faster and takes more memory.\n\
+         # auto: 64 on x86 and 32 elsewhere, or 128 for models with experts.",
     ),
     (
         "cache-type",
@@ -49,31 +50,37 @@ pub const SETTINGS: [(&str, &str, &str); 23] = [
         "auto",
         "Tokens at the start that middle keeps. auto: the system prompt and the first question.",
     ),
-    ("temp", "0.8", "Randomness of the answers, 0 for none."),
+    (
+        "temp",
+        "auto",
+        "Randomness of the answers, 0 for none. auto: the model file's, else 0.8.",
+    ),
     (
         "top-k",
-        "40",
-        "Choose among the k most likely tokens, 0 for all.",
+        "auto",
+        "Choose among the k most likely tokens, 0 for all. auto: the model file's, else 40.",
     ),
     (
         "top-p",
-        "0.95",
-        "Choose among the tokens that make up this much of the probability.",
+        "auto",
+        "Choose among the tokens that make up this much of the probability.\n\
+         # auto: the model file's, else 0.95.",
     ),
     (
         "min-p",
-        "0.05",
-        "Leave out tokens less likely than this share of the best one.",
+        "auto",
+        "Leave out tokens less likely than this share of the best one.\n\
+         # auto: the model file's, else 0.05.",
     ),
     (
         "repeat-penalty",
-        "1.0",
-        "Penalty on recent tokens, 1 for none.",
+        "auto",
+        "Penalty on recent tokens, 1 for none. auto: the model file's, else 1.",
     ),
     (
         "repeat-last-n",
-        "64",
-        "How many tokens back the penalties look.",
+        "auto",
+        "How many tokens back the penalties look. auto: the model file's, else 64.",
     ),
     (
         "frequency-penalty",
@@ -86,6 +93,52 @@ pub const SETTINGS: [(&str, &str, &str); 23] = [
         "Lower the score of every token used recently.",
     ),
     (
+        "typical",
+        "1",
+        "Keep the tokens of typical surprise, up to this much probability. 1 for all.",
+    ),
+    (
+        "top-nsigma",
+        "0",
+        "Keep tokens within this many standard deviations of the best one. 0 for all.",
+    ),
+    (
+        "xtc-probability",
+        "auto",
+        "How often XTC drops the most likely tokens, 0 for never.\n\
+         # auto: the model file's, else 0.",
+    ),
+    (
+        "xtc-threshold",
+        "auto",
+        "Probability a token needs for XTC to drop it. auto: the model file's, else 0.1.",
+    ),
+    (
+        "dynatemp-range",
+        "0",
+        "Let the temperature move this far with the uncertainty, 0 for a fixed one.",
+    ),
+    (
+        "dynatemp-exp",
+        "1",
+        "How the dynamic temperature follows the uncertainty, 1 for linear.",
+    ),
+    (
+        "mirostat",
+        "auto",
+        "Mirostat version, 0 for off. auto: the model file's, else 0.",
+    ),
+    (
+        "mirostat-ent",
+        "auto",
+        "Mirostat's target surprise. auto: the model file's, else 5.",
+    ),
+    (
+        "mirostat-lr",
+        "auto",
+        "Mirostat's learning rate. auto: the model file's, else 0.1.",
+    ),
+    (
         "seed",
         "auto",
         "Seed of the random choices. auto: a new one every time.",
@@ -93,7 +146,7 @@ pub const SETTINGS: [(&str, &str, &str); 23] = [
     (
         "max-tokens",
         "auto",
-        "Stop an answer after this many tokens. auto: no limit.",
+        "Stop an answer after this many tokens, reasoning included. auto: no limit.",
     ),
     (
         "system",
@@ -101,9 +154,20 @@ pub const SETTINGS: [(&str, &str, &str); 23] = [
         "A system message for every chat. Empty for none.",
     ),
     (
+        "cpus",
+        "auto",
+        "The CPUs to run on, such as 6-7 or 0,2,4-5. Linux and Android. auto: all of them.",
+    ),
+    (
         "template",
         "auto",
         "Chat format. auto: the one the model file describes.",
+    ),
+    (
+        "think",
+        "auto",
+        "Whether a reasoning model thinks first: on or off, or low, medium or high for gpt-oss.\n\
+         # auto: as the model does.",
     ),
     (
         "host",
@@ -131,17 +195,49 @@ pub struct Config {
 
 static LOADED: OnceLock<Config> = OnceLock::new();
 
+/// Values that SmaLLM 0.3.0 and earlier wrote into every settings file, for
+/// settings whose default is `auto` now. In a file those versions wrote,
+/// they are the old defaults, not choices. Read as written, they would
+/// override the model file's sampling settings and the larger prompt batch.
+const OLD_DEFAULTS: [(&str, &str); 7] = [
+    ("batch", "32"),
+    ("temp", "0.8"),
+    ("top-k", "40"),
+    ("top-p", "0.95"),
+    ("min-p", "0.05"),
+    ("repeat-penalty", "1.0"),
+    ("repeat-last-n", "64"),
+];
+
 /// Reads the settings file, once, and reports lines it cannot use. Until
 /// this runs, as in tests, no settings apply.
 pub fn init() {
     LOADED.get_or_init(|| {
         let text = std::fs::read_to_string(path()).unwrap_or_default();
-        let (values, problems) = parse(&text);
+        let (mut values, problems) = parse(&text);
         for problem in problems {
             eprintln!("smallm: {}: {problem}", path().display());
         }
+        forget_old_defaults(&text, &mut values);
         Config { values }
     });
+}
+
+/// Reads the [`OLD_DEFAULTS`] as `auto` in a file an older version wrote.
+/// Such a file starts with the header this program writes and has no
+/// `mirostat` line, which every file written since has. A value the owner
+/// changed is kept, and so is every value in a file written by hand.
+fn forget_old_defaults(text: &str, values: &mut [(String, String)]) {
+    let written_by_us = text.starts_with("# SmaLLM settings.");
+    let older = written_by_us && !values.iter().any(|(name, _)| name == "mirostat");
+    if !older {
+        return;
+    }
+    for (name, value) in values.iter_mut() {
+        if OLD_DEFAULTS.contains(&(name.as_str(), value.as_str())) {
+            *value = "auto".to_string();
+        }
+    }
 }
 
 /// The settings of this run, once [`init`] has read them.
@@ -273,6 +369,30 @@ mod tests {
         assert_eq!(config.value("ctx"), None);
         assert_eq!(config.value("system"), None);
         assert_eq!(config.value("overflow"), Some("middle"));
-        assert_eq!(config.value("batch"), Some("32"));
+        assert_eq!(config.value("batch"), None);
+    }
+
+    #[test]
+    fn old_defaults_in_an_older_file_read_as_auto() {
+        let older = "# SmaLLM settings.\n\nbatch = 32\ntemp = 0.8\ntop-k = 50\nmin-p = 0.05\n";
+        let read = |text: &str| {
+            let (mut values, _) = parse(text);
+            forget_old_defaults(text, &mut values);
+            Config { values }
+        };
+        let config = read(older);
+        assert_eq!(config.value("batch"), None);
+        assert_eq!(config.value("temp"), None);
+        assert_eq!(config.value("min-p"), None);
+        assert_eq!(config.value("top-k"), Some("50"), "a changed value stays");
+        // A file written since, or by hand, means what it says.
+        let newer = format!("{older}mirostat = auto\n");
+        assert_eq!(read(&newer).value("temp"), Some("0.8"));
+        assert_eq!(read("temp = 0.8\n").value("temp"), Some("0.8"));
+        // The defaults written today are never taken for old ones.
+        let today = read(&defaults());
+        assert!(SETTINGS.iter().all(|(name, value, _)| {
+            today.value(name).is_none() || today.value(name) == Some(value)
+        }));
     }
 }

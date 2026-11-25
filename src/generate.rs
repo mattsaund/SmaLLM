@@ -11,7 +11,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::chat::{Message, Template};
+use crate::chat::{Format, Message};
 use crate::error::{Error, Result};
 use crate::model::Session;
 use crate::sampler::{Sampler, SamplerConfig};
@@ -169,25 +169,32 @@ pub fn run(
     run_tokens(session, &tokens, options, on_text)
 }
 
-/// Answers a conversation, formatted with `template`.
+/// Answers a conversation, written in `format`: a [`Format`], or a
+/// [`Template`](crate::chat::Template) that leaves reasoning to the model.
 pub fn chat(
     session: &mut Session,
-    template: Template,
+    format: impl Into<Format>,
     messages: &[Message],
     options: &Options,
     on_text: impl FnMut(&str) -> bool,
 ) -> Result<Stats> {
-    let tokens = chat_tokens(session.model().tokenizer(), template, messages);
+    let tokens = chat_tokens(session.model().tokenizer(), format, messages);
     run_tokens(session, &tokens, options, on_text)
 }
 
 /// The tokens of a conversation that ends with an open assistant turn.
-pub fn chat_tokens(tokenizer: &Tokenizer, template: Template, messages: &[Message]) -> Vec<u32> {
+pub fn chat_tokens(
+    tokenizer: &Tokenizer,
+    format: impl Into<Format>,
+    messages: &[Message],
+) -> Vec<u32> {
     let eos = tokenizer
         .eos()
         .map(|token| tokenizer.token_text(token))
         .unwrap_or_default();
-    let parts = template.render(messages, true, &String::from_utf8_lossy(eos));
+    let parts = format
+        .into()
+        .render(messages, true, &String::from_utf8_lossy(eos));
     let parts: Vec<(&str, bool)> = parts
         .iter()
         .map(|part| (part.text.as_str(), part.markup))
@@ -203,16 +210,17 @@ pub fn chat_tokens(tokenizer: &Tokenizer, template: Template, messages: &[Messag
 /// kept. Returns the tokens and the number of messages dropped.
 pub fn chat_tokens_fitting(
     tokenizer: &Tokenizer,
-    template: Template,
+    format: impl Into<Format>,
     messages: &[Message],
     n_ctx: usize,
     reserve: usize,
     overflow: Overflow,
 ) -> (Vec<u32>, usize) {
     use crate::chat::Role;
+    let format = format.into();
     let mut kept: Vec<Message> = messages.to_vec();
     loop {
-        let tokens = chat_tokens(tokenizer, template, &kept);
+        let tokens = chat_tokens(tokenizer, format, &kept);
         if tokens.len() + reserve <= n_ctx {
             return (tokens, messages.len() - kept.len());
         }
@@ -242,7 +250,7 @@ pub fn chat_tokens_fitting(
 /// instructions or the question that began the conversation.
 pub fn opening_tokens(
     tokenizer: &Tokenizer,
-    template: Template,
+    format: impl Into<Format>,
     messages: &[Message],
     prompt: &[u32],
 ) -> usize {
@@ -257,7 +265,7 @@ pub fn opening_tokens(
     }
     // The opening renders the same in front of any conversation, up to the
     // turn after it.
-    let alone = chat_tokens(tokenizer, template, &messages[..system + first_user]);
+    let alone = chat_tokens(tokenizer, format, &messages[..system + first_user]);
     alone.iter().zip(prompt).take_while(|(a, b)| a == b).count()
 }
 
@@ -425,7 +433,7 @@ pub fn run_tokens_with(
 }
 
 /// Follows which part of its output a model is writing: its reasoning or
-/// its answer. Two conventions are known.
+/// its answer. Three conventions are known.
 ///
 /// - `<think>` and `</think>` around the reasoning (Qwen3, DeepSeek R1).
 ///   A prompt may open the reasoning itself, and then the model starts
@@ -434,9 +442,15 @@ pub fn run_tokens_with(
 ///   `<|start|>assistant<|channel|>final<|message|>`, and ends with
 ///   `<|end|>`. The final channel is the answer and the others (analysis,
 ///   commentary) are reasoning. Headers are not output.
+/// - Gemma 4's channels: `<|channel>thought`, a newline, the reasoning, and
+///   `<channel|>`. The answer follows. The name line is not output.
 struct Channels {
     /// `<think>` and `</think>`.
     think: Option<(u32, u32)>,
+    /// Gemma 4's `<|channel>` and `<channel|>`.
+    gemma: Option<(u32, u32)>,
+    /// True while the name line of a Gemma 4 channel is read.
+    naming: bool,
     /// Harmony's `<|start|>`, `<|channel|>`, `<|message|>` and `<|end|>`.
     harmony: Option<[u32; 4]>,
     /// Harmony's `<|constrain|>`, which can sit in a header.
@@ -457,6 +471,7 @@ impl Channels {
     fn new(tokenizer: &Tokenizer, prompt: &[u32], enabled: bool) -> Channels {
         let find = |text: &str| tokenizer.find(text.as_bytes()).filter(|_| enabled);
         let think = find("<think>").zip(find("</think>"));
+        let gemma = find("<|channel>").zip(find("<channel|>"));
         let harmony = match (
             find("<|start|>"),
             find("<|channel|>"),
@@ -470,6 +485,8 @@ impl Channels {
         };
         Channels {
             think,
+            gemma,
+            naming: false,
             harmony,
             constrain: find("<|constrain|>"),
             reasoning: opens_thought(think, prompt),
@@ -481,6 +498,21 @@ impl Channels {
     /// Where the text of `token`, `piece`, goes: `None` to drop it, or the
     /// text to show and whether it is reasoning.
     fn route<'p>(&mut self, token: u32, piece: &'p [u8]) -> Option<(&'p [u8], bool)> {
+        let mut piece = piece;
+        if let Some((open, close)) = self.gemma {
+            if token == open || token == close {
+                self.naming = token == open;
+                self.switch(token == open);
+                return None;
+            }
+            if self.naming {
+                // The channel's name runs to the end of its line, and its
+                // reasoning starts after that.
+                let end = piece.iter().position(|&byte| byte == b'\n')?;
+                self.naming = false;
+                piece = &piece[end + 1..];
+            }
+        }
         if let Some([start, channel, message, end]) = self.harmony {
             if token == start || token == channel {
                 // A header, or the channel part of one: read it afresh.
@@ -783,6 +815,8 @@ mod tests {
     fn channels(think: Option<(u32, u32)>, harmony: Option<[u32; 4]>) -> Channels {
         Channels {
             think,
+            gemma: None,
+            naming: false,
             harmony,
             constrain: Some(5),
             reasoning: false,
@@ -809,6 +843,39 @@ mod tests {
         // Without tags, everything is answer, leading space included.
         let mut router = channels(Some((10, 11)), None);
         assert_eq!(route(&mut router, &[(20, " Hi")]).0, " Hi");
+    }
+
+    #[test]
+    fn gemma_4_channels_are_reasoning() {
+        let mut router = channels(None, None);
+        router.gemma = Some((30, 31));
+        let (answer, reasoning) = route(
+            &mut router,
+            &[
+                (30, "<|channel>"),
+                (20, "thought"),
+                (21, "\nPlan"),
+                (22, " it."),
+                (31, "<channel|>"),
+                (23, "Done."),
+            ],
+        );
+        assert_eq!((answer.as_str(), reasoning.as_str()), ("Done.", "Plan it."));
+        // A name line split over tokens, and an empty channel.
+        let mut router = channels(None, None);
+        router.gemma = Some((30, 31));
+        let (answer, reasoning) = route(
+            &mut router,
+            &[
+                (30, ""),
+                (20, "thou"),
+                (21, "ght"),
+                (22, "\n"),
+                (31, ""),
+                (23, "Hi"),
+            ],
+        );
+        assert_eq!((answer.as_str(), reasoning.as_str()), ("Hi", ""));
     }
 
     #[test]

@@ -257,12 +257,13 @@ the C API already carries a `device` field for choosing one.
 ## Reading a prompt: tiles
 
 Generating a token multiplies each weight row by one vector. Reading a
-prompt multiplies it by a batch of them, 32 by default, and that changes
-what is worth doing.
+prompt multiplies it by a batch of them, 64 by default on x86 and 32
+elsewhere, or 128 for a model with experts, and that changes what is worth
+doing.
 
 The kernels above unpack a row's blocks while they multiply. For a batch
-that would unpack every row 32 times. So a batch of 8 or more vectors takes
-another route:
+that would unpack every row once per vector. So a batch of 8 or more
+vectors takes another route:
 
 1. A few rows are unpacked once into a **tile**: 8 rows with AVX2, 4 with
    NEON. Unpacking 6-bit weights costs the same as multiplying them, so
@@ -382,9 +383,16 @@ help neither.
 
 ## Sampling and the generation loop
 
-The sampler narrows the candidates in a fixed order: repetition penalty,
-top-k, top-p, min-p, temperature, then a random draw. A temperature of zero
-takes the best token.
+The sampler narrows the candidates in llama.cpp's default order: logit
+bias, the repetition, frequency and presence penalties, top-n-sigma, top-k,
+typical, top-p, min-p and XTC. Then the temperature, fixed or moved with the
+entropy of what is left, and a random draw. A step whose setting is off is
+skipped, and a temperature of zero takes the best token. Mirostat replaces
+the truncating steps: it keeps the tokens whose surprise is under a running
+estimate, which it moves after each choice toward a target.
+
+The defaults come from the model file where it recommends them
+(`general.sampling.*`), below the settings file and the command line.
 
 The loop in `generate.rs` does the bookkeeping around it:
 
@@ -398,14 +406,23 @@ The loop in `generate.rs` does the bookkeeping around it:
 - **It trims long chats.** When a conversation outgrows the window, the
   oldest turns are left out and the system message is kept.
 - **It keeps reasoning apart.** Thinking models write their reasoning
-  between `<think>` tags or, in OpenAI's Harmony format, on a channel other
-  than the final one. A small state machine follows those markers, so the
-  reasoning can be shown faint, sent as its own field, or left out, and the
-  markers never reach the output.
+  between `<think>` tags, in Gemma 4's `<|channel>thought` block or, in
+  OpenAI's Harmony format, on a channel other than the final one. A small
+  state machine follows those markers, so the reasoning can be shown faint,
+  sent as its own field, or left out, and the markers never reach the
+  output.
 
 Chat formats are recognized from the template text in the model file and
 written out by hand. Running the template itself would take an interpreter
 several times the size of everything else in the module.
+
+The template text also says how a model's thinking is switched. A template
+with an `enable_thinking` argument writes a block of empty reasoning after
+the assistant's opening to turn it off, and that block is found in the text:
+`<think>\n\n</think>\n\n` for Qwen3, `<think></think>` for LFM3. Gemma 4
+turns thinking on with `<|think|>` at the top of the system turn, and gpt-oss
+sets a level on the `Reasoning:` line of its system message. `Format` in
+`chat.rs` pairs a template with that choice.
 
 ## Accuracy
 

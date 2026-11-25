@@ -71,8 +71,23 @@ use mla::MlaScratch;
 /// Context length used when the caller does not choose one.
 const DEFAULT_CONTEXT: usize = 4096;
 
-/// Tokens per forward pass while reading a prompt.
+/// Tokens per forward pass while reading a prompt. On x86, 64 read prompts up
+/// to 11 percent faster than 32, for 2 to 6 MB more scratch memory.
+#[cfg(target_arch = "x86_64")]
+const DEFAULT_BATCH: usize = 64;
+
+/// The same elsewhere. On an Allwinner A733's Cortex-A76 cores, 64 gained
+/// nothing over 32 (LFM3 level, Nemotron 3 percent slower, runs alternated
+/// and started at the same temperature) and took 5 to 6 MB more, so other
+/// machines keep 32 until one measures otherwise.
+#[cfg(not(target_arch = "x86_64"))]
 const DEFAULT_BATCH: usize = 32;
+
+/// The same for models with experts. A batch is split among the experts its
+/// tokens are routed to, so each expert needs a larger batch for its
+/// multiply to fill the prompt route's tiles. On x86, 128 read prompts 21
+/// to 51 percent faster than 32 for 13 to 44 MB more scratch memory.
+const DEFAULT_BATCH_EXPERTS: usize = 128;
 
 /// Attention over fewer multiply-adds than this runs on the calling thread.
 const INLINE_ATTENTION_WORK: usize = 64 * 1024;
@@ -192,7 +207,8 @@ pub struct SessionConfig {
     /// follows. Reading a prompt is arithmetic that every core speeds up,
     /// where generating waits on memory.
     pub batch_threads: usize,
-    /// Tokens evaluated together while reading a prompt. Zero picks 32.
+    /// Tokens evaluated together while reading a prompt. Zero picks 64 on
+    /// x86 and 32 elsewhere, or 128 for a model with experts.
     /// Larger batches read prompts faster and use more scratch memory.
     pub batch: usize,
     /// The kernel backend. `None` picks the fastest one the CPU supports.
@@ -598,10 +614,10 @@ impl Session {
         } else {
             config.n_ctx
         };
-        let batch = if config.batch == 0 {
-            DEFAULT_BATCH
-        } else {
-            config.batch
+        let batch = match config.batch {
+            0 if c.routing.is_some() => DEFAULT_BATCH_EXPERTS,
+            0 => DEFAULT_BATCH,
+            chosen => chosen,
         };
         let threads = if config.threads == 0 {
             default_threads()

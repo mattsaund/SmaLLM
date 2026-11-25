@@ -85,6 +85,20 @@ Anonymous memory: SmaLLM 12 to 21 MB, llama.cpp 1.3 GB (LFM3) and 6.8 GB
 (Nemotron). Pinning the generation threads to the A76s changed nothing:
 the scheduler already keeps them there.
 
+Measured again after 0.3.0, against llama.cpp b12711 (its prebuilt
+`ubuntu-arm64` build, which picks its `armv8.2_2` CPU variant here). Both
+models with a 128-token prompt and 64 generated tokens on the two A76
+cores, the engines alternating, each run started under 62°C, best of three.
+The rounds agreed to within 1 percent.
+
+| Model (format) | Prompt: SmaLLM | Prompt: llama.cpp | Generation: SmaLLM | Generation: llama.cpp |
+|---|---|---|---|---|
+| LFM3-1.7B (Q4_0) | 12.8 | 44.6 | 7.5 | 8.7 |
+| Nemotron 3.5 Bolt E4B (Q4_K_M) | 8.9 | 8.5 | 2.8 | 2.7 |
+
+This llama.cpp generates Q4_0 faster than the build measured first (8.7
+against 8.0), which doubles the Q4_0 generation gap.
+
 Findings:
 
 - **Q4_0 prompt reading is 3.6 times slower than llama.cpp.** About 96
@@ -96,10 +110,12 @@ Findings:
   accumulators and uses `sdot` by lane, so each loaded weight register
   serves four tokens. The NEON tile kernel's register blocking is the first
   place to look.
-- **Generation is memory-bound and close to llama.cpp.** Q4_0 is 7 percent
-  behind (7.4 against 8.0), Q4_K_M 8 percent ahead (2.7 against 2.5). On
-  Q4_0, SmaLLM reads weights at about 7.7 GB/s and llama.cpp at 8.3, so the
-  Q4_0 matrix-vector kernel has some headroom. In LFM3's generation profile the
+- **Generation is memory-bound, and Q4_0 falls behind.** Against the build
+  measured first, Q4_0 was 7 percent behind (7.4 against 8.0) and Q4_K_M 8
+  percent ahead (2.7 against 2.5). Against b12711, Q4_0 is 14 percent
+  behind (7.5 against 8.7) and Q4_K_M 4 percent ahead (2.8 against 2.7). On
+  Q4_0, SmaLLM reads weights at about 7.7 GB/s, so the Q4_0 matrix-vector
+  kernel leaves bandwidth unused. In LFM3's generation profile the
   feed-forward up projection takes 40 percent, down 21, the logits 18 (a
   tied 128,000 by 2,048 Q6_K embedding, about 215 MB per token) and query,
   key and value 13.
@@ -116,24 +132,38 @@ Findings:
   affinity mask: under `taskset -c 0-5` (the six A55s) SmaLLM still found
   two fast cores and generated on 2 threads, where 6 was right. Both are
   fixed after 0.3.0.
-- **A prompt batch of 64** read 6 percent faster than 32 here (18.8
-  against 17.7 tokens per second). Its scratch memory cost is not measured
-  yet.
+- **A prompt batch of 64 does not pay here.** The first runs showed 64 6
+  percent faster than 32 (18.8 against 17.7 tokens per second), but those
+  runs followed each other and heated the board. Alternated, each started
+  under 62°C, best of three on all 8 cores, a 128-token prompt: LFM3 read
+  19.3 tokens per second at both sizes, and Nemotron 11.9 at 32 against
+  11.5 at 64. 64 took 4.7 MB (LFM3) and 6.4 MB (Nemotron) more. ARM keeps
+  32, and x86, where 64 is faster, moved to 64 (after 0.3.0).
+- **Heat decides back-to-back measurements.** The A76 cluster starts idle
+  injection at 70°C (`cpub_idle_zone`) and throttles at 90°C, and the board
+  idles at 60°C with its fan at full speed. One run of a 128-token prompt
+  takes it to 81 to 84°C. Over a series of runs without pauses, LFM3's
+  generation fell from 7.4 to 6.2 tokens per second. Alternate what is
+  compared, and start each run at the same temperature: wait until
+  `/sys/class/thermal/thermal_zone0/temp` is under 62000.
 - **Storage.** Weights are mapped, so under memory pressure their pages are
   dropped and read again from the card: Nemotron's 6.2 GB takes about 95
-  seconds at 65 MB/s. Locking the weights in memory (opt-in, for boards with
-  RAM to spare) would prevent that. A cold start is fine: LFM3's first token
+  seconds at 65 MB/s. `--mlock` (opt-in, added after 0.3.0) keeps the
+  weights in memory instead. It needs a locked-memory limit as large as the
+  file, and the board's is 8 MB (`ulimit -l`), so a service needs
+  `LimitMEMLOCK=infinity`. A cold start is fine: LFM3's first token
   (1.05 GB of weights) took 18.7 seconds straight off the card through page
   faults, against 16.1 to read the file in order and 1.2 warm. Asking the
   kernel to read ahead at load (`MADV_WILLNEED`) would save at most 15
   percent.
 - **Thinking costs a lot here.** At about 7 tokens per second on two A76
-  cores, LFM3 reasons for tens of seconds before every answer, and SmaLLM
-  has no switch to turn that off. `--max-tokens` counts reasoning tokens
-  too, so a small limit can end before the answer starts.
-- **Sampling settings in the file are ignored.** Nemotron 3.5 Bolt E4B's
-  file asks for temperature 1.0, top-k 64 and top-p 0.95. SmaLLM uses its
-  own defaults, 0.8, 40 and 0.95.
+  cores, LFM3 reasons for tens of seconds before every answer. 0.3.0 had no
+  switch to turn that off. `--think off` does now (added after 0.3.0).
+  `--max-tokens` counts reasoning tokens too, so a small limit can end
+  before the answer starts.
+- **Sampling settings in the file were ignored** in 0.3.0. Nemotron 3.5
+  Bolt E4B's file asks for temperature 1.0, top-k 64 and top-p 0.95, where
+  SmaLLM used its own 0.8, 40 and 0.95. They are the defaults now.
 - **The GPU would not help generation.** The PowerVR BXM-4-64 (vendor DDK
   24.2) measures 5.27 GB/s and 37 GFLOPS with clpeak at its 600 MHz, below
   the CPU's 8 GB/s. Its Vulkan shader compiler fails on 16-bit storage
@@ -169,12 +199,12 @@ Findings:
    still uses the portable versions of `quantize`, `silu_mul`, the softmax
    and the attention kernels (`dot_rows`, `mix_rows` and their 16-bit
    forms). Writing them with NEON is the likely next step if they show up.
-5. **How large should a prompt batch be for mixtures of experts?** The
-   default batch of 32 tokens leaves each of 64 experts about 3 tokens,
-   too few for the tile route. On the desktop, `-b 256` read the prompts
-   of DeepSeek-Coder-V2-Lite 1.6 times as fast as llama.cpp, where the
-   default batch was slower than it. A larger default for expert models
-   costs scratch memory.
+5. **Are the prompt batch sizes right here?** The defaults are 32 tokens on
+   ARM (64 on x86), and 128 for models with experts, whose batch is split
+   among the experts its tokens are routed to. The dense default was
+   measured on the A733, the expert one only on x86. Time `-b 32`, `64`,
+   `128` and `256` on an expert model on a board, alternating and starting
+   each run at the same temperature, and watch the memory `bench` reports.
 6. **Memory.** `smallm bench` prints what the process holds. Compare with
    `ref mem`. Models of 10 to 12 GB, such as gpt-oss-20b and
    DeepSeek-V2-Lite at Q4_K_M, leave a 12 GB board little room. The

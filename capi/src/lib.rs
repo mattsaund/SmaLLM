@@ -157,6 +157,7 @@ impl SmallmSamplerParams {
             frequency_penalty: self.frequency_penalty,
             presence_penalty: self.presence_penalty,
             seed: self.seed,
+            ..SamplerConfig::default()
         }
     }
 }

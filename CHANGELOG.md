@@ -12,6 +12,48 @@ Each version is a `v` tag, with ready-made binaries and libraries on its
   now, so `taskset` limits them.
 - **`smallm rm` asks first**, as `uninstall` does. `--yes` skips the
   question. `smallm list --help` and `smallm rm --help` work.
+- **Sampling defaults from the model file.** The settings a model file
+  recommends (`general.sampling.*`: temperature, top-k, top-p, min-p, the
+  repetition penalty and its window, XTC and Mirostat) are the defaults,
+  as llama.cpp reads them. `smallm.conf` and the command line still win,
+  and the file's sampling settings default to `auto`. A settings file
+  written by 0.3.0 or earlier spells out the old defaults (`temp = 0.8`,
+  `batch = 32` and the rest). Those values now read as `auto`, so they do
+  not hide the model's settings. Values that were changed are kept.
+- **Six more samplers**, in llama.cpp's order and with its option names:
+  typical (`--typical`), top-n-sigma (`--top-nsigma`), XTC
+  (`--xtc-probability`, `--xtc-threshold`), dynamic temperature
+  (`--dynatemp-range`, `--dynatemp-exp`), Mirostat 1 and 2 (`--mirostat`,
+  `--mirostat-ent`, `--mirostat-lr`) and logit bias
+  (`--logit-bias TOKEN+BIAS`, repeatable). The server reads them from
+  requests: `typical_p`, `top_n_sigma`, `xtc_probability`,
+  `xtc_threshold`, `dynatemp_range`, `dynatemp_exponent`, `mirostat`,
+  `mirostat_tau`, `mirostat_eta`, and `logit_bias` as OpenAI's object or
+  llama.cpp's list of pairs.
+- **`smallm serve` takes the sampling options** as defaults for requests
+  that do not give their own.
+- **A switch for thinking.** `--think off` makes Qwen3, LFM3, SmolLM3 and
+  RWKV-7 G1 answer without reasoning, written the way each model's own
+  template writes it. `--think on` turns it on for Gemma 4, whose reasoning
+  is now kept apart from its answer. gpt-oss always reasons and takes
+  `--think low`, `medium` or `high`. The server takes
+  `chat_template_kwargs.enable_thinking` and `reasoning_effort` per
+  request, and `serve --think` sets its default.
+- **Larger prompt batches on x86 and for models with experts.** Prompts
+  are read 64 tokens at a time on x86 (32 before), and 128 for models with
+  experts on every machine, whose batch is split among the experts. On an
+  Intel Core i7-14700K, dense models read prompts up to 11 percent faster
+  for 2 to 6 MB more scratch memory. The expert models read them about 44
+  percent faster: DeepSeek-Coder-V2-Lite at 189 tokens per second against
+  llama.cpp's 162 (0.83 times llama.cpp before), for 44 MB. ARM keeps 32,
+  which was as fast as 64 on the Allwinner A733 and took 5 to 6 MB less.
+- **`--cpus`** runs on chosen CPUs, such as one cluster of a board, and the
+  thread counts follow them. Linux and Android. The `cpus` setting does the
+  same.
+- **`--mlock`** reads the whole model into memory at load and keeps it
+  there, for boards whose storage is too slow to read pages back. It needs
+  a locked-memory limit (`ulimit -l`) as large as the file.
+- `--max-tokens` says in its help that it counts reasoning tokens.
 
 ## 0.3.0 - 2026-11-24
 

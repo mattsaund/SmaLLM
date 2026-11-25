@@ -7,8 +7,8 @@ use smallm::Session;
 use smallm::model::{Embedder, Pooling};
 
 use super::{
-    CONTEXT_SPECS, SESSION_SPECS, TEMPLATE_SPECS, chat_template, describe, load_model,
-    overflow_options, session_config,
+    CONTEXT_SPECS, SAMPLER_SPECS, SESSION_SPECS, TEMPLATE_SPECS, chat_template, describe,
+    load_model, overflow_options, sampler_config, session_config,
 };
 use crate::args::{self, Args, Spec, value};
 use crate::server::api::Server;
@@ -29,6 +29,7 @@ fn specs() -> Vec<Spec> {
         .chain(SESSION_SPECS)
         .chain(CONTEXT_SPECS)
         .chain(TEMPLATE_SPECS)
+        .chain(SAMPLER_SPECS)
         .collect()
 }
 
@@ -38,7 +39,8 @@ pub fn help() -> String {
          Serves the model over HTTP, in the API that OpenAI clients speak:\n\
          /v1/chat/completions, /v1/completions and /v1/models.\n\
          Also /tokenize and /detokenize. An embedding model is served at\n\
-         /v1/embeddings, and a reranking model at /v1/rerank.\n\n\
+         /v1/embeddings, and a reranking model at /v1/rerank. The sampling\n\
+         options set the defaults for requests that do not give their own.\n\n\
          Options:\n{}",
         args::describe(&specs())
     )
@@ -53,7 +55,7 @@ pub fn main(raw: impl Iterator<Item = String>) -> Result<(), String> {
     let port: u16 = args.number("port")?.unwrap_or(8080);
     let api_key = args.get("api-key").map(str::to_string);
 
-    let loaded = load_model(name)?;
+    let loaded = load_model(name, &args)?;
     let model = &loaded.model;
 
     // Clients name the model in requests. The file name is what people
@@ -95,10 +97,12 @@ pub fn main(raw: impl Iterator<Item = String>) -> Result<(), String> {
             super::thread_counts(&session),
             session.kernels(),
             session.n_ctx(),
-            template.map_or("none", |template| template.name())
+            template.map_or("none", |format| format.template.name())
         );
         let mut server = Server::new(session, template, model_id, api_key.clone());
         (server.overflow, server.keep) = overflow_options(&args)?;
+        server.sampler = sampler_config(&args, model)?;
+        server.seed = args.number("seed")?;
         server
     };
     let reachable_by_others = !matches!(host, "127.0.0.1" | "localhost" | "::1");

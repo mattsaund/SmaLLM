@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use smallm::chat::Template;
+use smallm::chat::{Format, Template, Thinking};
 use smallm::generate::{Finish, Overflow, Stats};
 use smallm::model::CacheType;
 use smallm::tensor::type_name;
@@ -23,7 +23,7 @@ use crate::args::{Args, Spec, switch, value};
 use crate::models;
 
 /// Options of every command that runs a model.
-pub const SESSION_SPECS: [Spec; 5] = [
+pub const SESSION_SPECS: [Spec; 7] = [
     value(
         "threads",
         Some('t'),
@@ -42,12 +42,25 @@ pub const SESSION_SPECS: [Spec; 5] = [
     value(
         "batch",
         Some('b'),
-        "Prompt tokens evaluated together (default: 32)",
+        "Prompt tokens evaluated together (default: 64 on x86 and 32 elsewhere, or 128 for models \
+         with experts)",
     ),
     value(
         "cache-type",
         None,
         "What the key/value cache keeps: f16 (default, half the memory) or f32",
+    ),
+    value(
+        "cpus",
+        None,
+        "Run on these CPUs only, such as 6-7 or 0,2,4-5. Thread counts follow them. \
+         Linux and Android (default: all)",
+    ),
+    switch(
+        "mlock",
+        None,
+        "Read the whole model into memory at load and keep it there, for slow storage. \
+         Needs a locked-memory limit (ulimit -l) as large as the file",
     ),
 ];
 
@@ -79,32 +92,88 @@ pub fn overflow_options(args: &Args) -> Result<(Overflow, Option<usize>), String
 }
 
 /// Options of every command that generates text.
-pub const SAMPLER_SPECS: [Spec; 9] = [
-    value("temp", None, "Randomness, 0 for none (default: 0.8)"),
+/// Sampling options. Where the model file recommends a setting, that is the
+/// default, else the built-in one in parentheses.
+pub const SAMPLER_SPECS: [Spec; 19] = [
+    value(
+        "temp",
+        None,
+        "Randomness, 0 for none (default: the model's, else 0.8)",
+    ),
     value(
         "top-k",
         None,
-        "Keep the k most likely tokens, 0 for all (default: 40)",
+        "Keep the k most likely tokens, 0 for all (default: the model's, else 40)",
     ),
     value(
         "top-p",
         None,
-        "Keep tokens within this probability mass (default: 0.95)",
+        "Keep tokens within this probability mass (default: the model's, else 0.95)",
     ),
     value(
         "min-p",
         None,
-        "Drop tokens below this share of the best (default: 0.05)",
+        "Drop tokens below this share of the best (default: the model's, else 0.05)",
     ),
     value(
         "repeat-penalty",
         None,
-        "Penalty on recent tokens, 1 for none (default: 1.0)",
+        "Penalty on recent tokens, 1 for none (default: the model's, else 1.0)",
     ),
     value(
         "repeat-last-n",
         None,
-        "Tokens the penalties look back (default: 64)",
+        "Tokens the penalties look back (default: the model's, else 64)",
+    ),
+    value(
+        "typical",
+        None,
+        "Keep tokens of typical surprise up to this mass, 1 for all (default: 1)",
+    ),
+    value(
+        "top-nsigma",
+        None,
+        "Keep tokens within n standard deviations of the best logit, 0 for all (default: 0)",
+    ),
+    value(
+        "xtc-probability",
+        None,
+        "How often XTC drops the most likely tokens, 0 for never (default: the model's, else 0)",
+    ),
+    value(
+        "xtc-threshold",
+        None,
+        "Probability a token needs for XTC to drop it (default: the model's, else 0.1)",
+    ),
+    value(
+        "dynatemp-range",
+        None,
+        "Let the temperature move this far with the entropy, 0 for fixed (default: 0)",
+    ),
+    value(
+        "dynatemp-exp",
+        None,
+        "How the dynamic temperature follows the entropy (default: 1)",
+    ),
+    value(
+        "mirostat",
+        None,
+        "Mirostat version, 0 for off (default: the model's, else 0)",
+    ),
+    value(
+        "mirostat-ent",
+        None,
+        "Mirostat's target surprise, tau (default: the model's, else 5)",
+    ),
+    value(
+        "mirostat-lr",
+        None,
+        "Mirostat's learning rate, eta (default: the model's, else 0.1)",
+    ),
+    value(
+        "logit-bias",
+        None,
+        "Add to a token's logit, as TOKEN+BIAS or TOKEN-BIAS (-inf bans it). Repeatable",
     ),
     value(
         "frequency-penalty",
@@ -120,7 +189,7 @@ pub const SAMPLER_SPECS: [Spec; 9] = [
 ];
 
 /// Options that choose how a prompt is formatted.
-pub const TEMPLATE_SPECS: [Spec; 2] = [
+pub const TEMPLATE_SPECS: [Spec; 3] = [
     value(
         "template",
         None,
@@ -132,6 +201,12 @@ pub const TEMPLATE_SPECS: [Spec; 2] = [
         None,
         "Complete the prompt as plain text, with no chat format",
     ),
+    value(
+        "think",
+        None,
+        "Whether a reasoning model thinks first: on or off, or low, medium or high for gpt-oss, \
+         which cannot turn it off (default: as the model does)",
+    ),
 ];
 
 /// A model, and how long it took to open.
@@ -140,11 +215,26 @@ pub struct Loaded {
     pub load_time: Duration,
 }
 
-/// Finds and opens the model the user named.
-pub fn load_model(name: &str) -> Result<Loaded, String> {
+/// Finds and opens the model the user named. `--cpus` applies before the
+/// model opens, so every thread started after it stays on those CPUs, and
+/// `--mlock` reads the weights in once the model is open.
+pub fn load_model(name: &str, args: &Args) -> Result<Loaded, String> {
+    if let Some(list) = args.get("cpus") {
+        smallm::threads::run_on_cpus(list).map_err(|error| format!("--cpus: {error}"))?;
+    }
     let path = models::resolve(name)?;
     let start = Instant::now();
     let model = Model::load(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    if args.has("mlock") {
+        let size = models::human_bytes(model.file_size() as u64);
+        model.lock_in_memory().map_err(|error| {
+            format!(
+                "--mlock: could not keep the model's {size} in memory: {error}. The limit is \
+                 'ulimit -l'. Raise it, or set LimitMEMLOCK= for a service."
+            )
+        })?;
+        eprintln!("locked the model's {size} in memory");
+    }
     let (pre, known) = model.tokenizer().pre_tokenizer();
     if !known {
         // Older files name none, and then llama.cpp's default is used too.
@@ -194,11 +284,18 @@ pub fn session_config(args: &Args) -> Result<SessionConfig, String> {
 }
 
 /// Reads the sampling options. Without a seed, each run draws its own.
-pub fn sampler_config(args: &Args) -> Result<SamplerConfig, String> {
-    let defaults = SamplerConfig::default();
+/// Reads the sampling options. A setting not given on the command line or
+/// in the settings file takes the value the model file recommends, if any,
+/// else the built-in default. Without a seed, each run draws its own.
+pub fn sampler_config(args: &Args, model: &Model) -> Result<SamplerConfig, String> {
+    let defaults = SamplerConfig::from_model_file(model.gguf());
     let clock_seed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |time| time.as_nanos() as u64);
+    let mut logit_bias = Vec::new();
+    for entry in args.all("logit-bias") {
+        logit_bias.push(parse_logit_bias(&entry)?);
+    }
     Ok(SamplerConfig {
         temperature: args.number("temp")?.unwrap_or(defaults.temperature),
         top_k: args.number("top-k")?.unwrap_or(defaults.top_k),
@@ -216,26 +313,88 @@ pub fn sampler_config(args: &Args) -> Result<SamplerConfig, String> {
         presence_penalty: args
             .number("presence-penalty")?
             .unwrap_or(defaults.presence_penalty),
+        typical_p: args.number("typical")?.unwrap_or(defaults.typical_p),
+        top_n_sigma: args.number("top-nsigma")?.unwrap_or(defaults.top_n_sigma),
+        xtc_probability: args
+            .number("xtc-probability")?
+            .unwrap_or(defaults.xtc_probability),
+        xtc_threshold: args
+            .number("xtc-threshold")?
+            .unwrap_or(defaults.xtc_threshold),
+        dynatemp_range: args
+            .number("dynatemp-range")?
+            .unwrap_or(defaults.dynatemp_range),
+        dynatemp_exponent: args
+            .number("dynatemp-exp")?
+            .unwrap_or(defaults.dynatemp_exponent),
+        mirostat: match args.number::<u8>("mirostat")? {
+            Some(version) if version > 2 => {
+                return Err(format!("--mirostat is 0, 1 or 2, not {version}"));
+            }
+            Some(version) => version,
+            None => defaults.mirostat,
+        },
+        mirostat_tau: args
+            .number("mirostat-ent")?
+            .unwrap_or(defaults.mirostat_tau),
+        mirostat_eta: args.number("mirostat-lr")?.unwrap_or(defaults.mirostat_eta),
+        logit_bias,
         seed: args.number("seed")?.unwrap_or(clock_seed),
     })
 }
 
+/// Reads a `--logit-bias` entry, `TOKEN+BIAS` or `TOKEN-BIAS`, as llama.cpp
+/// writes it. `-inf` bans the token.
+pub fn parse_logit_bias(entry: &str) -> Result<(u32, f32), String> {
+    let split = entry
+        .find(['+', '-'])
+        .ok_or_else(|| format!("--logit-bias wants TOKEN+BIAS or TOKEN-BIAS, not '{entry}'"))?;
+    let token = entry[..split]
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| format!("--logit-bias: '{}' is not a token id", &entry[..split]))?;
+    let bias = entry[split..]
+        .trim()
+        .parse::<f32>()
+        .map_err(|_| format!("--logit-bias: '{}' is not a number", &entry[split..]))?;
+    Ok((token, bias))
+}
+
 /// Picks the chat format: the one asked for, else the model's own. `None`
 /// means plain completion.
-pub fn chat_template(args: &Args, model: &Model) -> Result<Option<Template>, String> {
+/// The chat format of a run: `--template`, or the one the model's own
+/// template is recognized as, with the choice of `--think`. `None` for plain
+/// text.
+pub fn chat_template(args: &Args, model: &Model) -> Result<Option<Format>, String> {
     if args.has("raw") {
         return Ok(None);
     }
-    if let Some(name) = args.get("template") {
-        return Template::from_name(name).map(Some).ok_or_else(|| {
+    let thinking = match args.get("think") {
+        None => Thinking::Default,
+        Some(name) => Thinking::from_name(name).ok_or_else(|| {
+            format!("--think is on, off, low, medium, high or auto, not '{name}'")
+        })?,
+    };
+    let template = match args.get("template") {
+        Some(name) => Template::from_name(name).ok_or_else(|| {
             let known: Vec<&str> = Template::ALL.iter().map(|t| t.name()).collect();
             format!(
                 "unknown chat template '{name}'. Known: {}",
                 known.join(", ")
             )
-        });
+        })?,
+        None => match model.chat_template().and_then(Template::detect) {
+            Some(template) => template,
+            None => return Ok(None),
+        },
+    };
+    let format = Format::new(template, model.chat_template(), thinking);
+    if args.given("think") && thinking != Thinking::Default && !format.can_switch_thinking() {
+        eprintln!(
+            "smallm: this model's chat format has no switch for thinking, so --think does nothing"
+        );
     }
-    Ok(model.chat_template().and_then(Template::detect))
+    Ok(Some(format))
 }
 
 /// The weight format that holds most of a model's parameters.
@@ -317,6 +476,16 @@ pub fn human_count(count: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logit_bias_entries_are_read_as_llama_cpp_writes_them() {
+        assert_eq!(parse_logit_bias("15043+1"), Ok((15043, 1.0)));
+        assert_eq!(parse_logit_bias("7-0.5"), Ok((7, -0.5)));
+        assert_eq!(parse_logit_bias("3-inf"), Ok((3, f32::NEG_INFINITY)));
+        assert!(parse_logit_bias("15043").is_err());
+        assert!(parse_logit_bias("x+1").is_err());
+        assert!(parse_logit_bias("4+y").is_err());
+    }
 
     #[test]
     fn the_template_help_names_every_chat_format() {

@@ -56,7 +56,7 @@ pub fn main(raw: impl Iterator<Item = String>) -> Result<(), String> {
     let n_gen: usize = args.number("gen-tokens")?.unwrap_or(128);
     let repeat: usize = args.number("repeat")?.unwrap_or(3).max(1);
 
-    let loaded = load_model(name)?;
+    let loaded = load_model(name, &args)?;
     let model = &loaded.model;
     let memory_loaded = memory_in_use();
     let mut config = session_config(&args)?;

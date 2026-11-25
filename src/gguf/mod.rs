@@ -352,6 +352,12 @@ impl Gguf {
         Gguf::parse(Arc::new(Mapping::open(path.as_ref())?))
     }
 
+    /// Reads the whole file into memory and keeps it there. See
+    /// [`Mapping::lock`].
+    pub fn lock_in_memory(&self) -> std::io::Result<()> {
+        self.map.lock()
+    }
+
     /// Parses a file that is already in memory.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Gguf> {
         Gguf::parse(Arc::new(Mapping::from_vec(bytes)))

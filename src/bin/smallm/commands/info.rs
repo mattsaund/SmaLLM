@@ -36,7 +36,7 @@ pub fn main(raw: impl Iterator<Item = String>) -> Result<(), String> {
     let name = args
         .positional(0)
         .ok_or("which model? Usage: smallm info <model>")?;
-    let loaded = load_model(name)?;
+    let loaded = load_model(name, &args)?;
     let model = &loaded.model;
     let (config, file, tokenizer) = (model.config(), model.gguf(), model.tokenizer());
 
@@ -299,7 +299,7 @@ pub fn tokenize(raw: impl Iterator<Item = String>) -> Result<(), String> {
         .positional(0)
         .ok_or("which model? Usage: smallm tokenize <model> <text>")?;
     let text = args.rest(1).join(" ");
-    let loaded = load_model(name)?;
+    let loaded = load_model(name, &args)?;
     let tokenizer = loaded.model.tokenizer();
     let special = !args.has("no-special");
     let tokens = tokenizer.encode(&text, special, special);

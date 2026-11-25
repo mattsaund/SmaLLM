@@ -129,6 +129,14 @@ impl Model {
         &self.file
     }
 
+    /// Reads all the weights into memory and keeps them there, rather than
+    /// reading them as they are first used. For machines whose storage is
+    /// too slow to read them again after the system drops them. Fails when
+    /// the file is larger than the process may lock (`ulimit -l`).
+    pub fn lock_in_memory(&self) -> std::io::Result<()> {
+        self.file.lock_in_memory()
+    }
+
     /// The chat template stored in the file, in Jinja syntax.
     pub fn chat_template(&self) -> Option<&str> {
         self.file.get_str("tokenizer.chat_template")

@@ -46,7 +46,7 @@ fn embedder(args: &Args, usage: &str) -> Result<Embedder, String> {
     let name = args
         .positional(0)
         .ok_or(format!("which model? Usage: {usage}"))?;
-    let loaded = load_model(name)?;
+    let loaded = load_model(name, args)?;
     if !loaded.model.is_encoder() {
         return Err(format!(
             "{name} generates text: use 'smallm run'. This command needs an embedding or reranking model"

@@ -6,7 +6,7 @@
 
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 
-use smallm::chat::{Message, Role, Template};
+use smallm::chat::{Format, Message, Role};
 use smallm::generate::{self, Options, Stats};
 use smallm::{Model, Session};
 
@@ -21,7 +21,7 @@ const SPECS: [Spec; 7] = [
     value(
         "max-tokens",
         Some('n'),
-        "Stop after this many tokens (default: no limit)",
+        "Stop after this many tokens, reasoning included (default: no limit)",
     ),
     value(
         "system",
@@ -78,7 +78,7 @@ pub fn main(raw: impl Iterator<Item = String>) -> Result<(), String> {
         stats: verbose || (term::stderr_is_terminal() && !args.has("quiet")),
     };
 
-    let loaded = load_model(name)?;
+    let loaded = load_model(name, &args)?;
     let model = &loaded.model;
     let template = chat_template(&args, model)?;
     let mut session =
@@ -86,7 +86,7 @@ pub fn main(raw: impl Iterator<Item = String>) -> Result<(), String> {
     let (overflow, keep) = super::overflow_options(&args)?;
     let options = Options {
         max_tokens: args.number("max-tokens")?.unwrap_or(0),
-        sampler: sampler_config(&args)?,
+        sampler: sampler_config(&args, model)?,
         stop: args.all("stop"),
         show_special: args.has("show-special"),
         reasoning: false,
@@ -185,7 +185,7 @@ fn complete(session: &mut Session, prompt: &str, options: &Options) -> Result<St
 /// Answers a conversation. Returns the answer and how it went.
 fn answer(
     session: &mut Session,
-    template: Template,
+    template: Format,
     messages: &[Message],
     options: &Options,
 ) -> Result<(String, Stats), String> {
@@ -254,7 +254,7 @@ Ctrl+C stops an answer.";
 fn chat(
     session: &mut Session,
     model: &Model,
-    template: Option<Template>,
+    template: Option<Format>,
     mut system: Option<String>,
     options: &Options,
     report: Report,

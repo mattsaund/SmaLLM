@@ -176,7 +176,8 @@ engine and explains the design choices.
 | support a new architecture | `ARCHITECTURES` and the `match` in `model/config.rs`, which sets the model-wide switches and each layer's `LayerSpec`. New tensors go in `model/weights.rs`, new math in `model/forward.rs` and the oracle in `model/tests.rs`. Check it with `tests/compare.rs` and add a golden file from a real model |
 | support a new weight format | `TensorType` in `tensor/mod.rs`, a decoder in `tensor/quant.rs`, and a row in `kernels/scalar.rs`. The scalar row is enough to be correct. Add the format to `tools/reference/quant.c` and `tests/quant.rs` to check it against ggml |
 | speed up a weight format | a kernel in `kernels/x86.rs` or `kernels/arm.rs`. `kernels/tests.rs` checks it against the scalar one without further work |
-| add a chat format | `Template` in `chat.rs`: detection, rendering and a test |
+| add a chat format | `Template` in `chat.rs`: detection, rendering and a test. If the format can switch thinking, `Format` and `Thinking` there too |
+| add a sampler | `SamplerConfig` and `Sampler::sample` in `sampler.rs`, with a test. The option goes in `SAMPLER_SPECS` and `sampler_config` (`commands/mod.rs`), the setting in `config.rs`, and the request field in `Job::from_json` (`server/api.rs`) |
 | add a word splitting rule | run `tools/gen_pretok.py` on a newer llama.cpp. A rule that is common and slow can get a scanner in `tokenizer/pretok.rs` |
 | add a command | a file in `src/bin/smallm/commands/` and a line in `main.rs` |
 | add an API endpoint | `route` in `src/bin/smallm/server/api.rs` |

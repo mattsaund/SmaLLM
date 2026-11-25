@@ -402,6 +402,49 @@ fn parse_cpu_list(text: &str) -> Option<Vec<usize>> {
     Some(cpus)
 }
 
+/// Keeps this thread, and the threads it starts from now on, on the CPUs in
+/// `list`, written as the kernel writes CPU lists: `6-7` or `0,2,4-5`. Call
+/// it before a session is made, and the default thread counts follow those
+/// CPUs. On a board with fast and slow clusters, this picks one.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn run_on_cpus(list: &str) -> crate::Result<()> {
+    // The kernel reads the mask as words of the C `unsigned long`, which is
+    // `usize` on every Linux target. 1024 CPUs is the C library's size.
+    const BITS: usize = usize::BITS as usize;
+    let mut mask = [0usize; 1024 / BITS];
+    let cpus = parse_cpu_list(list)
+        .filter(|cpus| !cpus.is_empty())
+        .ok_or_else(|| {
+            crate::Error::invalid(format!(
+                "'{list}' is not a list of CPUs, such as 6-7 or 0,2,4-5"
+            ))
+        })?;
+    for cpu in cpus {
+        let word = mask.get_mut(cpu / BITS).ok_or_else(|| {
+            crate::Error::invalid(format!("CPU {cpu} is beyond the 1024 that can be chosen"))
+        })?;
+        *word |= 1 << (cpu % BITS);
+    }
+    unsafe extern "C" {
+        fn sched_setaffinity(pid: i32, size: usize, mask: *const usize) -> i32;
+    }
+    // SAFETY: the mask is a readable buffer of the size given, and process
+    // id 0 names the calling thread.
+    if unsafe { sched_setaffinity(0, std::mem::size_of_val(&mask), mask.as_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+/// Choosing CPUs needs an affinity call that only Linux and Android have.
+/// macOS has none, and Windows is not supported yet.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub fn run_on_cpus(_list: &str) -> crate::Result<()> {
+    Err(crate::Error::invalid(
+        "choosing CPUs works on Linux and Android only",
+    ))
+}
+
 /// Counts cores from the kernel's CPU topology, among the CPUs this process
 /// may run on.
 #[cfg(any(target_os = "linux", target_os = "android"))]

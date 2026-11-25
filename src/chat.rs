@@ -206,6 +206,20 @@ impl Template {
     /// [`Tokenizer::encode_parts`](crate::Tokenizer::encode_parts) with the
     /// `markup` flag, so control tokens are read from markup only.
     pub fn render(self, messages: &[Message], add_assistant: bool, eos: &str) -> Vec<Part> {
+        self.render_with(messages, add_assistant, eos, Thinking::Default)
+    }
+
+    /// [`render`](Self::render), with a choice about reasoning for the
+    /// formats that write one into the conversation: gpt-oss's level on
+    /// Harmony's `Reasoning:` line, and the thinking token at the top of
+    /// Gemma 4's system turn. [`Format`] adds what the other formats need.
+    pub fn render_with(
+        self,
+        messages: &[Message],
+        add_assistant: bool,
+        eos: &str,
+        thinking: Thinking,
+    ) -> Vec<Part> {
         let mut out = Prompt::default();
         match self {
             Template::ChatMl => {
@@ -295,8 +309,21 @@ impl Template {
             }
             Template::Gemma4 => {
                 // Unlike earlier Gemma models, Gemma 4 has a system role.
-                // Content is trimmed, as its own template does.
-                for message in messages {
+                // Content is trimmed, as its own template does. It thinks
+                // only when the system turn opens with `<|think|>`, so that
+                // turn is written even without a system message.
+                let mut rest = messages;
+                if thinking.asks_for_it() {
+                    out.markup("<|turn>system\n<|think|>\n");
+                    if let Some((first, after)) = messages.split_first() {
+                        if first.role == Role::System {
+                            out.content(first.content.trim());
+                            rest = after;
+                        }
+                    }
+                    out.markup("<turn|>\n");
+                }
+                for message in rest {
                     let role = match message.role {
                         Role::Assistant => "model",
                         role => role.name(),
@@ -380,10 +407,11 @@ impl Template {
                     "You are ChatGPT, a large language model trained by OpenAI.\n\
                      Knowledge cutoff: 2024-06\n\
                      Current date: {}\n\n\
-                     Reasoning: medium\n\n\
+                     Reasoning: {}\n\n\
                      # Valid channels: analysis, commentary, final. \
                      Channel must be included for every message.",
-                    today()
+                    today(),
+                    thinking.harmony_level()
                 ));
                 out.markup("<|end|>");
                 for message in messages {
@@ -475,6 +503,163 @@ impl Template {
             .map(|part| part.text)
             .collect()
     }
+}
+
+/// Whether a reasoning model thinks before it answers, for the models whose
+/// prompt can choose. The default leaves it to the model's own template:
+/// Qwen3 and LFM3 think unless told not to, and Gemma 4 does not unless
+/// told to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Thinking {
+    /// As the model's template does when nothing is chosen.
+    #[default]
+    Default,
+    /// Think before answering.
+    On,
+    /// Answer without thinking. gpt-oss cannot, and thinks at its low
+    /// level instead.
+    Off,
+    /// gpt-oss's three levels of reasoning. Other models take each as
+    /// [`On`](Thinking::On).
+    Low,
+    Medium,
+    High,
+}
+
+impl Thinking {
+    /// Every choice, for listings.
+    pub const ALL: [Thinking; 6] = [
+        Thinking::Default,
+        Thinking::On,
+        Thinking::Off,
+        Thinking::Low,
+        Thinking::Medium,
+        Thinking::High,
+    ];
+
+    /// The name of the choice, as the command line and settings write it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Thinking::Default => "auto",
+            Thinking::On => "on",
+            Thinking::Off => "off",
+            Thinking::Low => "low",
+            Thinking::Medium => "medium",
+            Thinking::High => "high",
+        }
+    }
+
+    /// Looks up a choice by [`name`](Self::name).
+    pub fn from_name(name: &str) -> Option<Thinking> {
+        Thinking::ALL
+            .into_iter()
+            .find(|thinking| thinking.name() == name)
+    }
+
+    /// True for the choices that ask for reasoning.
+    fn asks_for_it(self) -> bool {
+        matches!(
+            self,
+            Thinking::On | Thinking::Low | Thinking::Medium | Thinking::High
+        )
+    }
+
+    /// gpt-oss's level for this choice. It always reasons, so off is low.
+    fn harmony_level(self) -> &'static str {
+        match self {
+            Thinking::Off | Thinking::Low => "low",
+            Thinking::High => "high",
+            Thinking::Default | Thinking::On | Thinking::Medium => "medium",
+        }
+    }
+}
+
+/// Empty reasoning that model templates write after the assistant's
+/// opening to answer without thinking: Qwen3's, LFM3's, SmolLM3's and
+/// RWKV-7 G1's.
+const EMPTY_THOUGHTS: [&str; 4] = [
+    "<think>\n\n</think>\n\n",
+    "<think></think>",
+    "<think>\n\n</think>\n",
+    " <think>\n</think>",
+];
+
+/// A chat format, with the conversation's choice about reasoning.
+///
+/// A [`Template`] converts into a format that leaves reasoning to the
+/// model, so the functions that take a format also take a template.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Format {
+    pub template: Template,
+    pub thinking: Thinking,
+    /// What the model's own template writes after the assistant's opening
+    /// when thinking is off. `None` when it has no such switch.
+    pub no_thinking: Option<&'static str>,
+}
+
+impl From<Template> for Format {
+    fn from(template: Template) -> Format {
+        Format {
+            template,
+            thinking: Thinking::Default,
+            no_thinking: None,
+        }
+    }
+}
+
+impl Format {
+    /// The format of a model whose Jinja chat template is `jinja`, which
+    /// tells how the model turns its thinking off.
+    pub fn new(template: Template, jinja: Option<&str>, thinking: Thinking) -> Format {
+        Format {
+            template,
+            thinking,
+            no_thinking: jinja.and_then(empty_thought),
+        }
+    }
+
+    /// True when the choice about thinking can change this model's prompt.
+    pub fn can_switch_thinking(self) -> bool {
+        self.no_thinking.is_some() || matches!(self.template, Template::Harmony | Template::Gemma4)
+    }
+
+    /// Writes a conversation, as [`Template::render`] does, with the
+    /// choice about thinking.
+    pub fn render(self, messages: &[Message], add_assistant: bool, eos: &str) -> Vec<Part> {
+        let mut parts = self
+            .template
+            .render_with(messages, add_assistant, eos, self.thinking);
+        if let Some(block) = self.no_thinking {
+            if add_assistant && self.thinking == Thinking::Off {
+                match parts.last_mut() {
+                    Some(last) if last.markup => last.text.push_str(block),
+                    _ => parts.push(Part {
+                        text: block.to_string(),
+                        markup: true,
+                    }),
+                }
+            }
+        }
+        parts
+    }
+}
+
+/// The empty reasoning that the Jinja template `jinja` writes to answer
+/// without thinking, if it has a switch for thinking (`enable_thinking`).
+/// The block is found as a string of its own in the template, written with
+/// escaped or real newlines.
+fn empty_thought(jinja: &str) -> Option<&'static str> {
+    if !jinja.contains("enable_thinking") {
+        return None;
+    }
+    EMPTY_THOUGHTS.into_iter().find(|block| {
+        let escaped = block.replace('\n', "\\n");
+        ['\'', '"'].into_iter().any(|quote| {
+            [&escaped, *block]
+                .into_iter()
+                .any(|text| jinja.contains(&format!("{quote}{text}{quote}")))
+        })
+    })
 }
 
 /// Accumulates the parts of a prompt, joining neighbors of the same kind.
@@ -588,6 +773,113 @@ mod tests {
                 .render_text(&conversation(), false, "")
                 .ends_with("assistant\n")
         );
+    }
+
+    /// A format's prompt as one string.
+    fn written(format: Format, messages: &[Message]) -> String {
+        format
+            .render(messages, true, "")
+            .into_iter()
+            .map(|part| part.text)
+            .collect()
+    }
+
+    #[test]
+    fn thinking_is_turned_off_the_way_each_model_does_it() {
+        // Lines from Qwen3's, LFM3's, SmolLM3's and RWKV-7 G1's own
+        // templates.
+        let qwen3 = "{%- if enable_thinking is defined and enable_thinking is false %}\n\
+                     {{- '<think>\\n\\n</think>\\n\\n' }}";
+        let lfm3 = "{%- if enable_thinking -%}{{- \"<think>\" -}}{%- else -%}\
+                    {{- \"<think></think>\" -}}{%- endif -%}";
+        let smollm3 = "{%- set reasoning_mode = \"/no_think\" if enable_thinking is defined \
+                       and not enable_thinking -%}\
+                       {{ \"<|im_start|>assistant\\n\" + \"<think>\\n\\n</think>\\n\"  }}";
+        let rwkv = "{%- if enable_thinking is defined and enable_thinking is false %}\
+                    {{- ' <think>\\n</think>' }}";
+        let user = [Message::new(Role::User, "Hi")];
+        for (jinja, template, ending) in [
+            (
+                qwen3,
+                Template::ChatMl,
+                "assistant\n<think>\n\n</think>\n\n",
+            ),
+            (lfm3, Template::ChatMl, "assistant\n<think></think>"),
+            (
+                smollm3,
+                Template::ChatMl,
+                "assistant\n<think>\n\n</think>\n",
+            ),
+            (rwkv, Template::RwkvWorld, "Assistant: <think>\n</think>"),
+        ] {
+            let off = Format::new(template, Some(jinja), Thinking::Off);
+            assert!(off.can_switch_thinking());
+            assert!(
+                written(off, &user).ends_with(ending),
+                "{}",
+                written(off, &user)
+            );
+            // Any other choice leaves the prompt as the model's default.
+            for thinking in [Thinking::Default, Thinking::On, Thinking::High] {
+                let format = Format { thinking, ..off };
+                assert_eq!(
+                    written(format, &user),
+                    template.render_text(&user, true, "")
+                );
+            }
+        }
+        // A template without the switch, or with a block it does not
+        // write on its own, has nothing to turn off.
+        assert_eq!(empty_thought("'<think>\\n\\n</think>\\n\\n'"), None);
+        assert_eq!(empty_thought("enable_thinking '<think>\\n' + text"), None);
+        let plain = Format::new(Template::Llama3, Some("no switch"), Thinking::Off);
+        assert!(!plain.can_switch_thinking());
+        assert_eq!(
+            written(plain, &user),
+            Template::Llama3.render_text(&user, true, "")
+        );
+    }
+
+    #[test]
+    fn gpt_oss_reasons_at_the_level_chosen() {
+        let level = |thinking: Thinking| {
+            let text = written(
+                Format::new(Template::Harmony, None, thinking),
+                &conversation(),
+            );
+            let at = text.find("Reasoning: ").unwrap() + "Reasoning: ".len();
+            text[at..].split('\n').next().unwrap().to_string()
+        };
+        assert_eq!(level(Thinking::Default), "medium");
+        assert_eq!(level(Thinking::On), "medium");
+        assert_eq!(level(Thinking::Off), "low");
+        assert_eq!(level(Thinking::Low), "low");
+        assert_eq!(level(Thinking::High), "high");
+        assert!(Format::from(Template::Harmony).can_switch_thinking());
+    }
+
+    #[test]
+    fn gemma_4_thinks_when_its_system_turn_asks() {
+        let on = Format::new(Template::Gemma4, None, Thinking::On);
+        assert_eq!(
+            written(on, &conversation()[..2]),
+            "<|turn>system\n<|think|>\nBe brief.<turn|>\n<|turn>user\nHi<turn|>\n<|turn>model\n"
+        );
+        // Without a system message, the turn is written for the token alone.
+        assert_eq!(
+            written(on, &conversation()[1..2]),
+            "<|turn>system\n<|think|>\n<turn|>\n<|turn>user\nHi<turn|>\n<|turn>model\n"
+        );
+        let off = Format::new(Template::Gemma4, None, Thinking::Off);
+        assert!(!written(off, &conversation()).contains("<|think|>"));
+    }
+
+    #[test]
+    fn thinking_names_round_trip() {
+        for thinking in Thinking::ALL {
+            assert_eq!(Thinking::from_name(thinking.name()), Some(thinking));
+        }
+        assert_eq!(Thinking::from_name("maybe"), None);
     }
 
     #[test]

@@ -65,15 +65,21 @@ name is enough when it singles one out.
 | `config` | Shows the settings and where they are kept. `--reset` restores the defaults |
 | `uninstall` | Removes the program, its downloaded models and its settings |
 
-`smallm <command> --help` lists the options of a command: threads, context
-size, what to do when the context is full, temperature and the other
-sampling settings, stop strings, system message. In a chat, `/clear` starts
-over, `/system` sets a system message and `/exit` leaves.
+`smallm <command> --help` lists the options of a command: threads and the
+CPUs to run on, context size, what to do when the context is full,
+temperature and the other sampling settings, stop strings, system message.
+Sampling settings that the model file recommends are the defaults. In a
+chat, `/clear` starts over, `/system` sets a system message and `/exit`
+leaves.
 
 **Reasoning output.** For models that emit reasoning before the answer
-(Qwen3, DeepSeek R1, gpt-oss), the chat prints it dimmed and keeps it out of
-the conversation history. Piped output omits it. The server returns it as
-`reasoning_content`, the field llama.cpp uses.
+(Qwen3, LFM3, Gemma 4, DeepSeek R1, gpt-oss), the chat prints it dimmed and
+keeps it out of the conversation history. Piped output omits it. The server
+returns it as `reasoning_content`, the field llama.cpp uses. `--think off`
+makes Qwen3, LFM3 and RWKV-7 G1 answer without reasoning, and `--think on`
+turns it on for Gemma 4. gpt-oss always reasons and takes `--think low`,
+`medium` or `high`. In the server, `chat_template_kwargs.enable_thinking`
+and `reasoning_effort` choose per request.
 
 **Settings.** Every setting has a line in one file, `smallm.conf`, named like
 its command-line option. `smallm config` shows the settings in effect and
@@ -129,9 +135,9 @@ Llama 3.2 1B, Q4_K_M, in tokens per second:
 
 | Threads | Prompt, SmaLLM | Prompt, llama.cpp | Generation, SmaLLM | Generation, llama.cpp |
 |---|---|---|---|---|
-| 1 | **121** | 102 | 23.6 | **25.0** |
-| 4 | **448** | 372 | **47.6** | 42.7 |
-| 8 | **765** | 657 | **50.4** | 44.6 |
+| 1 | **126** | 101 | 24.0 | **25.2** |
+| 4 | **470** | 373 | **49.6** | 44.4 |
+| 8 | **829** | 707 | **51.7** | 45.6 |
 
 Measured on an Intel Core i7-14700K under Linux, against llama.cpp b11846
 with its `alderlake` CPU backend: a 256-token prompt and 96 generated
@@ -144,11 +150,11 @@ before it is used. Anonymous memory (RssAnon), Llama 3.2 1B Q4_K_M:
 
 | | Model loaded | Session, 4,096-token context | After 256 tokens |
 |---|---|---|---|
-| SmaLLM | **7.5 MB** | **7.7 MB** | **21 MB** |
+| SmaLLM | **7.6 MB** | **7.7 MB** | **24 MB** |
 | llama.cpp | 498 MB | 627 MB | 636 MB |
 
 The difference grows with the weights llama.cpp repacks. On gpt-oss-20b
-(MXFP4) it is 33 MB against 9,966 MB.
+(MXFP4) it is 59 MB against 9,966 MB.
 
 ### How it works
 
@@ -163,9 +169,10 @@ The difference grows with the weights llama.cpp repacks. On gpt-oss-20b
   16-bit floats. llama.cpp allocates the whole context window when the
   session starts. Memory scales with the tokens in the context, not with
   the configured window.
-- **Small working set.** Scratch buffers are sized for a 32-token batch. The
-  vocabulary is read from the mapped file. Logits are computed for the last
-  token only.
+- **Small working set.** Scratch buffers are sized for a 64-token batch on
+  x86 and 32 elsewhere, or 128 for models with experts. The vocabulary is
+  read from the mapped file.
+  Logits are computed for the last token only.
 - **Per-architecture state.** DeepSeek's latent attention caches one
   compressed row per position and layer. Mamba and RWKV keep a fixed-size
   recurrent state and one saved copy of it. Gemma 4's shared layers have no
@@ -190,7 +197,9 @@ The difference grows with the weights llama.cpp repacks. On gpt-oss-20b
 - **Under memory pressure, speed depends on storage.** The kernel evicts
   file pages and faults them back in on access. That is workable on NVMe or
   eMMC and slow on an SD card. llama.cpp's repacked copy is anonymous memory
-  and can only go to swap.
+  and can only go to swap. `--mlock` keeps the whole file resident instead,
+  which costs reading all of it at load and needs a locked-memory limit
+  (`ulimit -l`) as large as the file.
 - **No up-front check.** A context window too large for the machine fails
   when the conversation reaches it, not when the session starts.
 - **Packing on every prompt batch.** Tiles are packed per batch, not once at

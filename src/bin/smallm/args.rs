@@ -43,6 +43,8 @@ pub const fn switch(long: &'static str, short: Option<char>, help: &'static str)
 pub struct Args {
     positional: Vec<String>,
     options: Vec<(&'static str, Option<String>)>,
+    /// The options the settings file filled in.
+    from_settings: Vec<&'static str>,
 }
 
 impl Args {
@@ -91,10 +93,17 @@ impl Args {
             for spec in specs.iter().filter(|spec| spec.takes_value) {
                 if let (false, Some(value)) = (args.has(spec.long), settings.value(spec.long)) {
                     args.options.push((spec.long, Some(value.to_string())));
+                    args.from_settings.push(spec.long);
                 }
             }
         }
         Ok(args)
+    }
+
+    /// True when `long` was given on the command line, rather than filled
+    /// in from the settings file.
+    pub fn given(&self, long: &str) -> bool {
+        self.has(long) && !self.from_settings.contains(&long)
     }
 
     /// The positional argument at `index`.
