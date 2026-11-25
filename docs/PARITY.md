@@ -24,7 +24,7 @@ x86 CPU, Intel Core i7-14700K, 8 threads, llama.cpp b11846 with its
 | Anonymous memory, gpt-oss-20b | 59 MB | 9,966 MB | Not measured |
 | Generation speed | Faster on 10 of 10 models, by 8 to 33% | 5% faster on one thread (Llama 3.2 1B) | Not measured |
 | Prompt speed | Faster on 9 of 10, by 15 to 81%, RWKV-7 0.97x | | Not measured |
-| ARM speed (A733, see below) | Q4_K_M prompts 1.7x as fast, generation 4% ahead. Q4_0 prompts 12% behind on 2 cores, ahead on all 8, generation level | Mature NEON, i8mm and SVE kernels | llama.cpp's |
+| ARM speed (A733, see below) | Q4_K_M prompts 1.8x as fast, generation 9% ahead. Q4_0 prompts 9% behind on 2 cores, ahead on all 8, generation 1% ahead | Mature NEON, i8mm and SVE kernels | llama.cpp's |
 
 Speed by model, tokens per second, 256-token prompt, 64 generated:
 
@@ -78,15 +78,15 @@ the details.
 
 | Model (format) | Prompt: SmaLLM | Prompt: llama.cpp | Generation: SmaLLM | Generation: llama.cpp |
 |---|---|---|---|---|
-| LFM3-1.7B (Q4_0) | 39.1 | 44.5 | 8.6 | 8.5 |
-| Nemotron 3.5 Bolt E4B (Q4_K_M) | 14.3 | 8.5 | 2.8 | 2.7 |
+| LFM3-1.7B (Q4_0) | 40.6 | 44.6 | 8.8 | 8.7 |
+| Nemotron 3.5 Bolt E4B (Q4_K_M) | 15.0 | 8.5 | 2.9 | 2.7 |
 
 Generation on this board is limited by memory, which reads 9.9 GB/s with
 one core or two. LFM3 reads 1.07 GB per token, so about 9.2 tokens per
 second is the most an engine gets here.
 
-With prompts on all 8 cores, its default, SmaLLM reads them at 47.4 (LFM3)
-and 17.8 (Nemotron) tokens per second. llama.cpp got slower when the A55s
+With prompts on all 8 cores, its default, SmaLLM reads them at 50.3 (LFM3)
+and 19.1 (Nemotron) tokens per second. llama.cpp got slower when the A55s
 joined. Anonymous memory after the prompt: SmaLLM 26 MB (LFM3) and 38 MB
 (Nemotron), llama.cpp 1.3 GB and 6.8 GB.
 
@@ -172,11 +172,11 @@ reranking, reasoning output, and full-context handling.
    files, and converting or quantizing models.
 
 **On ARM** (one board so far, the A733): memory is as far ahead as on x86.
-On Q4_K_M SmaLLM reads prompts 1.7 times as fast as llama.cpp and generates
-4 percent faster. On Q4_0, llama.cpp's current release reads prompts 14
+On Q4_K_M SmaLLM reads prompts 1.8 times as fast as llama.cpp and generates
+9 percent faster. On Q4_0, llama.cpp's current release reads prompts 10
 percent faster on the two fast cores (it was 3.5 times as fast before the
 NEON work), while SmaLLM is ahead with all 8 cores, its default. Both
-generate at the board's memory limit, at the same speed. Q4_0 prompts on
+generate at the board's memory limit, SmaLLM 1 percent ahead. Q4_0 prompts on
 the fast cores are the largest gap left on the target hardware. See
 [DEVELOPMENT.md](DEVELOPMENT.md).
 

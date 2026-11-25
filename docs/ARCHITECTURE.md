@@ -309,6 +309,11 @@ tile's four rows times four vectors keep four sums going. Formats with one
 scale per 32 weights or more (Q4_0, Q8_0, Q4_K and others) sum 32 columns
 as integers before scaling, where the tile's scale layout steps every 16.
 
+A thread fills up to three tiles at a time, as many as fit in about 32 KB,
+and each group of vectors meets all of them before the next group. A
+batch's activations outgrow the nearest cache, so this way they come from
+further out once for several tiles instead of once for each.
+
 A tile lives in a few kilobytes of scratch memory per thread, so this route
 costs no memory to speak of. The weights stay in the model file. llama.cpp
 gets its batch speed from a rearranged copy of the weights that it keeps in

@@ -192,11 +192,14 @@ under 62°C, best of three, against llama.cpp b12711. Tokens per second:
 
 | Model (format) | Prompt: SmaLLM | Prompt: llama.cpp | Generation: SmaLLM | Generation: llama.cpp |
 |---|---|---|---|---|
-| LFM3-1.7B (Q4_0) | 39.1 | 44.5 | 8.6 | 8.5 |
-| Nemotron 3.5 Bolt E4B (Q4_K_M) | 14.3 | 8.5 | 2.8 | 2.7 |
+| LFM3-1.7B (Q4_0) | 40.6 | 44.6 | 8.8 | 8.7 |
+| Nemotron 3.5 Bolt E4B (Q4_K_M) | 15.0 | 8.5 | 2.9 | 2.7 |
 
 On all 8 cores, its default for prompts, SmaLLM reads LFM3's prompt at
-47.4 tokens per second and Nemotron's at 17.8 (19.3 and 11.9 before).
+50.3 tokens per second and Nemotron's at 19.1 (19.3 and 11.9 before).
+Nemotron's rounds varied, 11.7 to 15.0 for SmaLLM and 8.0 to 8.5 for
+llama.cpp: with llama.cpp's 6.8 GB and a 6.2 GB file on a 12 GB board, the
+mapped weights were partly read again from the card.
 
 What changed, with `kernel_speed` on one A76 in picoseconds per weight:
 
@@ -226,6 +229,26 @@ What changed, with `kernel_speed` on one A76 in picoseconds per weight:
   offsets as whole registers: Q4_0 162 to 123, Q8_0 144 to 99.
 - **The next tile's rows are prefetched** while the current tile meets the
   batch, since four rows read at once are four streams.
+- **NEON attention, softmax, gates and quantizing.** These were still the
+  portable loops, and took 9 percent of a prompt token. Widening the 16-bit
+  keys and values with `fcvtl` (four per instruction, where the portable
+  conversion takes several instructions per value) took attention from
+  1.52 to 0.38 ms per prompt token. The SiLU gate went from 0.39 to 0.26
+  ms, and quantizing from 0.40 to 0.32, both now held back by streaming the
+  batch's 7680-wide activations through memory. Generation gained too:
+  8.6 to 8.8 tokens per second.
+- **Tiles in sets.** The Q4_0 tile kernel runs at 26.5 picoseconds per
+  weight and vector with four vectors in the nearest cache, but 29.2 to
+  29.5 against a batch of 64 vectors of 2048 columns, whose 128 KB of
+  activations come from the second-level cache. A thread now fills up to
+  three tiles, as many as fit in 32 KB, and passes each group of four
+  vectors over all of them: 28.0 with two tiles, 27.6 with three. About 1
+  percent on LFM3's prompt.
+- **Zeroing sums with `fmov` from `xzr`.** `movi` takes a slot on the vector
+  pipes, and a bare copy of the tile kernel's step ran 4 percent faster
+  with `fmov`. In the real kernel it gave 27.0 to 26.6. Elsewhere (the row
+  kernels, Q6_K's tile kernel) the assembly kept the compiler from moving
+  it and cost more than it saved, so only the paired tile loops use it.
 - **A batch of 64 on ARM too.** With the faster kernels, LFM3 reads a
   128-token prompt at 37.0 tokens per second at 64, against 34.7 at 32 and
   35.9 at 128 (best of two), for 4.7 MB more.
@@ -248,12 +271,30 @@ Findings:
   (LFM3's feed-forward down). Sharing each group of vectors between 2 or 4
   tiles gained nothing at 2048 columns. Splitting the columns of wide
   matrices is what is left there.
+- **Tried and dropped.** Splitting the columns of wide matrices, so that a
+  tile of LFM3's feed-forward down fits the nearest cache, made that
+  multiply 36 percent slower (6.7 to 9.2 ms per token): its rows were then
+  read in halves 4 KB apart, which stream badly. Spreading the next tile's
+  prefetches over the passes, instead of asking for them at once, changed
+  nothing. Prefetching activations a few steps ahead inside the tile
+  kernel made it slower everywhere, 26.6 to 28.6 even in the cache.
+- **Per core, the gap is the same.** On one A76, SmaLLM reads LFM3's prompt
+  at 21.1 tokens per second and llama.cpp at 22.8. Both scale by 1.9 to
+  two cores. What is left: interleaving four vectors' activations, 16
+  bytes of each in turn, so that a pass reads one stream instead of four
+  (27.2 against 27.8 in a test, 2 to 3 percent of the multiplies), and
+  doing the tile fill inside the passes over the previous tiles. The fill
+  is limited by its stores, the passes by the vector pipes, so they could
+  overlap: about 3 percent.
 - **The rest of the prompt gap is in the multiplies.** LFM3 spends about
-  32.7 picoseconds per weight and vector on each core in its multiplies.
-  The tile kernel accounts for 28 to 32 of that, the fill for 1.9 at a
-  batch of 64, and the rest is threads and memory. The fill loop runs at
-  about half the instruction rate the core should reach, which is not
-  understood yet.
+  32 picoseconds per weight and vector on each core in its multiplies. The
+  tile kernel accounts for 28 to 32 of that, the fill for 1.9 at a batch
+  of 64, and the rest is threads and memory. The fill is limited by its
+  stores, 192 bytes per block of four rows: the A76 writes 16 bytes per
+  cycle into its nearest cache with `stp` or `st1`, and 10.7 with `st4`.
+  In a copy of the loop, its loads, stores and arithmetic barely
+  overlapped, and storing through shuffles and `st1` instead of `st4`
+  gained nothing.
 
 ## Questions the board can answer
 
@@ -273,14 +314,14 @@ Findings:
    around, and then the direct NEON kernels in `src/kernels/arm.rs` are
    where to look.
 4. **What does the prompt profile say?** Anything that is not a matrix
-   multiply and takes more than a few percent is a target. The NEON backend
-   still uses the portable versions of `quantize`, `silu_mul`, the softmax
-   and the attention kernels (`dot_rows`, `mix_rows` and their 16-bit
-   forms). Writing them with NEON is the likely next step if they show up.
-5. **Are the prompt batch sizes right here?** The defaults are 32 tokens on
-   ARM (64 on x86), and 128 for models with experts, whose batch is split
-   among the experts its tokens are routed to. The dense default was
-   measured on the A733, the expert one only on x86. Time `-b 32`, `64`,
+   multiply and takes more than a few percent is a target. On the A733 the
+   portable attention kernels took 6 percent of a prompt token, so NEON
+   has its own now, with the softmax, the gates and `quantize` (see "After
+   the NEON work"). `sum_squares` and `to_half` are still portable.
+5. **Are the prompt batch sizes right here?** The defaults are 64 tokens,
+   and 128 for models with experts, whose batch is split among the experts
+   its tokens are routed to. The dense default was measured on the A733,
+   the expert one only on x86. Time `-b 32`, `64`,
    `128` and `256` on an expert model on a board, alternating and starting
    each run at the same temperature, and watch the memory `bench` reports.
 6. **Memory.** `smallm bench` prints what the process holds. Compare with
@@ -291,12 +332,14 @@ Findings:
 
 ## Known unfinished work
 
-- **Q4_0 prompt reading on NEON** is 3.6 times slower than llama.cpp on the
-  A733 (above). It is the largest gap on boards.
-
-- **NEON speed is unmeasured.** The tile fills, and the MXFP4, NVFP4, Q2_0,
-  IQ4_NL and IQ4_XS kernels, were written without an ARM machine. CI shows
-  they are correct, not how fast they are.
+- **Q4_0 prompt reading on NEON** is 9 percent behind llama.cpp on the
+  A733's two A76 cores (40.6 against 44.6 tokens per second; it was 3.6
+  times slower). It is still the largest gap on boards. See "After the NEON
+  work" above for what is left.
+- **NEON speed is measured only in part.** `kernel_speed` has timed every
+  format's kernels and fills on an A76, but only Q4_0 and Q4_K_M models
+  were timed end to end. The MXFP4, NVFP4, Q2_0, IQ4_NL and IQ4_XS kernels
+  were written without an ARM machine. CI shows they are correct.
 - **Formats without SIMD.** IQ1, IQ2 and IQ3, TQ1_0, Q2_K and Q3_K have no
   NEON kernels, and use the portable tile fill on both backends. Q1_0 has
   no SIMD kernels at all.

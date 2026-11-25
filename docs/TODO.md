@@ -162,14 +162,31 @@ Gaps the measurements in PARITY.md and DEVELOPMENT.md show.
 - [x] Q4_0 prompt reading on NEON with the dot product extension, 3.5 times slower than llama.cpp b12711 on the
       A733's A76 cores. A four-vector tile kernel (`sdot` by lane), signed tiles, 32 columns per scale and faster
       fills took it from 12.8 to 39.1 tokens per second. Nemotron's Q4_K_M prompts went from 8.9 to 14.3.
-- [ ] Q4_0 prompt reading on NEON, still 12 percent behind llama.cpp b12711 on the A733's two A76 cores (39.1
-      against 44.5 tokens per second), though ahead on all 8 cores (47.4). What is left, in DEVELOPMENT.md: splitting the columns of wide matrices (a batch against 7680
-      columns runs the tile kernel 13 percent slower than against 2048), and the tile fill, which runs at half
-      the instruction rate the core should reach. An opt-in repack at load stays possible for boards with memory
-      to spare.
+- [x] NEON attention, softmax, gates and activation quantizing. The portable loops took 9 percent of a prompt
+      token on the A733. With 16-bit keys and values widened by `fcvtl`, attention went from 1.52 to 0.38 ms per
+      token, the SiLU gate from 0.39 to 0.26 and quantizing from 0.40 to 0.32. `quantize` gives exactly the
+      portable bytes.
+- [ ] Q4_0 prompt reading on NEON, still 9 percent behind llama.cpp b12711 on the A733's two A76 cores (40.6
+      against 44.6 tokens per second), and 7 percent on one (21.1 against 22.8), though ahead on all 8 cores
+      (50.3). What was tried and what is left, in DEVELOPMENT.md:
+      - [x] Zero the paired tile loops' sums with `fmov` from `xzr` instead of `movi`: 27.0 to 26.6 picoseconds
+            per weight. In the other loops it cost more than it saved.
+      - [x] Share each group of vectors between up to three tiles: 29.2 to 28.0 against a batch of 64, about 1
+            percent end to end.
+      - [ ] Interleave four vectors' activations, 16 bytes of each in turn, so that a pass reads one stream
+            instead of four: 2 to 3 percent of the multiplies in a test.
+      - [ ] Fill the next tiles inside the passes over the current ones. The fill is limited by its stores and
+            the passes by the vector pipes, so they could overlap: about 3 percent.
+      - [ ] Skip the tile offsets' stores when they are all zero, and run the norms on every thread: about 1
+            percent together.
+      - [ ] Fuse the gate with quantizing for the down projection: both stream the batch's 7680-wide activations
+            through memory.
+      - Splitting the columns of wide matrices was tried and made LFM3's feed-forward down 36 percent slower:
+        rows read in halves stream badly.
+      - An opt-in repack at load stays possible for boards with memory to spare.
 - [x] Q4_0 generation on NEON, 14 percent behind llama.cpp b12711 on the A733. Row kernels that take four blocks at
-      a time, and Q6_K's for the tied output layer, made it 8.6 against 8.5 tokens per second. Both engines are now
-      at the board's memory limit (9.9 GB/s, about 9.2 tokens per second for LFM3).
+      a time, Q6_K's for the tied output layer, and the NEON attention kernels made it 8.8 against 8.7 tokens per
+      second. Both engines are now at the board's memory limit (9.9 GB/s, about 9.2 tokens per second for LFM3).
 - [x] Q6_K's NEON row kernel, which the tied output layers of LFM3 and of Q4_K_M files use: 152 to 110 picoseconds
       per weight on an A76.
 - [x] The default prompt batch on ARM. With the faster NEON kernels, 64 reads LFM3's prompt 7 percent faster than

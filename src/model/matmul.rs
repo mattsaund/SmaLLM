@@ -54,9 +54,28 @@ const TILE_BATCH: usize = 8;
 /// The most rows any backend puts in a tile.
 const MAX_TILE_ROWS: usize = 8;
 
+/// The most tiles a thread fills before it passes the vectors over them.
+const MAX_TILES: usize = 3;
+
+/// Bytes the tiles that share each group of vectors may take together, with
+/// room left in a 64 KB first-level cache for the group's activations. On a
+/// Cortex-A76, a batch of 64 vectors of 2048 columns met by one tile at a
+/// time cost 10 percent more per weight than vectors already in that cache.
+/// Two tiles per group took back half of that, three two thirds.
+const TILE_SET_BYTES: usize = 32 * 1024;
+
+/// How many tiles of `height` rows and `cols` columns share each group of
+/// vectors: as many as [`TILE_SET_BYTES`] holds, counting a byte per weight
+/// and a scale and an offset per 16 weights, and at least one.
+fn tiles_at_once(height: usize, cols: usize) -> usize {
+    let bytes = height * cols + 2 * height * cols / 16 * 4;
+    (TILE_SET_BYTES / bytes.max(1)).clamp(1, MAX_TILES)
+}
+
 thread_local! {
-    /// The weight rows this thread is working on, decoded.
-    static TILE: RefCell<Tile> = RefCell::new(Tile::default());
+    /// The weight rows this thread is working on, decoded, a few tiles of
+    /// them at a time.
+    static TILES: RefCell<[Tile; MAX_TILES]> = RefCell::new(Default::default());
 }
 
 /// What a multiplication needs besides its operands.
@@ -287,6 +306,10 @@ impl Job<'_> {
     }
 
     /// Computes rows `rows` of one target by the tile route.
+    ///
+    /// A few tiles are filled at a time (see [`tiles_at_once`]), and each
+    /// group of vectors meets all of them before the next group, so that its
+    /// activations come from memory once for those tiles.
     fn run_tiled(&self, plan: &Plan, rows: Range<usize>) {
         // The group the activations were quantized in, which is not always
         // the weights' block: a block of Q2_0 spans two groups.
@@ -295,24 +318,36 @@ impl Job<'_> {
         let acts = self.acts(plan.family);
         let dot = self.kernels.tile_dot();
         let dot4 = self.kernels.tile_dot4();
-        TILE.with_borrow_mut(|tile| {
+        let set = tiles_at_once(height, self.cols);
+        TILES.with_borrow_mut(|tiles| {
             let mut row = rows.start;
             while row < rows.end {
-                let count = height.min(rows.end - row);
-                // SAFETY: rows `row..row + count` are below `plan.rows`, so
-                // they lie inside the tensor, which `multiply` checked
-                // against the mapping.
-                let bytes = unsafe {
-                    slice::from_raw_parts(
-                        plan.data.add(row * plan.row_bytes),
-                        count * plan.row_bytes,
-                    )
-                };
-                self.kernels.fill_tile(tile, plan.ty, bytes, plan.row_bytes);
-                debug_assert_eq!(tile.cols, self.cols);
-                // The next tile's rows, asked for now so that they arrive
-                // while this tile meets every vector.
-                let next = (row + count)..rows.end.min(row + count + height);
+                // Fill the set: tile `t` holds `counts[t]` rows from
+                // `firsts[t]`.
+                let mut firsts = [0; MAX_TILES];
+                let mut counts = [0; MAX_TILES];
+                let mut filled = 0;
+                while filled < set && row < rows.end {
+                    let count = height.min(rows.end - row);
+                    // SAFETY: rows `row..row + count` are below `plan.rows`,
+                    // so they lie inside the tensor, which `multiply`
+                    // checked against the mapping.
+                    let bytes = unsafe {
+                        slice::from_raw_parts(
+                            plan.data.add(row * plan.row_bytes),
+                            count * plan.row_bytes,
+                        )
+                    };
+                    let tile = &mut tiles[filled];
+                    self.kernels.fill_tile(tile, plan.ty, bytes, plan.row_bytes);
+                    debug_assert_eq!(tile.cols, self.cols);
+                    (firsts[filled], counts[filled]) = (row, count);
+                    filled += 1;
+                    row += count;
+                }
+                // The next set's rows, asked for now so that they arrive
+                // while this set meets every vector.
+                let next = row..rows.end.min(row + set * height);
                 if !next.is_empty() {
                     // SAFETY: as for `bytes`, rows below `rows.end`.
                     kernels::prefetch(unsafe {
@@ -322,6 +357,7 @@ impl Job<'_> {
                         )
                     });
                 }
+                let set_tiles = &tiles[..filled];
                 // Four vectors at a time when the backend has a kernel for
                 // that. It gives what four single calls would.
                 let mut first = 0;
@@ -332,15 +368,18 @@ impl Job<'_> {
                         let four = [0, 1, 2, 3].map(|k| acts.act(index(k), self.cols, group));
                         let sums =
                             [0, 1, 2, 3].map(|k| acts.scaled_sums(index(k), self.cols).as_ptr());
-                        // SAFETY: as for the single kernel below, for each of
-                        // the four vectors, and `results` has room for four
-                        // whole tiles.
-                        unsafe {
-                            dot4(tile, &four, &sums, group, results.as_mut_ptr());
-                            for k in 0..4 {
-                                let outputs = &results[k * height..k * height + count];
-                                for (r, value) in outputs.iter().enumerate() {
-                                    *plan.out.add((first + k) * plan.rows + row + r) = *value;
+                        for (t, tile) in set_tiles.iter().enumerate() {
+                            let (start, count) = (firsts[t], counts[t]);
+                            // SAFETY: as for the single kernel below, for
+                            // each of the four vectors, and `results` has
+                            // room for four whole tiles.
+                            unsafe {
+                                dot4(tile, &four, &sums, group, results.as_mut_ptr());
+                                for k in 0..4 {
+                                    let outputs = &results[k * height..k * height + count];
+                                    for (r, value) in outputs.iter().enumerate() {
+                                        *plan.out.add((first + k) * plan.rows + start + r) = *value;
+                                    }
                                 }
                             }
                         }
@@ -352,17 +391,20 @@ impl Job<'_> {
                 for (slot, index) in (first..).zip(inputs) {
                     let act = acts.act(index, self.cols, group);
                     let sums = acts.scaled_sums(index, self.cols).as_ptr();
-                    // SAFETY: the tile and the activations both hold `cols`
-                    // columns, `results` has room for a whole tile, and
-                    // `index` and `row + r` bound the output index.
-                    unsafe {
-                        dot(tile, act, sums, group, results.as_mut_ptr());
-                        for (r, value) in results[..count].iter().enumerate() {
-                            *plan.out.add(slot * plan.rows + row + r) = *value;
+                    for (t, tile) in set_tiles.iter().enumerate() {
+                        let (start, count) = (firsts[t], counts[t]);
+                        // SAFETY: the tile and the activations both hold
+                        // `cols` columns, `results` has room for a whole
+                        // tile, and `index` and `start + r` bound the output
+                        // index.
+                        unsafe {
+                            dot(tile, act, sums, group, results.as_mut_ptr());
+                            for (r, value) in results[..count].iter().enumerate() {
+                                *plan.out.add(slot * plan.rows + start + r) = *value;
+                            }
                         }
                     }
                 }
-                row += count;
             }
         });
     }

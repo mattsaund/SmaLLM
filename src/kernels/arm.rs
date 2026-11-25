@@ -48,17 +48,18 @@ const fn kernels(
         name,
         dot,
         axpy,
-        // NEON is always on, so the portable loops already vectorize.
+        // NEON is always on, so these portable loops vectorize, and they
+        // take little of the time.
         sum_squares: scalar::sum_squares,
-        dot_rows: scalar::dot_rows,
-        mix_rows: scalar::mix_rows,
-        dot_rows_half: scalar::dot_rows_half,
-        mix_rows_half: scalar::mix_rows_half,
         to_half: scalar::to_half,
-        silu_mul: scalar::silu_mul,
-        gelu_mul: scalar::gelu_mul,
-        softmax: scalar::softmax,
-        quantize: scalar::quantize,
+        dot_rows,
+        mix_rows,
+        dot_rows_half,
+        mix_rows_half,
+        silu_mul,
+        gelu_mul,
+        softmax,
+        quantize,
         row_f32,
         row_f16,
         row_bf16,
@@ -214,6 +215,468 @@ unsafe fn halves(p: *const u8) -> float32x4_t {
     }
 }
 
+/// Reads the eight half floats at `p` as eight f32 values, the first four
+/// and the last four.
+#[inline(always)]
+unsafe fn halves8(p: *const u16) -> [float32x4_t; 2] {
+    // SAFETY: the caller guarantees sixteen readable bytes at `p`. The
+    // assembly only touches the registers it is given.
+    unsafe {
+        let bits = vld1q_u16(p);
+        let (low, high): (float32x4_t, float32x4_t);
+        asm!(
+            "fcvtl {low:v}.4s, {bits:v}.4h",
+            "fcvtl2 {high:v}.4s, {bits:v}.8h",
+            bits = in(vreg) bits,
+            low = out(vreg) low,
+            high = out(vreg) high,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+        [low, high]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Attention
+// ---------------------------------------------------------------------------
+
+/// A row of keys or values as the cache keeps it: 32-bit floats, or 16-bit
+/// floats that are widened as they are read. Widening takes one instruction
+/// for four values, where the portable conversion takes several per value.
+trait CacheRow: Copy {
+    /// Eight values at `p`, as two registers.
+    unsafe fn eight(p: *const Self) -> [float32x4_t; 2];
+    /// The value at `p`.
+    unsafe fn one(p: *const Self) -> f32;
+}
+
+impl CacheRow for f32 {
+    #[inline(always)]
+    unsafe fn eight(p: *const f32) -> [float32x4_t; 2] {
+        // SAFETY: the caller guarantees eight readable floats at `p`.
+        unsafe { [vld1q_f32(p), vld1q_f32(p.add(4))] }
+    }
+    #[inline(always)]
+    unsafe fn one(p: *const f32) -> f32 {
+        // SAFETY: the caller guarantees a readable float at `p`.
+        unsafe { *p }
+    }
+}
+
+impl CacheRow for u16 {
+    #[inline(always)]
+    unsafe fn eight(p: *const u16) -> [float32x4_t; 2] {
+        // SAFETY: forwarded contract.
+        unsafe { halves8(p) }
+    }
+    #[inline(always)]
+    unsafe fn one(p: *const u16) -> f32 {
+        // SAFETY: the caller guarantees a readable half at `p`.
+        scalar::half_to_f32(unsafe { *p })
+    }
+}
+
+/// Scores `n` rows against `G` queries. Each row is loaded once and serves
+/// every query of the group, which is what makes grouped-query attention
+/// cheap. Two sums per query keep eight multiply-adds in flight with four
+/// queries.
+#[inline(always)]
+unsafe fn dot_rows_group<T: CacheRow, const G: usize>(
+    queries: *const f32,
+    rows: *const T,
+    n: usize,
+    len: usize,
+    scores: *mut f32,
+    stride: usize,
+) {
+    // SAFETY: the caller guarantees `G` queries and `n` rows of `len`
+    // values, and `G` score runs `stride` apart with room for `n` scores.
+    unsafe {
+        for j in 0..n {
+            let row = rows.add(j * len);
+            let mut acc = [[vdupq_n_f32(0.0); 2]; G];
+            let mut i = 0;
+            while i + 8 <= len {
+                let values = T::eight(row.add(i));
+                for (g, acc) in acc.iter_mut().enumerate() {
+                    let query = queries.add(g * len + i);
+                    acc[0] = vfmaq_f32(acc[0], values[0], vld1q_f32(query));
+                    acc[1] = vfmaq_f32(acc[1], values[1], vld1q_f32(query.add(4)));
+                }
+                i += 8;
+            }
+            for (g, acc) in acc.iter().enumerate() {
+                let mut sum = vaddvq_f32(vaddq_f32(acc[0], acc[1]));
+                for t in i..len {
+                    sum += T::one(row.add(t)) * *queries.add(g * len + t);
+                }
+                *scores.add(g * stride + j) = sum;
+            }
+        }
+    }
+}
+
+/// [`Kernels::dot_rows`] for either kind of row, queries four at a time.
+#[inline(always)]
+unsafe fn dot_rows_of<T: CacheRow>(
+    queries: *const f32,
+    n_queries: usize,
+    rows: *const T,
+    n: usize,
+    len: usize,
+    scores: *mut f32,
+    stride: usize,
+) {
+    // SAFETY: forwarded contract, one group of queries at a time.
+    unsafe {
+        let mut h = 0;
+        while h < n_queries {
+            let (q, s) = (queries.add(h * len), scores.add(h * stride));
+            match n_queries - h {
+                1 => dot_rows_group::<T, 1>(q, rows, n, len, s, stride),
+                2 => dot_rows_group::<T, 2>(q, rows, n, len, s, stride),
+                3 => dot_rows_group::<T, 3>(q, rows, n, len, s, stride),
+                _ => dot_rows_group::<T, 4>(q, rows, n, len, s, stride),
+            }
+            h += 4;
+        }
+    }
+}
+
+/// See [`Kernels::dot_rows`].
+unsafe fn dot_rows(
+    queries: *const f32,
+    n_queries: usize,
+    rows: *const f32,
+    n: usize,
+    len: usize,
+    scores: *mut f32,
+    stride: usize,
+) {
+    // SAFETY: forwarded contract.
+    unsafe { dot_rows_of(queries, n_queries, rows, n, len, scores, stride) }
+}
+
+/// See [`Kernels::dot_rows_any`], for rows of 16-bit floats.
+unsafe fn dot_rows_half(
+    queries: *const f32,
+    n_queries: usize,
+    rows: *const u16,
+    n: usize,
+    len: usize,
+    scores: *mut f32,
+    stride: usize,
+) {
+    // SAFETY: forwarded contract.
+    unsafe { dot_rows_of(queries, n_queries, rows, n, len, scores, stride) }
+}
+
+/// Adds the weighted rows to `G` outputs, `4 * K` floats of each at a time.
+/// The partial outputs stay in registers across all rows, so no row waits
+/// on a store from the row before it. `K` is even, since rows are read
+/// eight values at a time.
+#[inline(always)]
+unsafe fn mix_rows_block<T: CacheRow, const G: usize, const K: usize>(
+    weights: *const f32,
+    rows: *const T,
+    n: usize,
+    len: usize,
+    outs: *mut f32,
+    stride: usize,
+) {
+    // SAFETY: the caller guarantees `G` outputs with `4 * K` writable floats
+    // at `outs + g * len`, `n` rows with `4 * K` readable values at
+    // `rows + j * len`, and `G` weight runs `stride` apart.
+    unsafe {
+        let mut acc = [[vdupq_n_f32(0.0); K]; G];
+        for (g, out) in acc.iter_mut().enumerate() {
+            for (k, part) in out.iter_mut().enumerate() {
+                *part = vld1q_f32(outs.add(g * len + k * 4));
+            }
+        }
+        for j in 0..n {
+            let row = rows.add(j * len);
+            let mut values = [vdupq_n_f32(0.0); K];
+            for pair in 0..K / 2 {
+                [values[2 * pair], values[2 * pair + 1]] = T::eight(row.add(pair * 8));
+            }
+            for (g, out) in acc.iter_mut().enumerate() {
+                let weight = *weights.add(g * stride + j);
+                for (part, value) in out.iter_mut().zip(&values) {
+                    *part = vfmaq_n_f32(*part, *value, weight);
+                }
+            }
+        }
+        for (g, out) in acc.iter().enumerate() {
+            for (k, part) in out.iter().enumerate() {
+                vst1q_f32(outs.add(g * len + k * 4), *part);
+            }
+        }
+    }
+}
+
+/// [`Kernels::mix_rows`] for either kind of row. Outputs are taken four at
+/// a time and 16 floats at a time, which keeps 16 of the 32 registers for
+/// sums.
+#[inline(always)]
+unsafe fn mix_rows_of<T: CacheRow>(
+    weights: *const f32,
+    n_queries: usize,
+    rows: *const T,
+    n: usize,
+    len: usize,
+    outs: *mut f32,
+    stride: usize,
+) {
+    // SAFETY: forwarded contract. Each call covers a block of columns of a
+    // group of outputs, so the pointers are offset by the block's start.
+    unsafe {
+        let mut h = 0;
+        while h < n_queries {
+            let group = (n_queries - h).min(4);
+            let (w, o) = (weights.add(h * stride), outs.add(h * len));
+            let mut i = 0;
+            while i + 16 <= len {
+                let (r, o) = (rows.add(i), o.add(i));
+                match group {
+                    1 => mix_rows_block::<T, 1, 4>(w, r, n, len, o, stride),
+                    2 => mix_rows_block::<T, 2, 4>(w, r, n, len, o, stride),
+                    3 => mix_rows_block::<T, 3, 4>(w, r, n, len, o, stride),
+                    _ => mix_rows_block::<T, 4, 4>(w, r, n, len, o, stride),
+                }
+                i += 16;
+            }
+            while i + 8 <= len {
+                let (r, o) = (rows.add(i), o.add(i));
+                match group {
+                    1 => mix_rows_block::<T, 1, 2>(w, r, n, len, o, stride),
+                    2 => mix_rows_block::<T, 2, 2>(w, r, n, len, o, stride),
+                    3 => mix_rows_block::<T, 3, 2>(w, r, n, len, o, stride),
+                    _ => mix_rows_block::<T, 4, 2>(w, r, n, len, o, stride),
+                }
+                i += 8;
+            }
+            // The last few columns, one value at a time.
+            for g in 0..group {
+                for j in 0..n {
+                    let weight = *w.add(g * stride + j);
+                    for t in i..len {
+                        *o.add(g * len + t) += weight * T::one(rows.add(j * len + t));
+                    }
+                }
+            }
+            h += group;
+        }
+    }
+}
+
+/// See [`Kernels::mix_rows`].
+unsafe fn mix_rows(
+    weights: *const f32,
+    n_queries: usize,
+    rows: *const f32,
+    n: usize,
+    len: usize,
+    outs: *mut f32,
+    stride: usize,
+) {
+    // SAFETY: forwarded contract.
+    unsafe { mix_rows_of(weights, n_queries, rows, n, len, outs, stride) }
+}
+
+/// See [`Kernels::mix_rows_any`], for rows of 16-bit floats.
+unsafe fn mix_rows_half(
+    weights: *const f32,
+    n_queries: usize,
+    rows: *const u16,
+    n: usize,
+    len: usize,
+    outs: *mut f32,
+    stride: usize,
+) {
+    // SAFETY: forwarded contract.
+    unsafe { mix_rows_of(weights, n_queries, rows, n, len, outs, stride) }
+}
+
+// ---------------------------------------------------------------------------
+// Activations, the softmax and quantizing
+// ---------------------------------------------------------------------------
+
+/// [`scalar::exp_approx`] on four lanes: the same range reduction and
+/// polynomial, with fused multiply-adds. A value that is not a number stays
+/// one, since the clamp keeps it.
+#[inline(always)]
+unsafe fn exp4(x: float32x4_t) -> float32x4_t {
+    const LOG2_E: f32 = std::f32::consts::LOG2_E;
+    const LN2_HIGH: f32 = 0.693_145_75;
+    const LN2_LOW: f32 = 1.428_606_8e-6;
+    const ROUND: f32 = 12_582_912.0;
+    // SAFETY: NEON is part of the AArch64 baseline.
+    unsafe {
+        let x = vminq_f32(vmaxq_f32(x, vdupq_n_f32(-87.0)), vdupq_n_f32(88.0));
+        let shifted = vfmaq_n_f32(vdupq_n_f32(ROUND), x, LOG2_E);
+        let k = vsubq_f32(shifted, vdupq_n_f32(ROUND));
+        let r = vfmsq_f32(
+            vfmsq_f32(x, k, vdupq_n_f32(LN2_HIGH)),
+            k,
+            vdupq_n_f32(LN2_LOW),
+        );
+        let mut p = vdupq_n_f32(1.0 / 720.0);
+        for c in [1.0 / 120.0, 1.0 / 24.0, 1.0 / 6.0, 0.5, 1.0, 1.0] {
+            p = vfmaq_f32(vdupq_n_f32(c), p, r);
+        }
+        // `2^k` from the integer `shifted` holds above the bits of `ROUND`.
+        let bias = vdupq_n_u32(ROUND.to_bits() - 127);
+        let biased = vsubq_u32(vreinterpretq_u32_f32(shifted), bias);
+        vmulq_f32(p, vreinterpretq_f32_u32(vshlq_n_u32::<23>(biased)))
+    }
+}
+
+/// See [`Kernels::silu_mul`]. `silu(x) = x / (1 + exp(-x))`.
+unsafe fn silu_mul(gate: *mut f32, up: *const f32, n: usize) {
+    // SAFETY: the caller guarantees `gate` is valid for `n` writes and `up`
+    // for `n` reads, and that they do not overlap.
+    unsafe {
+        let one = vdupq_n_f32(1.0);
+        let mut i = 0;
+        while i + 4 <= n {
+            let x = vld1q_f32(gate.add(i));
+            let silu = vdivq_f32(x, vaddq_f32(one, exp4(vnegq_f32(x))));
+            vst1q_f32(gate.add(i), vmulq_f32(silu, vld1q_f32(up.add(i))));
+            i += 4;
+        }
+        scalar::silu_mul_impl(gate.add(i), up.add(i), n - i);
+    }
+}
+
+/// See [`Kernels::gelu_mul`]. The tanh form, as `x * sigmoid(2z)` with
+/// `z = sqrt(2 / pi) * x * (1 + 0.044715 * x^2)`.
+unsafe fn gelu_mul(gate: *mut f32, up: *const f32, n: usize) {
+    const SQRT_2_OVER_PI: f32 = 0.797_884_6;
+    const CUBIC: f32 = 0.044_715;
+    // SAFETY: as in `silu_mul`.
+    unsafe {
+        let one = vdupq_n_f32(1.0);
+        let mut i = 0;
+        while i + 4 <= n {
+            let x = vld1q_f32(gate.add(i));
+            let inner = vfmaq_f32(one, vmulq_n_f32(x, CUBIC), x);
+            let minus_two_z = vmulq_f32(vmulq_n_f32(x, -2.0 * SQRT_2_OVER_PI), inner);
+            let gelu = vdivq_f32(x, vaddq_f32(one, exp4(minus_two_z)));
+            vst1q_f32(gate.add(i), vmulq_f32(gelu, vld1q_f32(up.add(i))));
+            i += 4;
+        }
+        scalar::gelu_mul_impl(gate.add(i), up.add(i), n - i);
+    }
+}
+
+/// See [`Kernels::softmax`].
+unsafe fn softmax(x: *mut f32, n: usize) {
+    // SAFETY: the caller guarantees the pointer is valid for `n` reads and
+    // writes, and every access below stays under `n`.
+    unsafe {
+        let mut lanes = vdupq_n_f32(f32::NEG_INFINITY);
+        let mut i = 0;
+        while i + 4 <= n {
+            lanes = vmaxq_f32(lanes, vld1q_f32(x.add(i)));
+            i += 4;
+        }
+        let mut max = vmaxvq_f32(lanes);
+        for t in i..n {
+            max = max.max(*x.add(t));
+        }
+        let shift = vdupq_n_f32(max);
+        let mut sums = vdupq_n_f32(0.0);
+        i = 0;
+        while i + 4 <= n {
+            let value = exp4(vsubq_f32(vld1q_f32(x.add(i)), shift));
+            vst1q_f32(x.add(i), value);
+            sums = vaddq_f32(sums, value);
+            i += 4;
+        }
+        let mut sum = vaddvq_f32(sums);
+        for t in i..n {
+            let value = scalar::exp_approx(*x.add(t) - max);
+            *x.add(t) = value;
+            sum += value;
+        }
+        let inverse = 1.0 / sum;
+        i = 0;
+        while i + 4 <= n {
+            vst1q_f32(x.add(i), vmulq_n_f32(vld1q_f32(x.add(i)), inverse));
+            i += 4;
+        }
+        for t in i..n {
+            *x.add(t) *= inverse;
+        }
+    }
+}
+
+/// See [`Kernels::quantize`]. Gives exactly what the portable version
+/// gives, which a test holds it to.
+///
+/// The largest magnitude is taken lane by lane, a lane changing only for a
+/// larger value, so a value that is not a number never counts, as in the
+/// portable loop. `fcvtns` rounds to the nearest integer with ties to even,
+/// as the portable rounding trick does, and gives 0 for a value that is not
+/// a number, as the portable cast does. The narrowing keeps the low bits,
+/// as the portable cast to a byte does, for the scales whose inverse
+/// overflows.
+unsafe fn quantize(
+    x: *const f32,
+    n: usize,
+    group: usize,
+    q: *mut i8,
+    scale: *mut f32,
+    sums: *mut i16,
+    wsum: *mut f32,
+) {
+    // SAFETY: the caller guarantees the buffer sizes documented on
+    // `Kernels::quantize`, and that `group` is a multiple of 16.
+    unsafe {
+        for g in 0..n / group {
+            let values = x.add(g * group);
+            let out = q.add(g * group);
+            let run_sums = sums.add(g * group / 16);
+            let mut largest = [vdupq_n_f32(0.0); 4];
+            for run in 0..group / 16 {
+                for (k, largest) in largest.iter_mut().enumerate() {
+                    let magnitude = vabsq_f32(vld1q_f32(values.add(run * 16 + k * 4)));
+                    *largest = vbslq_f32(vcgtq_f32(magnitude, *largest), magnitude, *largest);
+                }
+            }
+            let largest = vmaxq_f32(
+                vmaxq_f32(largest[0], largest[1]),
+                vmaxq_f32(largest[2], largest[3]),
+            );
+            let max = vmaxvq_f32(largest);
+            if max == 0.0 {
+                std::ptr::write_bytes(out, 0, group);
+                std::ptr::write_bytes(run_sums, 0, group / 16);
+                *scale.add(g) = 0.0;
+                *wsum.add(g) = 0.0;
+                continue;
+            }
+            let inverse = 127.0 / max;
+            let mut total = 0i32;
+            for run in 0..group / 16 {
+                let at = values.add(run * 16);
+                let ints = [0, 1, 2, 3]
+                    .map(|k| vcvtnq_s32_f32(vmulq_n_f32(vld1q_f32(at.add(k * 4)), inverse)));
+                let low = vmovn_high_s32(vmovn_s32(ints[0]), ints[1]);
+                let high = vmovn_high_s32(vmovn_s32(ints[2]), ints[3]);
+                let bytes = vmovn_high_s16(vmovn_s16(low), high);
+                vst1q_s8(out.add(run * 16), bytes);
+                let partial = vaddlvq_s8(bytes);
+                *run_sums.add(run) = partial;
+                total += i32::from(partial);
+            }
+            *scale.add(g) = max / 127.0;
+            *wsum.add(g) = *scale.add(g) * total as f32;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Float weight rows
 // ---------------------------------------------------------------------------
@@ -350,6 +813,31 @@ unsafe fn sdot(mut sum: int32x4_t, weights: int8x16_t, acts: int8x16_t) -> int32
     sum
 }
 
+/// A register of zeros, for a sum of products to start from.
+///
+/// `movi` would take a slot on the vector pipes, which the dot products
+/// keep busy: on a Cortex-A76 the four per step of the tile kernel cost 4
+/// percent of its time in a test of the bare loop. `fmov` from the integer
+/// side's zero register cost nothing measurable there. Not marked pure, so
+/// that the compiler gives every sum its own register instead of copying
+/// one, which would take a vector slot again. That also keeps the compiler
+/// from moving it, and in the row kernels and the tile kernel for 16-column
+/// scales it cost more than it saved, so only the paired tile loops use
+/// it.
+#[inline(always)]
+unsafe fn zeros() -> int32x4_t {
+    let value: int32x4_t;
+    // SAFETY: the instruction writes only the register it is given.
+    unsafe {
+        asm!(
+            "fmov {value:d}, xzr",
+            value = out(vreg) value,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    value
+}
+
 /// The `sdot` instruction by element: multiplies the 16 bytes of `weights`
 /// with the four bytes in lane `LANE` of `acts`, repeated, and adds each
 /// group of four products to one 32-bit lane of `sum`. With a tile step of
@@ -408,7 +896,7 @@ unsafe fn tile_rows<D: ByteDot>(
             // scales multiplied first. `tile_dot4_sdot` does the same.
             let mut total = vdupq_n_f32(0.0);
             for pair in 0..tile.cols / 32 {
-                let mut sums = vdupq_n_s32(0);
+                let mut sums = zeros();
                 for step in pair * 8..pair * 8 + 8 {
                     let weights = vld1q_s8(q.add(step * 16));
                     let four = (act.q.add(step * 4) as *const u32).read_unaligned();
@@ -561,7 +1049,7 @@ unsafe fn pair_sums4(q: *const i8, acts: &[ActRef; 4], pair: usize) -> [int32x4_
             [0, 1, 2, 3].map(|vector| vld1q_s8(acts[vector].q.add((sub + half) * 16)))
         };
         let (first, second) = (values(0), values(1));
-        let mut sums = [vdupq_n_s32(0); 4];
+        let mut sums = [zeros(), zeros(), zeros(), zeros()];
         let weights = |half: usize, k: usize| vld1q_s8(q.add(((sub + half) * 4 + k) * 16));
         // One step of one sub-block for every vector. The lane is a constant
         // of the instruction, so the steps are written out.

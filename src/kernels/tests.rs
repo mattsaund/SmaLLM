@@ -852,16 +852,26 @@ fn kernel_speed() {
         };
         let ty = TensorType::Q4_0;
         let vectors = 64;
-        for cols in [1024, 2048, 7680] {
+        // Four distinct vectors stay in the nearest cache, 64 do not. Two
+        // tiles per group of vectors, as the multiply takes them at this
+        // width, read each group's activations from further out once.
+        for (cols, distinct, count) in [(2048, 4, 1), (2048, 64, 1), (2048, 64, 2), (7680, 64, 1)] {
             let height = kernels.tile_rows();
             let row_bytes = ty.row_bytes(cols).unwrap();
-            let rows = random_weights(&mut rng, ty, height * cols, 3.2);
-            let mut tile = Tile::default();
-            kernels.fill_tile(&mut tile, ty, &rows, row_bytes);
-            let batch: Vec<Acts> = (0..vectors)
+            let tiles: Vec<Tile> = (0..count)
+                .map(|_| {
+                    let rows = random_weights(&mut rng, ty, height * cols, 3.2);
+                    let mut tile = Tile::default();
+                    kernels.fill_tile(&mut tile, ty, &rows, row_bytes);
+                    tile
+                })
+                .collect();
+            // `distinct` different vectors, repeated to make up the batch.
+            let batch: Vec<Acts> = (0..distinct)
                 .map(|_| Acts::new(scalar(), &rng.floats(cols, -3.0, 3.0), 32))
                 .collect();
-            let sums: Vec<Vec<f32>> = batch.iter().map(scaled_sums).collect();
+            let batch: Vec<&Acts> = (0..vectors).map(|v| &batch[v % distinct]).collect();
+            let sums: Vec<Vec<f32>> = batch.iter().map(|acts| scaled_sums(acts)).collect();
             let mut out = [0.0f32; 32];
             let mut best = f64::MAX;
             for _ in 0..20 {
@@ -869,16 +879,18 @@ fn kernel_speed() {
                 for group in 0..vectors / 4 {
                     let refs = [0, 1, 2, 3].map(|k| batch[group * 4 + k].as_ref());
                     let pointers = [0, 1, 2, 3].map(|k| sums[group * 4 + k].as_ptr());
-                    // SAFETY: the tile and every vector hold `cols` columns,
-                    // and `out` has room for four tiles.
-                    unsafe { dot4(&tile, &refs, &pointers, 32, out.as_mut_ptr()) };
-                    std::hint::black_box(&mut out);
+                    for tile in &tiles {
+                        // SAFETY: the tile and every vector hold `cols`
+                        // columns, and `out` has room for four tiles.
+                        unsafe { dot4(tile, &refs, &pointers, 32, out.as_mut_ptr()) };
+                        std::hint::black_box(&mut out);
+                    }
                 }
                 best = best.min(start.elapsed().as_secs_f64());
             }
-            let picos = best * 1e12 / (vectors * height * cols) as f64;
+            let picos = best * 1e12 / (vectors * count * height * cols) as f64;
             println!(
-                "  {} Q4_0 tile4, a batch of {vectors} vectors of {cols}: {picos:.1}",
+                "  {} Q4_0 tile4, a batch of {vectors} vectors of {cols}, {distinct} distinct, {count} tiles: {picos:.1}",
                 kernels.name
             );
         }
