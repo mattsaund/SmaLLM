@@ -305,43 +305,64 @@ fn fast_cores(ratings: &[u64]) -> Option<usize> {
     Some(ratings.iter().filter(|&&rating| rating > midpoint).count())
 }
 
-/// Counts cores from the kernel's CPU topology.
-///
-/// Logical CPUs are grouped into physical cores by package and core id.
-/// Each core is rated by its capacity, which ARM kernels report, or else by
-/// its top frequency, which tells the core types of an x86 CPU apart.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn core_counts() -> Option<Cores> {
-    use std::collections::HashMap;
-    use std::fs;
+/// One logical CPU as the Linux kernel describes it in sysfs.
+#[derive(Clone, Debug, Default)]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android", test)),
+    allow(dead_code)
+)]
+struct LogicalCpu {
+    /// The N of `cpuN`.
+    id: usize,
+    /// The logical CPUs that share this CPU's physical core, this one
+    /// included: `topology/core_cpus_list`, or `thread_siblings_list` on
+    /// older kernels. Empty when the kernel gives neither.
+    siblings: Vec<usize>,
+    /// Package, cluster and core ids, for kernels without a sibling list.
+    package: String,
+    cluster: String,
+    core: String,
+    /// `cpu_capacity`, which ARM kernels report. Zero when absent.
+    capacity: u64,
+    /// `cpufreq/cpuinfo_max_freq`. Zero when absent.
+    max_freq: u64,
+}
 
-    // Capacity and top frequency of each physical core.
-    let mut cores: HashMap<(String, String), (u64, u64)> = HashMap::new();
-    for entry in fs::read_dir("/sys/devices/system/cpu").ok()? {
-        let path = entry.ok()?.path();
-        let name = path.file_name()?.to_str()?;
-        let is_cpu = name
-            .strip_prefix("cpu")
-            .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()));
-        if !is_cpu {
+/// Counts physical cores among the logical CPUs a process may run on.
+///
+/// A physical core is named by the CPUs that share it, from the sibling
+/// list, so that it is told apart from cores in other clusters. Core ids
+/// alone are not enough: on some ARM boards each cluster numbers its cores
+/// from zero again (the Allwinner A733's two A76 cores are cores 0 and 1 of
+/// cluster 1), and those cores would be taken for hardware threads of the
+/// first cluster's. Package, cluster and core id together serve when the
+/// kernel gives no sibling list.
+///
+/// `allowed` is the process's CPU affinity. CPUs outside it are not
+/// counted, so that a program confined to one cluster (`taskset -c 0-5`)
+/// sizes its threads for that cluster. Each core is rated by its capacity,
+/// or else by its top frequency, which tells the core types of an x86 CPU
+/// apart.
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android", test)),
+    allow(dead_code)
+)]
+fn count_cores(cpus: &[LogicalCpu], allowed: Option<&[usize]>) -> Option<Cores> {
+    use std::collections::HashMap;
+
+    // Capacity and top frequency of each physical core, by its name.
+    let mut cores: HashMap<String, (u64, u64)> = HashMap::new();
+    for cpu in cpus {
+        if allowed.is_some_and(|allowed| !allowed.contains(&cpu.id)) {
             continue;
         }
-        let read = |file: &str| {
-            fs::read_to_string(path.join(file))
-                .ok()
-                .map(|text| text.trim().to_string())
+        let name = match cpu.siblings.iter().min() {
+            Some(first) => format!("cpu {first}"),
+            None => format!("{} {} {}", cpu.package, cpu.cluster, cpu.core),
         };
-        // A CPU that is offline has no topology directory.
-        let (Some(package), Some(core)) = (
-            read("topology/physical_package_id"),
-            read("topology/core_id"),
-        ) else {
-            continue;
-        };
-        let number = |file: &str| read(file).and_then(|text| text.parse().ok()).unwrap_or(0);
-        let rating = cores.entry((package, core)).or_default();
-        rating.0 = rating.0.max(number("cpu_capacity"));
-        rating.1 = rating.1.max(number("cpufreq/cpuinfo_max_freq"));
+        let rating = cores.entry(name).or_default();
+        rating.0 = rating.0.max(cpu.capacity);
+        rating.1 = rating.1.max(cpu.max_freq);
     }
     if cores.is_empty() {
         return None;
@@ -355,6 +376,85 @@ fn core_counts() -> Option<Cores> {
         fast,
         all: cores.len(),
     })
+}
+
+/// Parses a kernel CPU list such as `0-5,8,10-11`. `None` when the text is
+/// not one.
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android", test)),
+    allow(dead_code)
+)]
+fn parse_cpu_list(text: &str) -> Option<Vec<usize>> {
+    let mut cpus = Vec::new();
+    for part in text.trim().split(',').filter(|part| !part.is_empty()) {
+        match part.split_once('-') {
+            Some((first, last)) => {
+                let (first, last): (usize, usize) = (first.parse().ok()?, last.parse().ok()?);
+                // A bound keeps a malformed range from allocating without end.
+                if last < first || last - first > 1 << 16 {
+                    return None;
+                }
+                cpus.extend(first..=last);
+            }
+            None => cpus.push(part.parse().ok()?),
+        }
+    }
+    Some(cpus)
+}
+
+/// Counts cores from the kernel's CPU topology, among the CPUs this process
+/// may run on.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn core_counts() -> Option<Cores> {
+    use std::fs;
+
+    let mut cpus = Vec::new();
+    for entry in fs::read_dir("/sys/devices/system/cpu").ok()? {
+        let path = entry.ok()?.path();
+        let name = path.file_name()?.to_str()?;
+        let Some(id) = name
+            .strip_prefix("cpu")
+            .and_then(|rest| rest.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        let read = |file: &str| {
+            fs::read_to_string(path.join(file))
+                .ok()
+                .map(|text| text.trim().to_string())
+        };
+        // A CPU that is offline has no topology directory.
+        let (Some(package), Some(core)) = (
+            read("topology/physical_package_id"),
+            read("topology/core_id"),
+        ) else {
+            continue;
+        };
+        let number = |file: &str| read(file).and_then(|text| text.parse().ok()).unwrap_or(0);
+        let siblings = read("topology/core_cpus_list")
+            .or_else(|| read("topology/thread_siblings_list"))
+            .and_then(|text| parse_cpu_list(&text))
+            .unwrap_or_default();
+        cpus.push(LogicalCpu {
+            id,
+            siblings,
+            package,
+            cluster: read("topology/cluster_id").unwrap_or_default(),
+            core,
+            capacity: number("cpu_capacity"),
+            max_freq: number("cpufreq/cpuinfo_max_freq"),
+        });
+    }
+    // The CPUs this process may run on, from its affinity mask.
+    let allowed = fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
+                .and_then(parse_cpu_list)
+        });
+    count_cores(&cpus, allowed.as_deref())
 }
 
 /// Counts performance cores on Apple silicon, and all physical cores.
@@ -639,6 +739,80 @@ mod tests {
         assert_eq!(fast_cores(&[]), None);
         assert_eq!(fast_cores(&[0, 0, 0, 0]), None);
         assert_eq!(fast_cores(&[5_500_000, 0]), None);
+    }
+
+    /// A logical CPU of a test topology.
+    fn cpu(id: usize, siblings: &[usize], cluster: &str, core: &str, capacity: u64) -> LogicalCpu {
+        LogicalCpu {
+            id,
+            siblings: siblings.to_vec(),
+            package: "0".into(),
+            cluster: cluster.into(),
+            core: core.into(),
+            capacity,
+            max_freq: 0,
+        }
+    }
+
+    #[test]
+    fn clusters_that_number_their_cores_from_zero_are_told_apart() {
+        // The Allwinner A733: six A55s are cores 0 to 5 of cluster 0, and
+        // two A76s are cores 0 and 1 of cluster 1.
+        let mut a733: Vec<LogicalCpu> = (0..6)
+            .map(|i| cpu(i, &[i], "0", &i.to_string(), 446))
+            .collect();
+        a733.push(cpu(6, &[6], "1", "0", 1024));
+        a733.push(cpu(7, &[7], "1", "1", 1024));
+        assert_eq!(count_cores(&a733, None), Some(Cores { fast: 2, all: 8 }));
+        // Without sibling lists, the cluster id tells them apart.
+        let mut old_kernel = a733.clone();
+        old_kernel.iter_mut().for_each(|cpu| cpu.siblings.clear());
+        assert_eq!(
+            count_cores(&old_kernel, None),
+            Some(Cores { fast: 2, all: 8 })
+        );
+        // Confined to the A55s, a process sees six equal cores.
+        let little = [0, 1, 2, 3, 4, 5];
+        assert_eq!(
+            count_cores(&a733, Some(&little)),
+            Some(Cores { fast: 6, all: 6 })
+        );
+        assert_eq!(
+            count_cores(&a733, Some(&[6, 7])),
+            Some(Cores { fast: 2, all: 2 })
+        );
+        assert_eq!(count_cores(&a733, Some(&[])), None);
+    }
+
+    #[test]
+    fn hardware_threads_of_one_core_count_once() {
+        // Two cores with two hardware threads each, numbered as Intel does:
+        // CPUs 0 and 2 share core 0, CPUs 1 and 3 share core 1.
+        let cpus = [
+            cpu(0, &[0, 2], "", "0", 0),
+            cpu(1, &[1, 3], "", "1", 0),
+            cpu(2, &[0, 2], "", "0", 0),
+            cpu(3, &[1, 3], "", "1", 0),
+        ];
+        assert_eq!(count_cores(&cpus, None), Some(Cores { fast: 2, all: 2 }));
+        // One thread of a core is enough for the core to count.
+        assert_eq!(
+            count_cores(&cpus, Some(&[2, 3])),
+            Some(Cores { fast: 2, all: 2 })
+        );
+    }
+
+    #[test]
+    fn cpu_lists_parse() {
+        assert_eq!(
+            parse_cpu_list("0-5,8,10-11\n"),
+            Some(vec![0, 1, 2, 3, 4, 5, 8, 10, 11])
+        );
+        assert_eq!(parse_cpu_list("7"), Some(vec![7]));
+        assert_eq!(parse_cpu_list(""), Some(vec![]));
+        assert_eq!(parse_cpu_list("3-1"), None);
+        assert_eq!(parse_cpu_list("a"), None);
+        assert_eq!(parse_cpu_list("0-999999999"), None);
     }
 
     #[test]

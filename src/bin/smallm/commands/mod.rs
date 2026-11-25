@@ -166,14 +166,14 @@ pub fn load_model(name: &str) -> Result<Loaded, String> {
 /// The thread counts of a session, for status lines: "8 threads" or
 /// "8 threads, 20 for prompts".
 pub fn thread_counts(session: &smallm::Session) -> String {
+    let threads = match session.threads() {
+        1 => "1 thread".to_string(),
+        n => format!("{n} threads"),
+    };
     if session.batch_threads() == session.threads() {
-        format!("{} threads", session.threads())
+        threads
     } else {
-        format!(
-            "{} threads, {} for prompts",
-            session.threads(),
-            session.batch_threads()
-        )
+        format!("{threads}, {} for prompts", session.batch_threads())
     }
 }
 
