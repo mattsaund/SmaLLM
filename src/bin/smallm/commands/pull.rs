@@ -11,7 +11,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use crate::args::Args;
+use crate::args::{self, Args, Spec, switch};
 use crate::json::Json;
 use crate::models::{self, human_bytes};
 use crate::screen::{Screen, clock};
@@ -518,6 +518,26 @@ pub fn pull(raw: impl Iterator<Item = String>) -> Result<(), String> {
     Ok(())
 }
 
+/// The options of `smallm rm`.
+const RM_SPECS: [Spec; 1] = [switch("yes", Some('y'), "Delete without asking first")];
+
+pub fn list_help() -> String {
+    "Usage: smallm list\n\n\
+     Lists the downloaded models, with their sizes, and the folder they are\n\
+     kept in. The models setting, or SMALLM_MODELS, chooses the folder.\n"
+        .to_string()
+}
+
+pub fn rm_help() -> String {
+    format!(
+        "Usage: smallm rm <model> [options]\n\n\
+         Deletes a downloaded model. Part of its name is enough when it\n\
+         singles one out. Asks first.\n\n\
+         Options:\n{}",
+        args::describe(&RM_SPECS)
+    )
+}
+
 pub fn list(raw: impl Iterator<Item = String>) -> Result<(), String> {
     Args::parse(raw, &[])?;
     let dir = models::models_dir();
@@ -542,12 +562,30 @@ pub fn list(raw: impl Iterator<Item = String>) -> Result<(), String> {
 }
 
 pub fn remove(raw: impl Iterator<Item = String>) -> Result<(), String> {
-    let args = Args::parse(raw, &[])?;
+    use std::io::{BufRead, IsTerminal};
+
+    let args = Args::parse(raw, &RM_SPECS)?;
     let name = args
         .positional(0)
         .ok_or("which model? Usage: smallm rm <model>")?;
     // Only downloaded models are removed, never an arbitrary path.
     let path = models::resolve_in(&models::models_dir(), name)?;
+    // Ask first, as uninstall does. Without a terminal to ask on, only
+    // --yes deletes.
+    if !args.has("yes") {
+        if !std::io::stdin().is_terminal() {
+            return Err("nothing was deleted. Pass --yes to delete without being asked.".into());
+        }
+        let size = std::fs::metadata(&path).map_or(0, |meta| meta.len());
+        print!("Delete {} ({})? [y/N] ", path.display(), human_bytes(size));
+        std::io::stdout().flush().ok();
+        let mut answer = String::new();
+        std::io::stdin().lock().read_line(&mut answer).ok();
+        if !matches!(answer.trim(), "y" | "Y" | "yes" | "Yes" | "YES") {
+            println!("Nothing was deleted.");
+            return Ok(());
+        }
+    }
     std::fs::remove_file(&path)
         .map_err(|error| format!("could not remove {}: {error}", path.display()))?;
     println!(
