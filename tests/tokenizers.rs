@@ -14,8 +14,9 @@
 //! Some vocabularies come without test files. For those,
 //! `tests/golden/vocab` holds the tokens llama.cpp gives the BERT test
 //! texts, made with `ref tokraw` from `tools/reference`. llama.cpp keeps no
-//! RWKV World vocabulary at all, so a file there may also be named after a
-//! model file. It is checked when `SMALLM_TEST_MODELS` holds that model.
+//! vocabulary file at all for some tokenizers, such as RWKV World's and
+//! Inkling 2's, so a file there may also be named after a model file. It is
+//! checked when `SMALLM_TEST_MODELS` holds that model.
 
 use std::path::{Path, PathBuf};
 

@@ -406,11 +406,11 @@ The loop in `generate.rs` does the bookkeeping around it:
 - **It trims long chats.** When a conversation outgrows the window, the
   oldest turns are left out and the system message is kept.
 - **It keeps reasoning apart.** Thinking models write their reasoning
-  between `<think>` tags, in Gemma 4's `<|channel>thought` block or, in
-  OpenAI's Harmony format, on a channel other than the final one. A small
-  state machine follows those markers, so the reasoning can be shown faint,
-  sent as its own field, or left out, and the markers never reach the
-  output.
+  between `<think>` tags, in Gemma 4's `<|channel>thought` block, in
+  Inkling 2's `<|content_thinking|>` messages or, in OpenAI's Harmony
+  format, on a channel other than the final one. A small state machine
+  follows those markers, so the reasoning can be shown faint, sent as its
+  own field, or left out, and the markers never reach the output.
 
 Chat formats are recognized from the template text in the model file and
 written out by hand. Running the template itself would take an interpreter
@@ -421,7 +421,8 @@ with an `enable_thinking` argument writes a block of empty reasoning after
 the assistant's opening to turn it off, and that block is found in the text:
 `<think>\n\n</think>\n\n` for Qwen3, `<think></think>` for LFM3. Gemma 4
 turns thinking on with `<|think|>` at the top of the system turn, and gpt-oss
-sets a level on the `Reasoning:` line of its system message. `Format` in
+sets a level on the `Reasoning:` line of its system message. Inkling 2 is
+given an effort from 0 to 0.99 in a system message of its own. `Format` in
 `chat.rs` pairs a template with that choice.
 
 ## Accuracy
@@ -464,7 +465,7 @@ are nearly tied.
 - It computes on the CPU. GPUs and NPUs are planned as further backends.
 - It runs text models of twenty-five architectures, and BERT and nomic-bert
   models for embeddings and reranking. No image or audio input.
-- It knows fifteen chat formats and does not interpret Jinja templates.
+- It knows sixteen chat formats and does not interpret Jinja templates.
 - It reads one GGUF file per model. Models split across several files are
   not loaded.
 - It is little-endian only, like the GGUF files themselves.

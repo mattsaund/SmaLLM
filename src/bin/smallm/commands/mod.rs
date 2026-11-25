@@ -194,7 +194,7 @@ pub const TEMPLATE_SPECS: [Spec; 3] = [
         "template",
         None,
         "Chat format: chatml, llama3, llama2, mistral, gemma, gemma4, granite, phi3, phi4-mini, \
-         zephyr, deepseek, deepseek2, kimi, harmony, rwkv-world",
+         zephyr, deepseek, deepseek2, kimi, harmony, inkling, rwkv-world",
     ),
     switch(
         "raw",
@@ -204,8 +204,8 @@ pub const TEMPLATE_SPECS: [Spec; 3] = [
     value(
         "think",
         None,
-        "Whether a reasoning model thinks first: on or off, or low, medium or high for gpt-oss, \
-         which cannot turn it off (default: as the model does)",
+        "Whether a reasoning model thinks first: on or off, or low, medium or high for gpt-oss and \
+         Inkling. gpt-oss cannot turn it off (default: as the model does)",
     ),
 ];
 

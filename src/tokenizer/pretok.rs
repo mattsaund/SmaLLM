@@ -521,6 +521,11 @@ mod tests {
         let gemma = PreTokenizer::for_name("gemma4").unwrap();
         assert!(gemma.escape_spaces && gemma.raw_bytes);
         assert!(PreTokenizer::for_name("chatglm-bpe").unwrap().no_bos);
+        // Inkling 2 splits words as GPT-4o does, takes a word that is a
+        // token whole, and has no BOS token.
+        let inkling = PreTokenizer::for_name("inkling2").unwrap();
+        assert!(inkling.ignore_merges && inkling.no_bos && !inkling.add_bos && inkling.known);
+        assert_eq!(family("inkling2"), family("gpt-4o"));
         assert!(PreTokenizer::for_name("default").unwrap().known);
         assert!(!PreTokenizer::for_name("something-new").unwrap().known);
     }

@@ -16,7 +16,7 @@ pub(super) const DEFAULT_PATTERNS: &[&str] = &[
 /// Each family: its names, the expressions that split text into words,
 /// and its switches.
 #[rustfmt::skip]
-pub(super) static FAMILIES: [Family; 67] = [
+pub(super) static FAMILIES: [Family; 71] = [
     Family {
         names: &["flint"],
         patterns: &[
@@ -286,7 +286,7 @@ pub(super) static FAMILIES: [Family; 67] = [
         raw_bytes: false,
     },
     Family {
-        names: &["qwen2", "deepseek-r1-qwen", "kormo", "f2llmv2"],
+        names: &["qwen2", "deepseek-r1-qwen", "kormo", "f2llmv2", "domyn-edge"],
         patterns: &[
             r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
         ],
@@ -411,6 +411,17 @@ pub(super) static FAMILIES: [Family; 67] = [
         names: &["tekken", "pixtral"],
         patterns: &[
             r"[^\r\n\p{L}\p{N}]?((?=[\p{L}\p{M}])([^a-z]))*((?=[\p{L}\p{M}])([^A-Z]))+|[^\r\n\p{L}\p{N}]?((?=[\p{L}\p{M}])([^a-z]))+((?=[\p{L}\p{M}])([^A-Z]))*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+        ],
+        ignore_merges: true,
+        add_bos: true,
+        escape_spaces: false,
+        no_bos: false,
+        raw_bytes: false,
+    },
+    Family {
+        names: &["tekken-num3"],
+        patterns: &[
+            r"[^\r\n\p{L}\p{N}]?((?=[\p{L}\p{M}])([^a-z]))*((?=[\p{L}\p{M}])([^A-Z]))+|[^\r\n\p{L}\p{N}]?((?=[\p{L}\p{M}])([^a-z]))+((?=[\p{L}\p{M}])([^A-Z]))*|\p{N}{1,3}(?=(?:\p{N}{3})*(?!\p{N}))|\p{N}{1,2}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+",
         ],
         ignore_merges: true,
         add_bos: true,
@@ -557,6 +568,17 @@ pub(super) static FAMILIES: [Family; 67] = [
         add_bos: false,
         escape_spaces: false,
         no_bos: false,
+        raw_bytes: false,
+    },
+    Family {
+        names: &["inkling2"],
+        patterns: &[
+            r"[^\r\n\p{L}\p{N}]?((?=[\p{L}\p{M}])([^a-z]))*((?=[\p{L}\p{M}])([^A-Z]))+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\r\n\p{L}\p{N}]?((?=[\p{L}\p{M}])([^a-z]))+((?=[\p{L}\p{M}])([^A-Z]))*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+        ],
+        ignore_merges: true,
+        add_bos: false,
+        escape_spaces: false,
+        no_bos: true,
         raw_bytes: false,
     },
     Family {
@@ -798,6 +820,29 @@ pub(super) static FAMILIES: [Family; 67] = [
         ],
         ignore_merges: true,
         add_bos: true,
+        escape_spaces: false,
+        no_bos: false,
+        raw_bytes: false,
+    },
+    Family {
+        names: &["soprano"],
+        patterns: &[
+            r"\p{N}",
+            r"\s+|[\p{L}\p{N}_]+|[^\p{L}\p{N}_\s]+",
+        ],
+        ignore_merges: false,
+        add_bos: false,
+        escape_spaces: false,
+        no_bos: false,
+        raw_bytes: true,
+    },
+    Family {
+        names: &["zonos3"],
+        patterns: &[
+            r"\p{N}{1,3}| ?[^\s\p{L}\p{N}]{2,}[\r\n/]*| +(?!\S)",
+        ],
+        ignore_merges: false,
+        add_bos: false,
         escape_spaces: false,
         no_bos: false,
         raw_bytes: false,

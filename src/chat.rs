@@ -90,6 +90,9 @@ pub enum Template {
     /// OpenAI's Harmony (gpt-oss): `<|start|>role<|message|> ... <|end|>`,
     /// with the model's answers on the final channel.
     Harmony,
+    /// `<|message_user|><|content_text|> ... <|end_message|>` (Inkling 2),
+    /// with the thinking effort in a system message.
+    Inkling,
     /// `User: ... Assistant: ...` (DeepSeek V2 and DeepSeek-MoE)
     DeepSeek2,
     /// `<|im_user|>user<|im_middle|> ... <|im_end|>` (Kimi, Moonlight)
@@ -107,7 +110,7 @@ const DEEPSEEK_END: &str = "<\u{ff5c}end\u{2581}of\u{2581}sentence\u{ff5c}>";
 
 impl Template {
     /// Every template, for listings.
-    pub const ALL: [Template; 15] = [
+    pub const ALL: [Template; 16] = [
         Template::ChatMl,
         Template::Llama3,
         Template::Llama2,
@@ -122,6 +125,7 @@ impl Template {
         Template::DeepSeek2,
         Template::Kimi,
         Template::Harmony,
+        Template::Inkling,
         Template::RwkvWorld,
     ];
 
@@ -130,6 +134,8 @@ impl Template {
         let has = |needle: &str| jinja.contains(needle);
         if has("<|start|>") && has("<|channel|>") {
             Some(Template::Harmony)
+        } else if has("<|message_model|>") && has("<|content_text|>") {
+            Some(Template::Inkling)
         } else if has("<|im_start|>") {
             Some(Template::ChatMl)
         } else if has("<|start_header_id|>") {
@@ -192,6 +198,7 @@ impl Template {
             Template::Kimi => "kimi",
             Template::DeepSeek => "deepseek",
             Template::Harmony => "harmony",
+            Template::Inkling => "inkling",
             Template::RwkvWorld => "rwkv-world",
         }
     }
@@ -211,8 +218,9 @@ impl Template {
 
     /// [`render`](Self::render), with a choice about reasoning for the
     /// formats that write one into the conversation: gpt-oss's level on
-    /// Harmony's `Reasoning:` line, and the thinking token at the top of
-    /// Gemma 4's system turn. [`Format`] adds what the other formats need.
+    /// Harmony's `Reasoning:` line, the thinking token at the top of
+    /// Gemma 4's system turn, and Inkling 2's thinking effort.
+    /// [`Format`] adds what the other formats need.
     pub fn render_with(
         self,
         messages: &[Message],
@@ -437,6 +445,42 @@ impl Template {
                     out.markup("<|start|>assistant");
                 }
             }
+            Template::Inkling => {
+                // As Inkling 2's template writes text messages. Each one is
+                // a role token, `<|content_text|>`, the text as it is and
+                // `<|end_message|>`. A reply is followed by
+                // `<|content_model_end_sampling|>`, which ends the model's
+                // turn. The template adds a system message of its own with
+                // the thinking effort. It goes before the first message
+                // that is not a system message, or at the end when all of
+                // them are. The model writes its own role token to answer,
+                // so `add_assistant` has nothing to add.
+                let effort = format!(
+                    "<|message_system|><|content_text|>Thinking effort level: {}<|end_message|>",
+                    thinking.inkling_effort()
+                );
+                let mut effort_written = false;
+                for message in messages {
+                    if !effort_written && message.role != Role::System {
+                        out.markup(&effort);
+                        effort_written = true;
+                    }
+                    out.markup(match message.role {
+                        Role::System => "<|message_system|>",
+                        Role::User => "<|message_user|>",
+                        Role::Assistant => "<|message_model|>",
+                    });
+                    out.markup("<|content_text|>");
+                    out.content(&message.content);
+                    out.markup("<|end_message|>");
+                    if message.role == Role::Assistant {
+                        out.markup("<|content_model_end_sampling|>");
+                    }
+                }
+                if !effort_written {
+                    out.markup(&effort);
+                }
+            }
             Template::RwkvWorld => {
                 // As llama.cpp writes it: content trimmed, and a blank line
                 // after each turn, which is also how the model ends one.
@@ -507,8 +551,8 @@ impl Template {
 
 /// Whether a reasoning model thinks before it answers, for the models whose
 /// prompt can choose. The default leaves it to the model's own template:
-/// Qwen3 and LFM3 think unless told not to, and Gemma 4 does not unless
-/// told to.
+/// Qwen3 and LFM3 think unless told not to, Gemma 4 does not unless told
+/// to, and Inkling 2 thinks at its high effort.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Thinking {
     /// As the model's template does when nothing is chosen.
@@ -519,8 +563,8 @@ pub enum Thinking {
     /// Answer without thinking. gpt-oss cannot, and thinks at its low
     /// level instead.
     Off,
-    /// gpt-oss's three levels of reasoning. Other models take each as
-    /// [`On`](Thinking::On).
+    /// Three levels of reasoning, for gpt-oss and Inkling 2. Other models
+    /// take each as [`On`](Thinking::On).
     Low,
     Medium,
     High,
@@ -572,6 +616,18 @@ impl Thinking {
             Thinking::Default | Thinking::On | Thinking::Medium => "medium",
         }
     }
+
+    /// Inkling 2's thinking effort for this choice, from 0 to 0.99, as its
+    /// template prints it. The levels are the template's own for low,
+    /// medium and high. Its default is high, so on is high too.
+    fn inkling_effort(self) -> &'static str {
+        match self {
+            Thinking::Off => "0",
+            Thinking::Low => "0.2",
+            Thinking::Medium => "0.7",
+            Thinking::Default | Thinking::On | Thinking::High => "0.9",
+        }
+    }
 }
 
 /// Empty reasoning that model templates write after the assistant's
@@ -620,7 +676,11 @@ impl Format {
 
     /// True when the choice about thinking can change this model's prompt.
     pub fn can_switch_thinking(self) -> bool {
-        self.no_thinking.is_some() || matches!(self.template, Template::Harmony | Template::Gemma4)
+        self.no_thinking.is_some()
+            || matches!(
+                self.template,
+                Template::Harmony | Template::Gemma4 | Template::Inkling
+            )
     }
 
     /// Writes a conversation, as [`Template::render`] does, with the
@@ -859,6 +919,61 @@ mod tests {
     }
 
     #[test]
+    fn inkling() {
+        // As Inkling 2's own template writes it, rendered with jinja2.
+        let text = Template::Inkling.render_text(&conversation(), true, "");
+        assert_eq!(
+            text,
+            "<|message_system|><|content_text|>Be brief.<|end_message|>\
+             <|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>\
+             <|message_user|><|content_text|>Hi<|end_message|>\
+             <|message_model|><|content_text|>Hello!<|end_message|><|content_model_end_sampling|>\
+             <|message_user|><|content_text|>Bye<|end_message|>"
+        );
+        // The model writes its own role token, so there is no opening.
+        assert_eq!(
+            Template::Inkling.render_text(&conversation(), false, ""),
+            text
+        );
+        // Without a system message the effort comes first, and after the
+        // last one when there is nothing else.
+        let effort = "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>";
+        assert_eq!(
+            Template::Inkling.render_text(&conversation()[1..2], true, ""),
+            format!("{effort}<|message_user|><|content_text|>Hi<|end_message|>")
+        );
+        assert_eq!(
+            Template::Inkling.render_text(&conversation()[..1], true, ""),
+            format!("<|message_system|><|content_text|>Be brief.<|end_message|>{effort}")
+        );
+        assert_eq!(Template::Inkling.render_text(&[], true, ""), effort);
+        // The effort is markup, and only what the user typed is content.
+        let parts = Template::Inkling.render(&conversation()[1..2], true, "");
+        let kinds: Vec<bool> = parts.iter().map(|part| part.markup).collect();
+        assert_eq!(kinds, [true, false, true]);
+        assert_eq!(parts[1].text, "Hi");
+    }
+
+    #[test]
+    fn inkling_thinks_at_the_effort_chosen() {
+        let effort = |thinking: Thinking| {
+            let text = written(
+                Format::new(Template::Inkling, None, thinking),
+                &conversation(),
+            );
+            let at = text.find("effort level: ").unwrap() + "effort level: ".len();
+            text[at..].split('<').next().unwrap().to_string()
+        };
+        assert_eq!(effort(Thinking::Default), "0.9");
+        assert_eq!(effort(Thinking::On), "0.9");
+        assert_eq!(effort(Thinking::Off), "0");
+        assert_eq!(effort(Thinking::Low), "0.2");
+        assert_eq!(effort(Thinking::Medium), "0.7");
+        assert_eq!(effort(Thinking::High), "0.9");
+        assert!(Format::from(Template::Inkling).can_switch_thinking());
+    }
+
+    #[test]
     fn gemma_4_thinks_when_its_system_turn_asks() {
         let on = Format::new(Template::Gemma4, None, Thinking::On);
         assert_eq!(
@@ -1038,6 +1153,11 @@ mod tests {
             (
                 "{{- \"<|start|>system<|message|>\" }}{{- \"<|start|>assistant<|channel|>final<|message|>\" }}",
                 Some(Template::Harmony),
+            ),
+            (
+                "{%- set role_token = {\"user\": \"<|message_user|>\", \"assistant\": \"<|message_model|>\"} -%}\
+                 {{- rtok ~ \"<|content_text|>\" ~ message.content ~ \"<|end_message|>\" -}}",
+                Some(Template::Inkling),
             ),
             (
                 "{{ '<\u{ff5c}User\u{ff5c}>' }}{{ '<\u{ff5c}Assistant\u{ff5c}>' }}",

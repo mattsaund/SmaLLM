@@ -298,8 +298,9 @@ pub fn run_tokens(
 /// well as its answer, each piece marked with which it is.
 ///
 /// With [`Options::reasoning`] set, reasoning is what a model writes
-/// between `<think>` and `</think>` (Qwen3, DeepSeek R1), or outside the
-/// final channel in OpenAI's Harmony format (gpt-oss). The markers are not
+/// between `<think>` and `</think>` (Qwen3, DeepSeek R1), on Gemma 4's
+/// thought channel, outside the final channel in OpenAI's Harmony format
+/// (gpt-oss), or in Inkling 2's thinking messages. The markers are not
 /// output, and stop strings apply to the answer only. Otherwise, or with
 /// `show_special` set, nothing is taken apart and everything is answer.
 pub fn run_tokens_with(
@@ -433,7 +434,7 @@ pub fn run_tokens_with(
 }
 
 /// Follows which part of its output a model is writing: its reasoning or
-/// its answer. Three conventions are known.
+/// its answer. Four conventions are known.
 ///
 /// - `<think>` and `</think>` around the reasoning (Qwen3, DeepSeek R1).
 ///   A prompt may open the reasoning itself, and then the model starts
@@ -444,6 +445,10 @@ pub fn run_tokens_with(
 ///   commentary) are reasoning. Headers are not output.
 /// - Gemma 4's channels: `<|channel>thought`, a newline, the reasoning, and
 ///   `<channel|>`. The answer follows. The name line is not output.
+/// - Inkling 2's messages. Each starts with `<|message_model|>` and a
+///   content token, and ends with `<|end_message|>`. Text after
+///   `<|content_thinking|>` is reasoning, and text after `<|content_text|>`
+///   is the answer. None of these tokens is output.
 struct Channels {
     /// `<think>` and `</think>`.
     think: Option<(u32, u32)>,
@@ -453,6 +458,9 @@ struct Channels {
     naming: bool,
     /// Harmony's `<|start|>`, `<|channel|>`, `<|message|>` and `<|end|>`.
     harmony: Option<[u32; 4]>,
+    /// Inkling 2's `<|message_model|>`, `<|content_thinking|>`,
+    /// `<|content_text|>` and `<|end_message|>`.
+    inkling: Option<[u32; 4]>,
     /// Harmony's `<|constrain|>`, which can sit in a header.
     constrain: Option<u32>,
     /// Whether the text now is reasoning.
@@ -483,11 +491,23 @@ impl Channels {
             }
             _ => None,
         };
+        let inkling = match (
+            find("<|message_model|>"),
+            find("<|content_thinking|>"),
+            find("<|content_text|>"),
+            find("<|end_message|>"),
+        ) {
+            (Some(message), Some(thinking), Some(text), Some(end)) => {
+                Some([message, thinking, text, end])
+            }
+            _ => None,
+        };
         Channels {
             think,
             gemma,
             naming: false,
             harmony,
+            inkling,
             constrain: find("<|constrain|>"),
             reasoning: opens_thought(think, prompt),
             header: None,
@@ -537,6 +557,17 @@ impl Channels {
         if let Some((open, close)) = self.think {
             if token == open || token == close {
                 self.switch(token == open);
+                return None;
+            }
+        }
+        if let Some([message, thinking, text, end]) = self.inkling {
+            // The content token says what the message holds. The tokens
+            // that open and close a message only frame it.
+            if token == thinking || token == text {
+                self.switch(token == thinking);
+                return None;
+            }
+            if token == message || token == end {
                 return None;
             }
         }
@@ -818,6 +849,7 @@ mod tests {
             gemma: None,
             naming: false,
             harmony,
+            inkling: None,
             constrain: Some(5),
             reasoning: false,
             header: None,
@@ -876,6 +908,86 @@ mod tests {
             ],
         );
         assert_eq!((answer.as_str(), reasoning.as_str()), ("Hi", ""));
+    }
+
+    #[test]
+    fn inkling_messages_split_reasoning_from_the_answer() {
+        // Ids 40 to 43 stand for `<|message_model|>`, `<|content_thinking|>`,
+        // `<|content_text|>` and `<|end_message|>`.
+        let inkling = Some([40, 41, 42, 43]);
+        let mut router = channels(None, None);
+        router.inkling = inkling;
+        let (answer, reasoning) = route(
+            &mut router,
+            &[
+                (40, "<|message_model|>"),
+                (41, "<|content_thinking|>"),
+                (20, "Seven"),
+                (21, " times six."),
+                (43, "<|end_message|>"),
+                (40, "<|message_model|>"),
+                (42, "<|content_text|>"),
+                (22, "\n42"),
+                (23, "."),
+                (43, "<|end_message|>"),
+            ],
+        );
+        assert_eq!(
+            (answer.as_str(), reasoning.as_str()),
+            ("42.", "Seven times six.")
+        );
+        // With thinking off, the answer is the only message. Control tokens
+        // reach the router without text.
+        let mut router = channels(None, None);
+        router.inkling = inkling;
+        let (answer, reasoning) = route(
+            &mut router,
+            &[(40, ""), (42, ""), (20, "Hi"), (21, " there."), (43, "")],
+        );
+        assert_eq!((answer.as_str(), reasoning.as_str()), ("Hi there.", ""));
+        // An empty thinking message leaves nothing behind.
+        let mut router = channels(None, None);
+        router.inkling = inkling;
+        let (answer, reasoning) = route(
+            &mut router,
+            &[
+                (40, ""),
+                (41, ""),
+                (43, ""),
+                (40, ""),
+                (42, ""),
+                (20, "Hi"),
+                (43, ""),
+            ],
+        );
+        assert_eq!((answer.as_str(), reasoning.as_str()), ("Hi", ""));
+    }
+
+    #[test]
+    fn inkling_markers_are_found_by_their_text() {
+        use crate::gguf::Gguf;
+        use crate::gguf::testing::Builder;
+        let texts = [
+            "a",
+            "<|message_model|>",
+            "<|content_thinking|>",
+            "<|content_text|>",
+            "<|end_message|>",
+        ];
+        let tokens: Vec<&[u8]> = texts.iter().map(|text| text.as_bytes()).collect();
+        let mut builder = Builder::new();
+        builder
+            .string("tokenizer.ggml.model", "gpt2")
+            .string("tokenizer.ggml.pre", "inkling2")
+            .strings("tokenizer.ggml.tokens", &tokens)
+            .strings("tokenizer.ggml.merges", &[])
+            .i32s("tokenizer.ggml.token_type", &[1, 3, 3, 3, 3]);
+        let tokenizer = Tokenizer::from_gguf(&Gguf::from_bytes(builder.build()).unwrap()).unwrap();
+        let router = Channels::new(&tokenizer, &[], true);
+        assert_eq!(router.inkling, Some([1, 2, 3, 4]));
+        assert!(router.think.is_none() && router.gemma.is_none() && router.harmony.is_none());
+        // A router that is off finds no markers.
+        assert_eq!(Channels::new(&tokenizer, &[], false).inkling, None);
     }
 
     #[test]

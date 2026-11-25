@@ -166,8 +166,8 @@ pub const SETTINGS: [(&str, &str, &str); 34] = [
     (
         "think",
         "auto",
-        "Whether a reasoning model thinks first: on or off, or low, medium or high for gpt-oss.\n\
-         # auto: as the model does.",
+        "Whether a reasoning model thinks first: on or off, or low, medium or high\n\
+         # for gpt-oss and Inkling. auto: as the model does.",
     ),
     (
         "host",
