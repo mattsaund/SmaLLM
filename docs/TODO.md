@@ -35,7 +35,7 @@ default binary stays small.
 - [x] One-line installers that bring what SmaLLM needs, a full uninstall, and static Linux binaries for x86-64,
       ARM64, ARMv7 and RISC-V
 - [x] CI on Linux, macOS and Windows, on x86-64 and ARM, with ARMv7 and RISC-V under emulation
-- [x] Tagged releases, the latest 0.3.0
+- [x] Tagged releases, the latest 0.4.0
 
 ## Fixes from board testing
 

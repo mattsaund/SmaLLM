@@ -137,14 +137,14 @@ Findings:
   core count came out right only by chance. Thread counts also ignored the
   affinity mask: under `taskset -c 0-5` (the six A55s) SmaLLM still found
   two fast cores and generated on 2 threads, where 6 was right. Both are
-  fixed after 0.3.0.
+  fixed in 0.4.0.
 - **A prompt batch of 64 does not pay here.** The first runs showed 64 6
   percent faster than 32 (18.8 against 17.7 tokens per second), but those
   runs followed each other and heated the board. Alternated, each started
   under 62°C, best of three on all 8 cores, a 128-token prompt: LFM3 read
   19.3 tokens per second at both sizes, and Nemotron 11.9 at 32 against
   11.5 at 64. 64 took 4.7 MB (LFM3) and 6.4 MB (Nemotron) more. ARM kept
-  32, and x86, where 64 is faster, moved to 64 (after 0.3.0). The faster
+  32, and x86, where 64 is faster, moved to 64 (in 0.4.0). The faster
   NEON kernels below changed that, and ARM moved to 64 as well.
 - **Heat decides back-to-back measurements.** The A76 cluster starts idle
   injection at 70°C (`cpub_idle_zone`) and throttles at 90°C, and the board
@@ -155,7 +155,7 @@ Findings:
   `/sys/class/thermal/thermal_zone0/temp` is under 62000.
 - **Storage.** Weights are mapped, so under memory pressure their pages are
   dropped and read again from the card: Nemotron's 6.2 GB takes about 95
-  seconds at 65 MB/s. `--mlock` (opt-in, added after 0.3.0) keeps the
+  seconds at 65 MB/s. `--mlock` (opt-in, added in 0.4.0) keeps the
   weights in memory instead. It needs a locked-memory limit as large as the
   file, and the board's is 8 MB (`ulimit -l`), so a service needs
   `LimitMEMLOCK=infinity`. A cold start is fine: LFM3's first token
@@ -165,7 +165,7 @@ Findings:
   percent.
 - **Thinking costs a lot here.** At about 7 tokens per second on two A76
   cores, LFM3 reasons for tens of seconds before every answer. 0.3.0 had no
-  switch to turn that off. `--think off` does now (added after 0.3.0).
+  switch to turn that off. `--think off` does now (added in 0.4.0).
   `--max-tokens` counts reasoning tokens too, so a small limit can end
   before the answer starts.
 - **Sampling settings in the file were ignored** in 0.3.0. Nemotron 3.5

@@ -3,7 +3,7 @@
 Each version is a `v` tag, with ready-made binaries and libraries on its
 [release page](https://github.com/mattsaund/SmaLLM/releases).
 
-## Unreleased
+## 0.4.0 - 2026-11-25
 
 - **Faster on ARM chips with the dot product extension** (Cortex-A55, A76
   and later, such as the Raspberry Pi 5 and the RK3588, Apple's M chips and

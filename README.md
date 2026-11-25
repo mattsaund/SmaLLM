@@ -210,8 +210,11 @@ The difference grows with the weights llama.cpp repacks. On gpt-oss-20b
 - **No up-front check.** A context window too large for the machine fails
   when the conversation reaches it, not when the session starts.
 - **Packing on every prompt batch.** Tiles are packed per batch, not once at
-  load. On x86 the kernels absorb the cost (see [Speed](#speed)). On ARM it
-  has not been measured.
+  load. On x86 the kernels absorb the cost (see [Speed](#speed)). On an
+  Allwinner A733's Cortex-A76 cores packing takes about 6 percent of a
+  prompt's time, and Q4_0 prompts run 9 percent behind llama.cpp on the two
+  fast cores and ahead of it on all eight ([docs/PARITY.md](docs/PARITY.md)).
+  Q4_K_M prompts run 1.8 times as fast there.
 
 Measured with `smallm bench`, which prints these figures on Linux, against
 llama.cpp b11846 on an Intel Core i7-14700K with a 4,096-token context.
@@ -307,7 +310,7 @@ static, with the header and the Python binding.
 
 ## Status
 
-Version 0.3.0. [docs/TODO.md](docs/TODO.md) lists what is done and what is
+Version 0.4.0. [docs/TODO.md](docs/TODO.md) lists what is done and what is
 left, and [docs/PARITY.md](docs/PARITY.md) compares SmaLLM with llama.cpp
 and Ollama area by area, with measurements.
 

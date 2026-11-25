@@ -5,7 +5,7 @@ area. This page tracks the work toward parity, and [TODO.md](TODO.md) turns
 its gaps into a list. Update it when a gap closes, and when the competitors
 move.
 
-State as of the main branch after SmaLLM 0.3.0 (2026-11-25).
+State as of SmaLLM 0.4.0 (2026-11-25).
 
 - **llama.cpp:** counted from the source of b11846 (see "Keeping this page
   current" below).
