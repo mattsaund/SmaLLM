@@ -35,6 +35,17 @@ default binary stays small.
 - [x] CI on Linux, macOS and Windows, on x86-64 and ARM, with ARMv7 and RISC-V under emulation
 - [x] Tagged releases, the latest 0.3.0
 
+## Fixes from board testing
+
+Bugs the first board found (the Allwinner A733, 2026-11-24).
+
+- [x] Physical cores counted wrong on boards whose clusters number their cores from zero, which cost 15 percent on
+      prompts. Cores are now named by the CPUs that share them.
+- [x] Thread counts ignored the CPU affinity mask, so `taskset` did not limit them.
+- [x] `smallm list --help` and `smallm rm --help` answered "unknown option".
+- [x] `smallm rm` deleted without asking. It asks now, and `--yes` skips the question.
+- [x] `docs/ARCHITECTURE.md` listed fourteen architectures, ten chat formats and no embeddings.
+
 ## Measurement
 
 - [x] Speed and memory measured on a first ARM board, the Allwinner A733. Results in
@@ -63,7 +74,8 @@ default binary stays small.
 - [ ] A model split across machines over the network, as llama.cpp's RPC backend does.
 - [ ] `--cpus`, to run on a chosen set of CPUs (one cluster) without `taskset`, as llama.cpp's `--cpu-range` does.
 - [ ] `--mlock`, opt-in, to keep the weights resident on boards with slow storage. On an SD card, pages dropped
-      under memory pressure are slow to read again.
+      under memory pressure are slow to read again (6.2 GB takes about 95 seconds at 65 MB/s).
+- [ ] Reading ahead at load (`MADV_WILLNEED`). Low value: at most 15 percent off a cold start from an SD card.
 
 ## Models
 
@@ -106,13 +118,16 @@ default binary stays small.
 - [ ] Saving a session's context to a file and loading it again.
 - [ ] An 8-bit and a 4-bit key/value cache, for long contexts. High value on boards.
 - [ ] Freeing the cache of sliding-window layers past their window (Gemma 2, Gemma 3, Gemma 4, gpt-oss), as
-      llama.cpp does. High value on boards: Gemma 4 style models keep 512-position windows in most layers.
+      llama.cpp does. High value on boards: Gemma 4 and Nemotron 3.5 Bolt keep 512-position windows in 35 of
+      their 42 layers.
 - [ ] Sampling defaults from the model file (`general.sampling.*`: temperature, top-k, top-p, min-p, repetition
-      penalty), below `smallm.conf` and the command line, as llama.cpp reads them.
+      penalty and its window, and the rest llama.cpp reads), below `smallm.conf` and the command line. Nemotron 3.5
+      Bolt E4B's file asks for temperature 1.0 and top-k 64, where SmaLLM uses 0.8 and 40.
 - [ ] A switch for thinking: `run --think on|off`, and `chat_template_kwargs.enable_thinking` and
-      `reasoning_effort` in the server, for the formats that support it (Qwen3, LFM3, SmolLM3, and gpt-oss's
-      reasoning level, fixed at medium today). On a board, a thinking model can spend tens of seconds before its
-      answer.
+      `reasoning_effort` in the server, for the formats that support it. Qwen3 turns it off with an empty block
+      after the assistant's opening (`<think>\n\n</think>\n\n`), LFM3 with `<think></think>`, SmolLM3 with
+      `/no_think` in the system message, and gpt-oss sets its level on the Harmony `Reasoning:` line, fixed at
+      medium today. On a board, a thinking model can spend tens of seconds before its answer.
 - [ ] `--max-tokens` counting reasoning and answer tokens apart, so that a small limit does not end before the
       answer begins.
 
@@ -125,7 +140,9 @@ Gaps the measurements in PARITY.md and DEVELOPMENT.md show.
       batch size is not the cause. Rework the NEON tile kernel's register blocking (4 rows by 4 tokens of
       accumulators, `sdot` by lane, as llama.cpp's Q4_0 GEMM does), or add an opt-in repack at load for boards
       with memory to spare.
-- [ ] Q4_0 generation on NEON, 7 percent behind llama.cpp on the A733 although memory-bound.
+- [ ] Q4_0 generation on NEON, 7 percent behind llama.cpp on the A733 (7.4 against 8.0 tokens per second). Both
+      are memory-bound, at 7.7 against 8.3 GB/s, so the matrix-vector kernel has some headroom. Q4_K_M is 8 percent
+      ahead.
 - [ ] The default prompt batch on ARM: 64 read 6 percent faster than 32 on the A733. Measure the scratch memory
       first.
 
@@ -149,7 +166,8 @@ Gaps the measurements in PARITY.md and DEVELOPMENT.md show.
 - [ ] The Anthropic Messages API and the OpenAI Responses API.
 - [ ] Speech endpoints (transcription and text to speech), with the models above.
 - [ ] The Ollama API next to the OpenAI one, and several models loaded and unloaded on demand.
-- [ ] Sampling options on `serve`, as defaults for requests.
+- [ ] Sampling options on `serve`, as defaults for requests. Today two servers can only differ through each
+      request or the shared `smallm.conf`.
 - [ ] A built-in web page, and metrics.
 
 ## Tools

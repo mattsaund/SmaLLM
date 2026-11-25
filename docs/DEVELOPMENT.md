@@ -66,13 +66,15 @@ Keep large models on disk, not in `/tmp`, which is often memory.
 
 ## First board: Allwinner A733
 
-Orange Pi with an Allwinner A733: 2 Cortex-A76 cores at 2.0 GHz (cpu6 and
-cpu7) and 6 Cortex-A55 cores at 1.8 GHz (cpu0 to cpu5), the dot product
-extension but no i8mm, 12 GB of LPDDR5, an SD card reading about 65 MB/s,
-and Armbian's 6.6 vendor kernel. SmaLLM 0.3.0 picked the `neon+dotprod`
-kernels. llama.cpp was built on the board for comparison.
+Orange Pi Zero 3W with an Allwinner A733: 2 Cortex-A76 cores at 2.0 GHz
+(cpu6 and cpu7) and 6 Cortex-A55 cores at 1.8 GHz (cpu0 to cpu5), the dot
+product extension but no i8mm, 12 GB of LPDDR5, an SD card reading about 65
+MB/s, and Armbian's 6.6 vendor kernel. Measured 2026-11-24 with SmaLLM
+0.3.0, which picked the `neon+dotprod` kernels, against llama.cpp v0.9.0
+built on the board.
 
-Prompt and generation on the two A76 cores, 2 threads, tokens per second:
+Matched runs, same lengths, prompt and generation on the two A76 cores, 2
+threads, tokens per second:
 
 | Model (format) | Prompt: SmaLLM | Prompt: llama.cpp | Generation: SmaLLM | Generation: llama.cpp | SmaLLM, prompts on 8 cores |
 |---|---|---|---|---|---|
@@ -80,7 +82,8 @@ Prompt and generation on the two A76 cores, 2 threads, tokens per second:
 | Nemotron 3.5 Bolt E4B (Q4_K_M), 64 prompt, 32 generated | 8.4 | 8.3 | 2.7 | 2.5 | 12.6 |
 
 Anonymous memory: SmaLLM 12 to 21 MB, llama.cpp 1.3 GB (LFM3) and 6.8 GB
-(Nemotron).
+(Nemotron). Pinning the generation threads to the A76s changed nothing:
+the scheduler already keeps them there.
 
 Findings:
 
@@ -94,33 +97,55 @@ Findings:
   serves four tokens. The NEON tile kernel's register blocking is the first
   place to look.
 - **Generation is memory-bound and close to llama.cpp.** Q4_0 is 7 percent
-  behind (7.4 against 8.0), Q4_K_M 8 percent ahead (2.7 against 2.5). Both
-  engines read weights at about 8 GB/s. In LFM3's generation profile the
+  behind (7.4 against 8.0), Q4_K_M 8 percent ahead (2.7 against 2.5). On
+  Q4_0, SmaLLM reads weights at about 7.7 GB/s and llama.cpp at 8.3, so the
+  Q4_0 matrix-vector kernel has some headroom. In LFM3's generation profile the
   feed-forward up projection takes 40 percent, down 21, the logits 18 (a
   tied 128,000 by 2,048 Q6_K embedding, about 215 MB per token) and query,
   key and value 13.
 - **Prompts on every core pay off.** On mixed cores the work-claiming pool
-  read Nemotron's prompt 46 percent faster on 8 threads than on 2. llama.cpp
-  got slower when the A55s joined.
-- **Thread counts were wrong** in 0.3.0: the A76s report core ids 0 and 1,
-  like the first two A55s, and were counted as their hardware threads, so
-  prompts ran on 6 threads instead of 8 (15.6 against 18.3 tokens per
-  second). Thread counts also ignored `taskset`. Both are fixed after 0.3.0.
-- **A prompt batch of 64** read 6 percent faster than 32 here.
+  read Nemotron's prompt 46 percent faster on 8 threads than on 2 (12.6
+  against 8.4). llama.cpp got slower when the A55s joined. This is a
+  strength to keep.
+- **Thread counts were wrong** in 0.3.0. The A76s report `core_id` 0 and 1
+  in package 0, like the first two A55s (their `cluster_id` is 1), and were
+  counted as their hardware threads. SmaLLM counted 6 physical cores
+  instead of 8 and read prompts on 6 threads: 15.6 tokens per second on
+  LFM3's 128-token prompt, against 18.3 with `--threads-batch 8`. The fast
+  core count came out right only by chance. Thread counts also ignored the
+  affinity mask: under `taskset -c 0-5` (the six A55s) SmaLLM still found
+  two fast cores and generated on 2 threads, where 6 was right. Both are
+  fixed after 0.3.0.
+- **A prompt batch of 64** read 6 percent faster than 32 here (18.8
+  against 17.7 tokens per second). Its scratch memory cost is not measured
+  yet.
 - **Storage.** Weights are mapped, so under memory pressure their pages are
-  dropped and read again from the card: 6.2 GB takes about 95 seconds at 65
-  MB/s. A cold start is fine. LFM3's first token (1.05 GB of weights) took
-  18.7 seconds through page faults, against 16.1 to read the file in order,
-  so asking the kernel to read ahead at load would save at most 15 percent.
+  dropped and read again from the card: Nemotron's 6.2 GB takes about 95
+  seconds at 65 MB/s. Locking the weights in memory (opt-in, for boards with
+  RAM to spare) would prevent that. A cold start is fine: LFM3's first token
+  (1.05 GB of weights) took 18.7 seconds straight off the card through page
+  faults, against 16.1 to read the file in order and 1.2 warm. Asking the
+  kernel to read ahead at load (`MADV_WILLNEED`) would save at most 15
+  percent.
+- **Thinking costs a lot here.** At about 7 tokens per second on two A76
+  cores, LFM3 reasons for tens of seconds before every answer, and SmaLLM
+  has no switch to turn that off. `--max-tokens` counts reasoning tokens
+  too, so a small limit can end before the answer starts.
+- **Sampling settings in the file are ignored.** Nemotron 3.5 Bolt E4B's
+  file asks for temperature 1.0, top-k 64 and top-p 0.95. SmaLLM uses its
+  own defaults, 0.8, 40 and 0.95.
 - **The GPU would not help generation.** The PowerVR BXM-4-64 (vendor DDK
-  24.2) measures 5.3 GB/s and 37 GFLOPS, below the CPU's 8 GB/s. Its Vulkan
-  compiler fails on 16-bit storage, it has 16 KB of shared memory, a
-  subgroup size of 1 and no integer dot product. A Vulkan backend meant for
-  board GPUs needs 32-bit storage fallbacks and small shared-memory tiles.
-- **The NPU does not fit language models.** The VeriSilicon VIP9000 runs
-  graphs compiled ahead of time on an x86 PC, with static shapes and no
-  key/value cache. Language models stop at SmolLM2 in 16-bit integers with a
-  32-token window.
+  24.2) measures 5.27 GB/s and 37 GFLOPS with clpeak at its 600 MHz, below
+  the CPU's 8 GB/s. Its Vulkan shader compiler fails on 16-bit storage
+  (llama.cpp's kernels stop at `createComputePipeline: ErrorUnknown`), and
+  it has 16 KB of shared memory, a subgroup size of 1 and no integer dot
+  product. A Vulkan backend meant for board GPUs needs 32-bit storage
+  fallbacks and small shared-memory tiles.
+- **The NPU does not fit language models.** The VeriSilicon VIP9000's
+  runtime (VIPLite) runs only NBG graphs, compiled ahead of time on an x86
+  PC with VeriSilicon's ACUITY tools, with static shapes and no key/value
+  cache. Language models stop at SmolLM2 in 16-bit integers with a 32-token
+  window, so it suits vision models, not SmaLLM's.
 
 ## Questions the board can answer
 
