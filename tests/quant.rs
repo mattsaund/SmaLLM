@@ -11,7 +11,7 @@ use smallm::tensor::TensorType;
 use smallm::tensor::quant::{DecodedRow, decode_row, dequantize_row};
 
 /// Every quantized format the engine reads, each with its own vectors.
-const FORMATS: [TensorType; 22] = [
+const FORMATS: [TensorType; 25] = [
     TensorType::Q4_0,
     TensorType::Q4_1,
     TensorType::Q5_0,
@@ -34,6 +34,9 @@ const FORMATS: [TensorType; 22] = [
     TensorType::Tq2_0,
     TensorType::Tq1_0,
     TensorType::Mxfp4,
+    TensorType::Nvfp4,
+    TensorType::Q1_0,
+    TensorType::Q2_0,
 ];
 
 /// One format's vectors: the blocks and the floats ggml made of them.

@@ -216,11 +216,12 @@ Findings:
 - **Q4_0 prompt reading on NEON** is 3.6 times slower than llama.cpp on the
   A733 (above). It is the largest gap on boards.
 
-- **NEON speed is unmeasured.** The tile fills, and the MXFP4, IQ4_NL and
-  IQ4_XS kernels, were written without an ARM machine. CI shows they are
-  correct, not how fast they are.
+- **NEON speed is unmeasured.** The tile fills, and the MXFP4, NVFP4, Q2_0,
+  IQ4_NL and IQ4_XS kernels, were written without an ARM machine. CI shows
+  they are correct, not how fast they are.
 - **Formats without SIMD.** IQ1, IQ2 and IQ3, TQ1_0, Q2_K and Q3_K have no
-  NEON kernels, and use the portable tile fill on both backends.
+  NEON kernels, and use the portable tile fill on both backends. Q1_0 has
+  no SIMD kernels at all.
 - **32-bit ARM and RISC-V** run portable code only.
 - **Long contexts with latent attention** (DeepSeek). Each unit of work
   reads a layer's whole latent cache, eight times over during generation.

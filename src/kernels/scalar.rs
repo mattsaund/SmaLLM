@@ -657,6 +657,67 @@ unsafe fn dot_blocks(
     total
 }
 
+/// Dot product for the formats whose blocks span several groups of 32
+/// activations: Q1_0, Q2_0 and NVFP4. ggml multiplies them with Q8_0
+/// activations, and the float steps here follow its order, so the results
+/// differ from ggml's only by how the activations were rounded.
+///
+/// With `PER_BLOCK`, one scale serves the whole block (Q1_0 and Q2_0). Each
+/// group's integer sum is scaled by its activation scale, those are added,
+/// and the block's scale multiplies the total. Otherwise every sub-block of
+/// 16 has a scale of its own (NVFP4), and each sub-block's integer sum is
+/// scaled by the product of its scale and its activation scale.
+#[inline(always)]
+unsafe fn dot_long_blocks<const PER_BLOCK: bool>(
+    decode: quant::Decoder,
+    block_bytes: usize,
+    block_len: usize,
+    row: *const u8,
+    n: usize,
+    act: ActRef,
+) -> f32 {
+    const GROUP: usize = 32;
+    let mut decoded = Group::new();
+    let mut total = 0.0f32;
+    for b in 0..n / block_len {
+        // SAFETY: the caller guarantees `row` holds `n / block_len` blocks
+        // and `act` describes `n` activations in groups of 32.
+        let (block, q, act_scale) = unsafe {
+            (
+                slice::from_raw_parts(row.add(b * block_bytes), block_bytes),
+                slice::from_raw_parts(act.q.add(b * block_len), block_len),
+                slice::from_raw_parts(act.scale.add(b * block_len / GROUP), block_len / GROUP),
+            )
+        };
+        decode(block, &mut decoded);
+        let mut partial = 0.0f32;
+        for (g, act_scale) in act_scale.iter().enumerate() {
+            if PER_BLOCK {
+                let run = g * GROUP..(g + 1) * GROUP;
+                let integer = integer_dot(&decoded.q[run.clone()], &q[run]);
+                partial += act_scale * integer as f32;
+            } else {
+                for sub in 2 * g..2 * g + 2 {
+                    let run = sub * 16..(sub + 1) * 16;
+                    let integer = integer_dot(&decoded.q[run.clone()], &q[run]);
+                    total += act_scale * decoded.scale[sub] * integer as f32;
+                }
+            }
+        }
+        if PER_BLOCK {
+            total += decoded.scale[0] * partial;
+        }
+    }
+    total
+}
+
+/// The exact sum of the products of two runs of signed bytes.
+#[inline(always)]
+fn integer_dot(weights: &[i8], acts: &[i8]) -> i32 {
+    let products = weights.iter().zip(acts);
+    products.map(|(w, a)| *w as i32 * *a as i32).sum()
+}
+
 /// See [`TileFill`](super::TileFill): the portable fill.
 pub(super) unsafe fn tile_fill(
     tile: &mut Tile,
@@ -746,6 +807,21 @@ scalar_row!(row_tq2_0, quant::decode_tq2_0, 66, 256);
 scalar_row!(row_tq1_0, quant::decode_tq1_0, 54, 256);
 scalar_row!(row_mxfp4, quant::decode_mxfp4, 17, 32);
 
+/// Defines the row kernel of a format with blocks longer than 32 on top of
+/// `dot_long_blocks`.
+macro_rules! long_row {
+    ($name:ident, $decode:path, $block_bytes:expr, $block_len:expr, $per_block:expr) => {
+        unsafe fn $name(row: *const u8, n: usize, act: ActRef) -> f32 {
+            // SAFETY: forwarded contract.
+            unsafe { dot_long_blocks::<$per_block>($decode, $block_bytes, $block_len, row, n, act) }
+        }
+    };
+}
+
+long_row!(row_nvfp4, quant::decode_nvfp4, 36, 64, false);
+long_row!(row_q1_0, quant::decode_q1_0, 18, 128, true);
+long_row!(row_q2_0, quant::decode_q2_0, 18, 64, true);
+
 /// The scalar row kernel for a quantized type.
 pub(super) fn row_quant(ty: TensorType) -> DotQuant {
     match ty {
@@ -771,6 +847,9 @@ pub(super) fn row_quant(ty: TensorType) -> DotQuant {
         TensorType::Tq2_0 => row_tq2_0,
         TensorType::Tq1_0 => row_tq1_0,
         TensorType::Mxfp4 => row_mxfp4,
+        TensorType::Nvfp4 => row_nvfp4,
+        TensorType::Q1_0 => row_q1_0,
+        TensorType::Q2_0 => row_q2_0,
         TensorType::F32 | TensorType::F16 | TensorType::BF16 => {
             unreachable!("float types use the float row kernels")
         }
@@ -841,6 +920,9 @@ mod exact {
     exact_row!(row_tq2_0, TensorType::Tq2_0);
     exact_row!(row_tq1_0, TensorType::Tq1_0);
     exact_row!(row_mxfp4, TensorType::Mxfp4);
+    exact_row!(row_nvfp4, TensorType::Nvfp4);
+    exact_row!(row_q1_0, TensorType::Q1_0);
+    exact_row!(row_q2_0, TensorType::Q2_0);
 
     pub fn row_quant(ty: TensorType) -> DotQuant {
         match ty {
@@ -866,6 +948,9 @@ mod exact {
             TensorType::Tq2_0 => row_tq2_0,
             TensorType::Tq1_0 => row_tq1_0,
             TensorType::Mxfp4 => row_mxfp4,
+            TensorType::Nvfp4 => row_nvfp4,
+            TensorType::Q1_0 => row_q1_0,
+            TensorType::Q2_0 => row_q2_0,
             TensorType::F32 | TensorType::F16 | TensorType::BF16 => {
                 unreachable!("float types use the float row kernels")
             }

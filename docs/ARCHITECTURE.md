@@ -204,7 +204,9 @@ SmaLLM never expands them to floats. It does the multiply in integers:
 
 1. The activation vector is quantized to 8-bit integers, once per multiply.
    It is cut into groups that match the weight format, 32 or 256 values, and
-   each group gets its own scale so that its largest value maps to 127.
+   each group gets its own scale so that its largest value maps to 127. A
+   few formats have blocks of 64 or 128 that span several groups of 32, as
+   they do in ggml.
 2. Each weight row is reduced against it with integer dot products, 32
    weights at a time in one register.
 3. One floating-point multiply per block applies the weight scale and the
@@ -225,9 +227,11 @@ is quantized.
 The i-quants (IQ1 to IQ3) store indices into grids of eight or four values
 each, which `tensor/iq_tables.rs` holds, generated from ggml's source. Their
 grid values become `q`. The ternary formats store -1, 0 and 1, and MXFP4
-stores 4-bit floats with a power-of-two scale for every 32 weights. They all
-fit the same shape. `tests/quant.rs` checks every format against ggml's own
-expansion, number for number.
+stores 4-bit floats with a power-of-two scale for every 32 weights. NVFP4
+stores the same 4-bit floats with an 8-bit float scale for every 16, Q2_0
+stores 2-bit values with a scale for every 64, and Q1_0 stores only signs,
+with a scale for every 128. They all fit the same shape. `tests/quant.rs`
+checks every format against ggml's own expansion, number for number.
 
 `tensor/quant.rs` is the single description of each format's bit layout, as
 plain scalar code. The kernels for the common formats are written again

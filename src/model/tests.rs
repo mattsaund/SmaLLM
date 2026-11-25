@@ -39,7 +39,7 @@ const ARCHS: [&str; 22] = [
     "rwkv7",
 ];
 
-const QUANT_TYPES: [TensorType; 22] = [
+const QUANT_TYPES: [TensorType; 25] = [
     TensorType::Q4_0,
     TensorType::Q4_1,
     TensorType::Q5_0,
@@ -62,6 +62,9 @@ const QUANT_TYPES: [TensorType; 22] = [
     TensorType::Tq2_0,
     TensorType::Tq1_0,
     TensorType::Mxfp4,
+    TensorType::Nvfp4,
+    TensorType::Q1_0,
+    TensorType::Q2_0,
 ];
 
 const PROMPT: [u32; 9] = [1, 5, 9, 12, 7, 30, 8, 8, 21];
@@ -1338,6 +1341,29 @@ fn every_backend_matches_the_scalar_one() {
                 backend.name,
                 ty.name()
             );
+        }
+    }
+}
+
+#[test]
+fn blocks_longer_than_an_activation_group_take_both_routes() {
+    // A block of NVFP4 or Q2_0 spans two groups of quantized activations,
+    // and a block of Q1_0 four, each group with a scale of its own. Small
+    // batches take the row kernels, and a batch of the long prompt the tile
+    // route where the backend has one. Every vector of a batch must find
+    // the scales of its own groups. The scales of the wrong groups are off
+    // by about half.
+    //
+    // The routes are not compared with each other. They add in other
+    // orders, and in these models a last-bit difference can move an
+    // activation across a rounding step of the 8-bit quantization, which
+    // then shows in the logits.
+    for ty in [TensorType::Nvfp4, TensorType::Q1_0, TensorType::Q2_0] {
+        let model = load(&TinyModel::new("llama", ty));
+        let expected = oracle::logits(&model, &LONG_PROMPT);
+        for batch in [1, 4, 32] {
+            let error = relative_error(&logits(&model, &LONG_PROMPT, 2, batch), &expected);
+            assert!(error < 0.08, "{} batch {batch}: error {error}", ty.name());
         }
     }
 }

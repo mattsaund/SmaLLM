@@ -69,6 +69,12 @@ pub enum TensorType {
     Tq1_0,
     /// 4-bit floats with a power of two shared by 32 of them.
     Mxfp4,
+    /// 4-bit floats in blocks of 64, with an 8-bit float scale for each 16.
+    Nvfp4,
+    /// Only the sign of each weight, one bit, with one scale per 128.
+    Q1_0,
+    /// Weights of -1, 0, 1 or 2, two bits each, with one scale per 64.
+    Q2_0,
 }
 
 /// How a type's blocks group, which decides how activations are quantized
@@ -77,10 +83,26 @@ pub enum TensorType {
 pub enum Family {
     /// One float per element. Activations stay in floating point.
     Float,
-    /// Blocks of 32 elements, each with its own float scale.
+    /// Activations in groups of 32, each with its own float scale, the way
+    /// ggml quantizes them to Q8_0. Most of these formats have blocks of 32
+    /// too. NVFP4 and Q2_0 have blocks of 64 and Q1_0 blocks of 128, which
+    /// span two or four groups.
     Block32,
     /// Super-blocks of 256 elements with integer sub-block scales.
+    /// Activations are quantized in groups of 256.
     Block256,
+}
+
+impl Family {
+    /// Elements per scale when activations are quantized for this family.
+    /// Float types are not quantized, and count one element per group.
+    pub fn group(self) -> usize {
+        match self {
+            Family::Float => 1,
+            Family::Block32 => 32,
+            Family::Block256 => 256,
+        }
+    }
 }
 
 impl TensorType {
@@ -112,6 +134,9 @@ impl TensorType {
             34 => TensorType::Tq1_0,
             35 => TensorType::Tq2_0,
             39 => TensorType::Mxfp4,
+            40 => TensorType::Nvfp4,
+            41 => TensorType::Q1_0,
+            42 => TensorType::Q2_0,
             _ => return None,
         })
     }
@@ -144,15 +169,19 @@ impl TensorType {
             TensorType::Tq2_0 => "TQ2_0",
             TensorType::Tq1_0 => "TQ1_0",
             TensorType::Mxfp4 => "MXFP4",
+            TensorType::Nvfp4 => "NVFP4",
+            TensorType::Q1_0 => "Q1_0",
+            TensorType::Q2_0 => "Q2_0",
         }
     }
 
-    /// Elements in one block.
+    /// Elements in one block. For most types that is the group size of
+    /// their family, but a few have longer blocks.
     pub fn block_len(self) -> usize {
-        match self.family() {
-            Family::Float => 1,
-            Family::Block32 => 32,
-            Family::Block256 => 256,
+        match self {
+            TensorType::Nvfp4 | TensorType::Q2_0 => 64,
+            TensorType::Q1_0 => 128,
+            _ => self.family().group(),
         }
     }
 
@@ -181,6 +210,8 @@ impl TensorType {
             TensorType::Iq1S => 50,
             TensorType::Tq1_0 => 54,
             TensorType::Mxfp4 => 17,
+            TensorType::Nvfp4 => 36,
+            TensorType::Q1_0 | TensorType::Q2_0 => 18,
         }
     }
 
@@ -194,7 +225,10 @@ impl TensorType {
             | TensorType::Q5_1
             | TensorType::Q8_0
             | TensorType::Iq4Nl
-            | TensorType::Mxfp4 => Family::Block32,
+            | TensorType::Mxfp4
+            | TensorType::Nvfp4
+            | TensorType::Q1_0
+            | TensorType::Q2_0 => Family::Block32,
             TensorType::Q2K
             | TensorType::Q3K
             | TensorType::Q4K
@@ -238,7 +272,7 @@ pub fn type_name(id: u32) -> &'static str {
         26 => "I32",
         27 => "I64",
         28 => "F64",
-        40 => "NVFP4",
+        43 => "F8_E4M3",
         _ => "unknown",
     }
 }
@@ -264,5 +298,26 @@ mod tests {
         assert_eq!(TensorType::Q4K.row_bytes(512), Some(288));
         assert_eq!(TensorType::Q4K.row_bytes(576), None);
         assert_eq!(TensorType::Q8_0.row_bytes(usize::MAX - 31), None);
+    }
+
+    #[test]
+    fn long_blocks_still_quantize_activations_in_groups_of_32() {
+        // ggml multiplies these formats with Q8_0 activations, whose
+        // blocks are 32 long, so a block of weights spans several groups.
+        for (ty, len, bytes) in [
+            (TensorType::Nvfp4, 64, 36),
+            (TensorType::Q2_0, 64, 18),
+            (TensorType::Q1_0, 128, 18),
+        ] {
+            assert_eq!(
+                (ty.block_len(), ty.block_bytes()),
+                (len, bytes),
+                "{}",
+                ty.name()
+            );
+            assert_eq!(ty.family().group(), 32, "{}", ty.name());
+            assert_eq!(ty.row_bytes(256), Some(256 / len * bytes), "{}", ty.name());
+            assert_eq!(ty.row_bytes(32), None, "{}", ty.name());
+        }
     }
 }

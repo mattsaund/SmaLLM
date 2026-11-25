@@ -74,6 +74,8 @@ fn row_quant_widening(ty: TensorType) -> DotQuant {
         TensorType::Q8_0 => row_q8_0,
         TensorType::Iq4Nl => row_iq4_nl,
         TensorType::Mxfp4 => row_mxfp4,
+        TensorType::Nvfp4 => row_nvfp4,
+        TensorType::Q2_0 => row_q2_0,
         TensorType::Q4K => row_q4_k,
         TensorType::Q5K => row_q5_k,
         TensorType::Q6K => row_q6_k,
@@ -92,6 +94,8 @@ fn row_quant_sdot(ty: TensorType) -> DotQuant {
         TensorType::Q8_0 => row_q8_0_sdot,
         TensorType::Iq4Nl => row_iq4_nl_sdot,
         TensorType::Mxfp4 => row_mxfp4_sdot,
+        TensorType::Nvfp4 => row_nvfp4_sdot,
+        TensorType::Q2_0 => row_q2_0_sdot,
         TensorType::Q4K => row_q4_k_sdot,
         TensorType::Q5K => row_q5_k_sdot,
         TensorType::Q6K => row_q6_k_sdot,
@@ -680,6 +684,163 @@ unsafe fn block_row<F: Block32, D: ByteDot>(row: *const u8, n: usize, act: ActRe
 }
 
 // ---------------------------------------------------------------------------
+// Formats with 64-weight blocks
+// ---------------------------------------------------------------------------
+
+/// The four sub-blocks of the NVFP4 block at `p`, 16 weights each, in
+/// order, looked up in the doubled FP4 levels.
+///
+/// A sub-block's 8 bytes hold its first 8 weights in their low nibbles and
+/// its last 8 in their high nibbles. Interleaving the 64-bit halves of the
+/// low and the high nibbles of 16 bytes gives two sub-blocks in order.
+#[inline(always)]
+unsafe fn nvfp4_weights(p: *const u8) -> [int8x16_t; 4] {
+    // SAFETY: the caller guarantees a 36-byte block at `p`.
+    unsafe {
+        let mut subs = [vdupq_n_s8(0); 4];
+        for half in 0..2 {
+            let (low, high) = nibbles(p.add(4 + 16 * half));
+            let (low, high) = (vreinterpretq_u64_u8(low), vreinterpretq_u64_u8(high));
+            let first = vreinterpretq_u8_u64(vzip1q_u64(low, high));
+            let second = vreinterpretq_u8_u64(vzip2q_u64(low, high));
+            subs[2 * half] = lookup(&quant::MXFP4_LEVELS, first);
+            subs[2 * half + 1] = lookup(&quant::MXFP4_LEVELS, second);
+        }
+        subs
+    }
+}
+
+/// The four scales of the NVFP4 block at `p`, from the table of every
+/// UE4M3 byte.
+#[inline(always)]
+unsafe fn nvfp4_scales(p: *const u8) -> float32x4_t {
+    // SAFETY: the caller guarantees a 36-byte block at `p`, which starts
+    // with its four scales.
+    unsafe {
+        let scales: [f32; 4] = std::array::from_fn(|s| quant::ue4m3_half(*p.add(s)));
+        vld1q_f32(scales.as_ptr())
+    }
+}
+
+/// The activation scales of the two groups of 32 at `scale`, each twice,
+/// for the four sub-blocks of 16 that the two groups hold.
+#[inline(always)]
+unsafe fn group_scales(scale: *const f32) -> float32x4_t {
+    // SAFETY: the caller guarantees two readable floats at `scale`.
+    unsafe {
+        let pair = vld1_f32(scale);
+        let twice = vcombine_f32(pair, pair);
+        vzip1q_f32(twice, twice)
+    }
+}
+
+/// Row kernel for NVFP4: 36-byte blocks of four sub-blocks of 16 weights,
+/// each with an 8-bit float scale.
+/// `weight = ue4m3(scale) / 2 * level[nibble]`.
+///
+/// Each sub-block's products are summed to one integer. Pairwise adds put
+/// the four sums of a block in the four lanes of one register, so a single
+/// multiply applies all four scales, each with its group's activation
+/// scale.
+#[inline(always)]
+unsafe fn nvfp4_row<D: ByteDot>(row: *const u8, n: usize, act: ActRef) -> f32 {
+    // SAFETY: the caller guarantees `row` holds `n / 64` blocks of 36 bytes
+    // and `act` describes `n` activations in groups of 32.
+    unsafe {
+        let mut acc = vdupq_n_f32(0.0);
+        for b in 0..n / 64 {
+            let p = row.add(b * 36);
+            let a = act.q.add(b * 64);
+            let [w0, w1, w2, w3] = nvfp4_weights(p);
+            let zero = vdupq_n_s32(0);
+            let s0 = D::add_products(zero, w0, vld1q_s8(a));
+            let s1 = D::add_products(zero, w1, vld1q_s8(a.add(16)));
+            let s2 = D::add_products(zero, w2, vld1q_s8(a.add(32)));
+            let s3 = D::add_products(zero, w3, vld1q_s8(a.add(48)));
+            let totals = vpaddq_s32(vpaddq_s32(s0, s1), vpaddq_s32(s2, s3));
+            let totals = vcvtq_f32_s32(totals);
+            let scales = vmulq_f32(nvfp4_scales(p), group_scales(act.scale.add(2 * b)));
+            acc = vfmaq_f32(acc, totals, scales);
+        }
+        vaddvq_f32(acc)
+    }
+}
+
+/// Picks byte `4 * m + i / 4` of 16 bytes for position `i` of register `m`:
+/// each byte of a Q2_0 block four times, for its four values.
+static Q2_0_SPREAD: [[u8; 16]; 4] = {
+    let mut masks = [[0u8; 16]; 4];
+    let mut m = 0;
+    while m < 4 {
+        let mut i = 0;
+        while i < 16 {
+            masks[m][i] = (4 * m + i / 4) as u8;
+            i += 1;
+        }
+        m += 1;
+    }
+    masks
+};
+
+/// Shifts each copy of a byte right by twice its position among the four,
+/// which brings its own value to the bottom. Negative counts shift right.
+static Q2_0_SHIFTS: [i8; 16] = [0, -2, -4, -6, 0, -2, -4, -6, 0, -2, -4, -6, 0, -2, -4, -6];
+
+/// The 64 values of the Q2_0 block whose values start at `p`, 0 to 3 each,
+/// in order, 16 to a register.
+///
+/// A byte holds four neighboring values, lowest bits first. A table lookup
+/// copies each byte to its four positions, and a shift by register moves
+/// each position's own two bits down.
+#[inline(always)]
+unsafe fn q2_0_values(p: *const u8) -> [uint8x16_t; 4] {
+    // SAFETY: the caller guarantees 16 readable bytes at `p`. The tables
+    // are 16 bytes each.
+    unsafe {
+        let bytes = vld1q_u8(p);
+        let shifts = vld1q_s8(Q2_0_SHIFTS.as_ptr());
+        std::array::from_fn(|m| {
+            let spread = vqtbl1q_u8(bytes, vld1q_u8(Q2_0_SPREAD[m].as_ptr()));
+            vandq_u8(vshlq_u8(spread, shifts), vdupq_n_u8(3))
+        })
+    }
+}
+
+/// Row kernel for Q2_0: 18-byte blocks of 64 weights, each a 2-bit value
+/// of 0 to 3 that stands for one less, and a half scale per block.
+/// `weight = d * (value - 1)`.
+///
+/// The values are multiplied as they are. The sums of the activations per
+/// 16, which their quantizer already computed, then take the 1 back off
+/// every weight, in integers. Pairwise adds leave each group's sum in two
+/// lanes, so one multiply applies both activation scales.
+#[inline(always)]
+unsafe fn q2_0_row<D: ByteDot>(row: *const u8, n: usize, act: ActRef) -> f32 {
+    // SAFETY: the caller guarantees `row` holds `n / 64` blocks of 18 bytes
+    // and `act` describes `n` activations in groups of 32.
+    unsafe {
+        let mut acc = vdupq_n_f32(0.0);
+        for b in 0..n / 64 {
+            let p = row.add(b * 18);
+            let a = act.q.add(b * 64);
+            let [v0, v1, v2, v3] = q2_0_values(p.add(2)).map(|v| vreinterpretq_s8_u8(v));
+            let zero = vdupq_n_s32(0);
+            let first = D::add_products(zero, v0, vld1q_s8(a));
+            let first = D::add_products(first, v1, vld1q_s8(a.add(16)));
+            let second = D::add_products(zero, v2, vld1q_s8(a.add(32)));
+            let second = D::add_products(second, v3, vld1q_s8(a.add(48)));
+            // Lanes 0 and 1 hold the first group, 2 and 3 the second. Each
+            // lane gives back one of the four sums of 16 activations.
+            let sums = vpaddq_s32(first, second);
+            let sums = vsubq_s32(sums, vmovl_s16(vld1_s16(act.sums.add(b * 4))));
+            let scales = vmulq_n_f32(group_scales(act.scale.add(2 * b)), half(p));
+            acc = vfmaq_f32(acc, vcvtq_f32_s32(sums), scales);
+        }
+        vaddvq_f32(acc)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Formats with 256-weight super-blocks
 // ---------------------------------------------------------------------------
 
@@ -972,6 +1133,8 @@ unsafe fn tile_fill(tile: &mut Tile, ty: TensorType, height: usize, data: &[u8],
         TensorType::Q8_0 => fill_block32::<Q8_0>,
         TensorType::Iq4Nl => fill_block32::<Iq4Nl>,
         TensorType::Mxfp4 => fill_block32::<Mxfp4>,
+        TensorType::Nvfp4 => fill_nvfp4,
+        TensorType::Q2_0 => fill_q2_0,
         TensorType::Q4K => fill_k4::<false>,
         TensorType::Q5K => fill_k4::<true>,
         TensorType::Q6K => fill_q6_k,
@@ -1176,6 +1339,81 @@ unsafe fn fill_block32<F: TileBlock>(tile: &mut Tile, rows: [*const u8; 4]) -> b
             }
             store_columns(q.add(block * 128), low);
             store_columns(q.add(block * 128 + 64), high);
+        }
+    }
+    any
+}
+
+/// The fill of NVFP4: blocks of 64 signed FP4 levels, which the tile keeps
+/// as they are, and a scale for every sub-block of 16. The format has no
+/// offsets, and its scales are finite, so the portable fill's offsets are
+/// all zero.
+unsafe fn fill_nvfp4(tile: &mut Tile, rows: [*const u8; 4]) -> bool {
+    const BYTES: usize = 36;
+    let (q, scale, offset) = (
+        tile.q.as_mut_ptr(),
+        tile.scale.as_mut_ptr(),
+        tile.offset.as_mut_ptr(),
+    );
+    // SAFETY: the caller guarantees `tile.cols / 64` blocks behind every
+    // row pointer and a tile sized for them.
+    unsafe {
+        for block in 0..tile.cols / 64 {
+            let mut scales = [vdupq_n_f32(0.0); 4];
+            let mut subs = [[vdupq_n_u8(0); 4]; 4];
+            for r in 0..4 {
+                let p = rows[r].add(block * BYTES);
+                scales[r] = nvfp4_scales(p);
+                for (s, weights) in nvfp4_weights(p).into_iter().enumerate() {
+                    subs[s][r] = vreinterpretq_u8_s8(weights);
+                }
+            }
+            store_affine(scale.add(block * 16), scales, 1);
+            for sub in block * 4..block * 4 + 4 {
+                vst1q_f32(offset.add(sub * 4), vdupq_n_f32(0.0));
+            }
+            for (s, weights) in subs.into_iter().enumerate() {
+                store_columns(q.add((block * 4 + s) * 64), weights);
+            }
+        }
+    }
+    false
+}
+
+/// The fill of Q2_0: blocks of 64 values of 0 to 3, stored with a bias of
+/// one, which is how the tile wants them, and one half scale per block.
+/// Returns whether any offset is not zero.
+unsafe fn fill_q2_0(tile: &mut Tile, rows: [*const u8; 4]) -> bool {
+    const BYTES: usize = 18;
+    let (q, scale, offset) = (
+        tile.q.as_mut_ptr(),
+        tile.scale.as_mut_ptr(),
+        tile.offset.as_mut_ptr(),
+    );
+    let mut any = false;
+    // SAFETY: the caller guarantees `tile.cols / 64` blocks behind every
+    // row pointer and a tile sized for them.
+    unsafe {
+        for block in 0..tile.cols / 64 {
+            let mut subs = [[vdupq_n_u8(0); 4]; 4];
+            for r in 0..4 {
+                let p = rows[r].add(block * BYTES);
+                for (s, values) in q2_0_values(p.add(2)).into_iter().enumerate() {
+                    subs[s][r] = values;
+                }
+                // One scale per row for all four sub-blocks. The offsets
+                // take the bias off, as the portable fill computes them.
+                let d = half(p);
+                let shift = 0.0 - 1.0 * d;
+                for sub in block * 4..block * 4 + 4 {
+                    *scale.add(sub * 4 + r) = d;
+                    *offset.add(sub * 4 + r) = shift;
+                }
+                any |= shift != 0.0;
+            }
+            for (s, values) in subs.into_iter().enumerate() {
+                store_columns(q.add((block * 4 + s) * 64), values);
+            }
         }
     }
     any
@@ -1403,6 +1641,8 @@ variants!(row_q8_0, row_q8_0_sdot, block_row, Q8_0);
 variants!(row_iq4_nl, row_iq4_nl_sdot, block_row, Iq4Nl);
 variants!(row_mxfp4, row_mxfp4_sdot, block_row, Mxfp4);
 variants!(row_iq4_xs, row_iq4_xs_sdot, iq4_xs_row);
+variants!(row_nvfp4, row_nvfp4_sdot, nvfp4_row);
+variants!(row_q2_0, row_q2_0_sdot, q2_0_row);
 variants!(row_q4_k, row_q4_k_sdot, q4_k_row);
 variants!(row_q5_k, row_q5_k_sdot, q5_k_row);
 variants!(row_q6_k, row_q6_k_sdot, q6_k_row);

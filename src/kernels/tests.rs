@@ -6,7 +6,7 @@ use crate::tensor::f16::{bf16_to_f32, f16_to_f32, f32_to_f16};
 use crate::tensor::quant::{Tile, dequantize_row};
 use crate::testing::{Rng, random_weights, set_scales};
 
-const QUANT_TYPES: [TensorType; 22] = [
+const QUANT_TYPES: [TensorType; 25] = [
     TensorType::Q4_0,
     TensorType::Q4_1,
     TensorType::Q5_0,
@@ -29,6 +29,9 @@ const QUANT_TYPES: [TensorType; 22] = [
     TensorType::Tq2_0,
     TensorType::Tq1_0,
     TensorType::Mxfp4,
+    TensorType::Nvfp4,
+    TensorType::Q1_0,
+    TensorType::Q2_0,
 ];
 
 /// An activation vector quantized by one backend.
@@ -80,8 +83,10 @@ impl Acts {
     }
 }
 
+/// The group size activations are quantized in for `ty`. It is the block
+/// length of most formats, but not of the ones with blocks of 64 or 128.
 fn group_of(ty: TensorType) -> usize {
-    ty.block_len()
+    ty.family().group()
 }
 
 /// Runs a backend's row kernel for a quantized type.
@@ -451,6 +456,50 @@ fn extreme_weights_and_activations_do_not_saturate() {
                         assert_close(got[0], expected, magnitude, &format!("tile {what}"));
                     }
                 }
+            }
+        }
+    }
+}
+
+#[test]
+fn every_nvfp4_scale_reads_the_same_on_every_backend() {
+    // The random scales of the other tests are ordinary ones. Here 64 rows
+    // of one block each hold all 256 scale bytes between them, among them
+    // the subnormal ones and those that ggml reads in its own way. Each
+    // row is checked on its own, so that a tiny scale read wrongly is not
+    // lost next to a large one.
+    let ty = TensorType::Nvfp4;
+    let n = ty.block_len();
+    let mut rng = Rng(24);
+    let mut matrix = rng.bytes(64 * ty.block_bytes());
+    for (b, block) in matrix.chunks_exact_mut(ty.block_bytes()).enumerate() {
+        for (s, scale) in block[..4].iter_mut().enumerate() {
+            *scale = (4 * b + s) as u8;
+        }
+    }
+    let x = rng.floats(n, -3.0, 3.0);
+    let acts = Acts::new(scalar(), &x, group_of(ty));
+    for kernels in available() {
+        let tiles: Vec<Vec<f32>> = tile_heights(kernels)
+            .into_iter()
+            .map(|height| tile_dots(kernels, height, ty, &matrix, n, &acts))
+            .collect();
+        for (b, row) in matrix.chunks_exact(ty.block_bytes()).enumerate() {
+            let (expected, magnitude) = reference_dot(ty, row, &acts.reconstruct());
+            let what = format!(
+                "{} scales {:#04x} to {:#04x}",
+                kernels.name,
+                4 * b,
+                4 * b + 3
+            );
+            assert_close(
+                row_dot(kernels, ty, row, n, &acts),
+                expected,
+                magnitude,
+                &what,
+            );
+            for got in &tiles {
+                assert_close(got[b], expected, magnitude, &format!("tile {what}"));
             }
         }
     }

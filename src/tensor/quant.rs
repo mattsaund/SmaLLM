@@ -12,8 +12,8 @@
 //! weight[i] = scale[i / 16] * q[i] + offset[i / 16]
 //! ```
 //!
-//! A group is 32 weights for the simple formats and MXFP4, and 256 for the
-//! K, IQ and TQ formats.
+//! A group is one block: 32 weights for the simple formats and MXFP4, 64
+//! for Q2_0 and NVFP4, 128 for Q1_0, and 256 for the K, IQ and TQ formats.
 //!
 //! The IQ formats look weights up in grids of allowed patterns, which live
 //! in `iq_tables.rs`. Each decoder here follows ggml's dequantization in
@@ -29,9 +29,9 @@ use super::iq_tables::{
 // The SIMD kernels look MXFP4 levels up themselves.
 pub(crate) use super::iq_tables::MXFP4_LEVELS;
 
-/// One decoded group of weights. Formats with blocks of 32 fill the first
-/// 32 values of `q` and the first 2 scales and offsets. Formats with blocks
-/// of 256 fill everything.
+/// One decoded group of weights. A format fills as many values of `q` as
+/// its block holds, and one scale and offset for each 16 of them. Formats
+/// with blocks of 256 fill everything.
 pub struct Group {
     /// The integer weights.
     pub q: [i8; 256],
@@ -113,6 +113,9 @@ pub fn decode_row(ty: TensorType, bytes: &[u8], row: &mut DecodedRow) {
         TensorType::Tq2_0 => decode_blocks(ty, bytes, row, decode_tq2_0),
         TensorType::Tq1_0 => decode_blocks(ty, bytes, row, decode_tq1_0),
         TensorType::Mxfp4 => decode_blocks(ty, bytes, row, decode_mxfp4),
+        TensorType::Nvfp4 => decode_blocks(ty, bytes, row, decode_nvfp4),
+        TensorType::Q1_0 => decode_blocks(ty, bytes, row, decode_q1_0),
+        TensorType::Q2_0 => decode_blocks(ty, bytes, row, decode_q2_0),
     }
 }
 
@@ -155,6 +158,11 @@ pub fn unsigned_range(ty: TensorType) -> Option<(i8, u8)> {
         TensorType::Q5_0 => Some((16, 31)),
         TensorType::Q5_1 | TensorType::Q5K => Some((0, 31)),
         TensorType::Q6K => Some((32, 63)),
+        // The two small formats are stored with a bias of one. Kept that
+        // way, the shift costs a tile an offset term and saves the sign
+        // handling of every multiply.
+        TensorType::Q1_0 => Some((1, 2)),
+        TensorType::Q2_0 => Some((1, 3)),
         TensorType::Q8_0 | TensorType::Iq4Nl | TensorType::Iq4Xs => None,
         // Grid, ternary and FP4 weights are signed, and they stay that way.
         TensorType::Iq3S
@@ -166,7 +174,8 @@ pub fn unsigned_range(ty: TensorType) -> Option<(i8, u8)> {
         | TensorType::Iq1S
         | TensorType::Tq2_0
         | TensorType::Tq1_0
-        | TensorType::Mxfp4 => None,
+        | TensorType::Mxfp4
+        | TensorType::Nvfp4 => None,
         TensorType::F32 | TensorType::F16 | TensorType::BF16 => None,
     }
 }
@@ -374,6 +383,9 @@ pub fn decoder(ty: TensorType) -> Option<Decoder> {
         TensorType::Tq2_0 => decode_tq2_0,
         TensorType::Tq1_0 => decode_tq1_0,
         TensorType::Mxfp4 => decode_mxfp4,
+        TensorType::Nvfp4 => decode_nvfp4,
+        TensorType::Q1_0 => decode_q1_0,
+        TensorType::Q2_0 => decode_q2_0,
     })
 }
 
@@ -1042,6 +1054,89 @@ pub(crate) fn decode_mxfp4(block: &[u8], out: &mut Group) {
     set_affine(out, 0, 2, e8m0_half(b[0]), 0.0);
 }
 
+/// Reads an unsigned E4M3 scale of NVFP4 as half the value it stands for,
+/// as ggml's `ggml_ue4m3_to_fp32` does. The FP4 levels are doubled, and
+/// this halves them back.
+#[inline(always)]
+pub(crate) fn ue4m3_half(x: u8) -> f32 {
+    UE4M3_HALF[x as usize]
+}
+
+/// [`ue4m3_half`] of every byte. A table, because a lookup is cheaper than
+/// the arithmetic, and the SIMD kernels read it too. Every entry is a
+/// normal float, so reading one is exact even where the CPU is set to
+/// flush tiny floats to zero.
+pub(crate) static UE4M3_HALF: [f32; 256] = ue4m3_table();
+
+/// Builds [`UE4M3_HALF`] while compiling, from the bits of each float.
+///
+/// A byte has 4 exponent bits with a bias of 7 and 3 mantissa bits. ggml
+/// ignores the top bit, and reads both zero and 0x7F, which E4M3 uses for
+/// NaN, as zero. 0xFF has the same low bits as 0x7F but is not caught by
+/// that rule, so it reads as 240. These cases follow ggml exactly.
+const fn ue4m3_table() -> [f32; 256] {
+    let mut table = [0.0f32; 256];
+    let mut x = 0;
+    while x < 256 {
+        let exponent = ((x >> 3) & 0x0f) as u32;
+        let mantissa = (x & 7) as u32;
+        let bits = if x == 0x7f || (exponent == 0 && mantissa == 0) {
+            0
+        } else if exponent == 0 {
+            // A subnormal: mantissa * 2^-9, halved. As an f32 it is normal,
+            // with the mantissa's top bit as the leading one.
+            let top = 31 - mantissa.leading_zeros();
+            ((top + 117) << 23) | ((mantissa - (1 << top)) << (23 - top))
+        } else {
+            // (1 + mantissa / 8) * 2^(exponent - 7), halved.
+            ((exponent + 119) << 23) | (mantissa << 20)
+        };
+        table[x] = f32::from_bits(bits);
+        x += 1;
+    }
+    table
+}
+
+/// NVFP4, 36 bytes: four UE4M3 scales, one for each 16 weights, then 32
+/// bytes of nibbles that index [`MXFP4_LEVELS`]. Each sub-block of 16 has
+/// 8 bytes of its own. Byte `j` of them holds weight `j` in its low nibble
+/// and weight `j + 8` in its high nibble.
+/// weight = ue4m3(scale) / 2 * level
+pub(crate) fn decode_nvfp4(block: &[u8], out: &mut Group) {
+    let b: &[u8; 36] = block.try_into().expect("NVFP4 block is 36 bytes");
+    for sub in 0..4 {
+        for j in 0..8 {
+            let byte = b[4 + 8 * sub + j];
+            out.q[16 * sub + j] = MXFP4_LEVELS[(byte & 0x0f) as usize];
+            out.q[16 * sub + j + 8] = MXFP4_LEVELS[(byte >> 4) as usize];
+        }
+        set_affine(out, sub, 1, ue4m3_half(b[sub]), 0.0);
+    }
+}
+
+/// Q1_0, 18 bytes: half scale, then 16 bytes of sign bits for 128 weights.
+/// Bit `j % 8` of byte `j / 8` belongs to weight `j`. A set bit is plus.
+/// weight = d or -d
+pub(crate) fn decode_q1_0(block: &[u8], out: &mut Group) {
+    let b: &[u8; 18] = block.try_into().expect("Q1_0 block is 18 bytes");
+    for (j, q) in out.q[..128].iter_mut().enumerate() {
+        let bit = (b[2 + j / 8] >> (j % 8)) & 1;
+        *q = 2 * bit as i8 - 1;
+    }
+    set_affine(out, 0, 8, half(b, 0), 0.0);
+}
+
+/// Q2_0, 18 bytes: half scale, then 16 bytes of 2-bit values for 64
+/// weights. Byte `j / 4` holds weight `j`, starting at bit `2 * (j % 4)`.
+/// weight = d * (value - 1)
+pub(crate) fn decode_q2_0(block: &[u8], out: &mut Group) {
+    let b: &[u8; 18] = block.try_into().expect("Q2_0 block is 18 bytes");
+    for (j, q) in out.q[..64].iter_mut().enumerate() {
+        *q = ((b[2 + j / 4] >> (2 * (j % 4))) & 3) as i8 - 1;
+    }
+    set_affine(out, 0, 4, half(b, 0), 0.0);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1363,5 +1458,80 @@ mod tests {
         let out = row(TensorType::Iq1M, &block);
         assert_eq!(out[0], 0.25 * 7.0 * (-1.0 + 0.125));
         assert_eq!(out[16], 0.25 * (-1.0 + 0.125));
+    }
+
+    /// ggml's `ggml_ue4m3_to_fp32`, written out the way ggml computes it.
+    fn ggml_ue4m3_to_fp32(x: u8) -> f32 {
+        if x == 0 || x == 0x7f {
+            return 0.0;
+        }
+        let pow2 = |e: i32| f32::from_bits(((e + 127) as u32) << 23);
+        let exponent = ((x >> 3) & 0x0f) as i32;
+        let mantissa = (x & 7) as f32;
+        let raw = if exponent == 0 {
+            mantissa * pow2(-9)
+        } else {
+            (1.0 + mantissa / 8.0) * pow2(exponent - 7)
+        };
+        raw * 0.5
+    }
+
+    #[test]
+    fn ue4m3_scales_read_like_ggml() {
+        for x in 0..=255u8 {
+            let (got, want) = (ue4m3_half(x), ggml_ue4m3_to_fp32(x));
+            assert_eq!(got.to_bits(), want.to_bits(), "{x:#04x}: {got:e} {want:e}");
+        }
+        // One, the largest finite scale, the smallest one, and the edges.
+        assert_eq!(ue4m3_half(0x38), 0.5);
+        assert_eq!(ue4m3_half(0x7e), 224.0);
+        assert_eq!(ue4m3_half(0x01), 2f32.powi(-10));
+        assert_eq!(ue4m3_half(0x7f), 0.0);
+        assert_eq!(ue4m3_half(0xff), 240.0);
+        assert_eq!(ue4m3_half(0xb8), 0.5, "the top bit is ignored");
+    }
+
+    #[test]
+    fn nvfp4_sub_blocks_have_scales_and_bytes_of_their_own() {
+        let mut block = [0u8; 36];
+        block[..4].copy_from_slice(&[0x38, 0x40, 0x30, 0x01]);
+        block[4] = 0xf1; // sub-block 0: weight 0 has level 1, weight 8 level -12
+        block[4 + 8 + 7] = 0x27; // sub-block 1: weight 7 has level 12, weight 15 level 2
+        block[4 + 24] = 0x09; // sub-block 3: weight 0 has level -1
+        let out = row(TensorType::Nvfp4, &block);
+        assert_eq!(out[0], 0.5);
+        assert_eq!(out[8], -6.0);
+        assert_eq!(out[16 + 7], 12.0);
+        assert_eq!(out[16 + 15], 2.0);
+        assert_eq!(out[48], -(2f32.powi(-10)));
+        assert!(out[32..48].iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn q2_0_packs_four_weights_into_each_byte() {
+        let mut block = [0u8; 18];
+        put_half(&mut block, 0, 0.5);
+        block[2] = 0b11_10_01_00; // weights 0 to 3: values 0, 1, 2 and 3
+        block[17] = 0b00_11_01_10; // weights 60 to 63: values 2, 1, 3 and 0
+        let out = row(TensorType::Q2_0, &block);
+        assert_eq!(out[..4], [-0.5, 0.0, 0.5, 1.0]);
+        assert_eq!(out[60..], [0.5, 0.0, 1.0, -0.5]);
+        assert_eq!(out[4], -0.5);
+    }
+
+    #[test]
+    fn q1_0_keeps_one_sign_per_bit() {
+        let mut block = [0u8; 18];
+        put_half(&mut block, 0, 0.25);
+        block[2] = 0b1000_0001; // weights 0 and 7 are positive
+        block[17] = 0b0100_0000; // weight 126 is positive
+        let out = row(TensorType::Q1_0, &block);
+        assert_eq!(
+            out[..8],
+            [0.25, -0.25, -0.25, -0.25, -0.25, -0.25, -0.25, 0.25]
+        );
+        assert_eq!(out[126], 0.25);
+        assert_eq!(out[127], -0.25);
+        assert_eq!(out.iter().filter(|v| **v > 0.0).count(), 3);
     }
 }

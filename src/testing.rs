@@ -33,7 +33,12 @@ impl Rng {
 /// Byte offsets of the half-float fields inside one block of `ty`.
 fn half_offsets(ty: TensorType) -> &'static [usize] {
     match ty {
-        TensorType::Q4_0 | TensorType::Q5_0 | TensorType::Q8_0 | TensorType::Iq4Nl => &[0],
+        TensorType::Q4_0
+        | TensorType::Q5_0
+        | TensorType::Q8_0
+        | TensorType::Iq4Nl
+        | TensorType::Q1_0
+        | TensorType::Q2_0 => &[0],
         TensorType::Q4_1 | TensorType::Q5_1 | TensorType::Q4K | TensorType::Q5K => &[0, 2],
         TensorType::Q2K => &[80, 82],
         TensorType::Q3K => &[108],
@@ -55,9 +60,9 @@ fn half_offsets(ty: TensorType) -> &'static [usize] {
 /// 127 of Q8_0: the largest integer weight times the largest sub-block
 /// scale the format can encode, over 127.
 ///
-/// Random scales of the IQ, TQ and MXFP4 formats are divided by it, so
-/// that their random weights come out about as large as Q8_0's. The older
-/// formats count as 1, as they did when their tests were tuned.
+/// Random scales of the IQ, TQ, FP4 and the small Q formats are divided by
+/// it, so that their random weights come out about as large as Q8_0's. The
+/// older formats count as 1, as they did when their tests were tuned.
 fn reach(ty: TensorType) -> f32 {
     let largest = match ty {
         // IQ4_NL levels up to 127, times 6-bit scales from -32.
@@ -70,12 +75,28 @@ fn reach(ty: TensorType) -> f32 {
         TensorType::Iq2S | TensorType::Iq2Xs | TensorType::Iq2Xxs => 43.0 * 3.875,
         // A grid value of 1 plus a delta of 1/8, times 2 * 7 + 1.
         TensorType::Iq1M | TensorType::Iq1S => 1.125 * 15.0,
-        TensorType::Tq2_0 | TensorType::Tq1_0 => 1.0,
+        TensorType::Tq2_0 | TensorType::Tq1_0 | TensorType::Q1_0 => 1.0,
+        TensorType::Q2_0 => 2.0,
         // The largest FP4 level, doubled. The scale is set directly.
-        TensorType::Mxfp4 => 12.0,
+        TensorType::Mxfp4 | TensorType::Nvfp4 => 12.0,
         _ => 127.0,
     };
     largest / 127.0
+}
+
+/// The largest UE4M3 scale byte of NVFP4 that stands for at most `scale`,
+/// in ggml's reading, which halves it.
+fn ue4m3_below(scale: f32) -> u8 {
+    // Twice the scale, as the 4-bit exponent with a bias of 7 and the top
+    // 3 bits of the mantissa. Tiny scales keep a mantissa without the
+    // leading one, and the smallest of all become zero.
+    let doubled = 2.0 * scale.clamp(0.0, 224.0);
+    let exponent = ((doubled.to_bits() >> 23) & 0xff) as i32 - 127 + 7;
+    if exponent >= 1 {
+        ((exponent as u8) << 3) | ((doubled.to_bits() >> 20) & 7) as u8
+    } else {
+        (doubled * 512.0) as u8
+    }
 }
 
 /// Overwrites the scale fields of every block with finite values of at most
@@ -104,6 +125,12 @@ pub(crate) fn set_scales(rng: &mut Rng, ty: TensorType, row: &mut [u8], magnitud
             TensorType::Mxfp4 => {
                 let scale = rng.range(0.0, magnitude);
                 block[0] = ((scale.to_bits() >> 23) & 0xff) as u8 + 1;
+            }
+            // NVFP4 has four unsigned 8-bit float scales, one per 16.
+            TensorType::Nvfp4 => {
+                for scale in &mut block[..4] {
+                    *scale = ue4m3_below(rng.range(0.0, magnitude));
+                }
             }
             _ => {}
         }

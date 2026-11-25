@@ -288,7 +288,9 @@ impl Job<'_> {
 
     /// Computes rows `rows` of one target by the tile route.
     fn run_tiled(&self, plan: &Plan, rows: Range<usize>) {
-        let group = plan.ty.block_len();
+        // The group the activations were quantized in, which is not always
+        // the weights' block: a block of Q2_0 spans two groups.
+        let group = plan.family.group();
         let height = self.kernels.tile_rows();
         let acts = self.acts(plan.family);
         let dot = self.kernels.tile_dot();
@@ -364,7 +366,7 @@ impl Job<'_> {
                                         wsum: input,
                                     }
                                 } else {
-                                    let group = plan.ty.block_len();
+                                    let group = plan.family.group();
                                     self.acts(plan.family).act(index, self.cols, group)
                                 };
                                 dot(weights, self.cols, act)

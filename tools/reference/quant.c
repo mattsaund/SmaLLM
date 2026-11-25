@@ -30,7 +30,9 @@
 #define ROWS 2
 #define COLS 256
 
-// Every quantized format SmaLLM reads.
+// Every quantized format SmaLLM reads. A new format goes at the end: the
+// rows come from one stream of random numbers, so the formats before it
+// keep the vectors they have.
 static const enum ggml_type TYPES[] = {
     GGML_TYPE_Q4_0,    GGML_TYPE_Q4_1,   GGML_TYPE_Q5_0,  GGML_TYPE_Q5_1,
     GGML_TYPE_Q8_0,    GGML_TYPE_IQ4_NL,
@@ -42,7 +44,16 @@ static const enum ggml_type TYPES[] = {
     GGML_TYPE_IQ4_XS,
     GGML_TYPE_TQ1_0,   GGML_TYPE_TQ2_0,
     GGML_TYPE_MXFP4,
+    GGML_TYPE_NVFP4,   GGML_TYPE_Q1_0,   GGML_TYPE_Q2_0,
 };
+
+// The formats that round each weight to -1, 0 or 1 times the largest
+// magnitude of its block: the TQ formats, and Q2_0, whose fourth level
+// ggml's quantizer never uses. They get the ternary weights of `fill`, or
+// most of their weights would be zero.
+static int is_ternary(enum ggml_type type) {
+    return type == GGML_TYPE_TQ1_0 || type == GGML_TYPE_TQ2_0 || type == GGML_TYPE_Q2_0;
+}
 
 // A small xorshift generator, so that every run writes the same vectors.
 static uint64_t state = 0x9e3779b97f4a7c15ull;
@@ -110,7 +121,7 @@ int main(int argc, char ** argv) {
 
     for (size_t t = 0; t < sizeof TYPES / sizeof TYPES[0]; t++) {
         const enum ggml_type type = TYPES[t];
-        fill(source, n, type == GGML_TYPE_TQ1_0 || type == GGML_TYPE_TQ2_0);
+        fill(source, n, is_ternary(type));
         const size_t row_size = ggml_row_size(type, COLS);
         uint8_t * blocks = malloc(ROWS * row_size);
         ggml_quantize_init(type);

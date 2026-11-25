@@ -109,6 +109,8 @@ fn row_quant(ty: TensorType) -> DotQuant {
         TensorType::Iq1S => row_iq1_s,
         TensorType::Tq2_0 => row_tq2_0,
         TensorType::Tq1_0 => row_tq1_0,
+        TensorType::Nvfp4 => row_nvfp4,
+        TensorType::Q2_0 => row_q2_0,
         _ => scalar::row_quant(ty),
     }
 }
@@ -360,6 +362,8 @@ unsafe fn tile_fill(tile: &mut Tile, ty: TensorType, height: usize, data: &[u8],
         TensorType::Q8_0 => fill_q8_0,
         TensorType::Iq4Nl => fill_iq4_nl,
         TensorType::Mxfp4 => fill_mxfp4,
+        TensorType::Nvfp4 => fill_nvfp4,
+        TensorType::Q2_0 => fill_q2_0,
         TensorType::Q4K => fill_q4_k,
         TensorType::Q5K => fill_q5_k,
         TensorType::Q6K => fill_q6_k,
@@ -544,6 +548,84 @@ block32_fill!(fill_mxfp4, 17, 0.0, e8m0_scales, |p| _mm256_shuffle_epi8(
     levels(&quant::MXFP4_LEVELS),
     nibbles(p.add(1))
 ));
+
+/// The fill of NVFP4: blocks of 64 signed FP4 levels, which the tile keeps
+/// as they are, and a scale for every sub-block of 16. The format has no
+/// offsets, and its scales are finite, so the portable fill's offsets are
+/// all zero.
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn fill_nvfp4(tile: &mut Tile, rows: [*const u8; 8]) -> bool {
+    const BYTES: usize = 36;
+    let (q, scale, offset) = (
+        tile.q.as_mut_ptr(),
+        tile.scale.as_mut_ptr(),
+        tile.offset.as_mut_ptr(),
+    );
+    // SAFETY: the caller guarantees `tile.cols / 64` blocks behind every
+    // row pointer and a tile sized for them.
+    unsafe {
+        for block in 0..tile.cols / 64 {
+            let mut first = [_mm256_setzero_si256(); 8];
+            let mut second = [_mm256_setzero_si256(); 8];
+            for r in 0..8 {
+                let p = rows[r].add(block * BYTES);
+                // Sub-blocks 0 and 2, and 1 and 3, put back in order.
+                let (even, odd) = nvfp4_weights(p);
+                first[r] = _mm256_permute2x128_si256::<0x20>(even, odd);
+                second[r] = _mm256_permute2x128_si256::<0x31>(even, odd);
+                for s in 0..4 {
+                    *scale.add((block * 4 + s) * 8 + r) = quant::ue4m3_half(*p.add(s));
+                }
+            }
+            store_columns(q.add(block * 512), first);
+            store_columns(q.add(block * 512 + 256), second);
+            for sub in block * 4..block * 4 + 4 {
+                _mm256_storeu_ps(offset.add(sub * 8), _mm256_setzero_ps());
+            }
+        }
+    }
+    false
+}
+
+/// The fill of Q2_0: blocks of 64 values of 0 to 3, stored with a bias of
+/// one, which is how the tile wants them, and one half scale per block.
+/// Returns whether any offset is not zero.
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn fill_q2_0(tile: &mut Tile, rows: [*const u8; 8]) -> bool {
+    const BYTES: usize = 18;
+    let (q, scale, offset) = (
+        tile.q.as_mut_ptr(),
+        tile.scale.as_mut_ptr(),
+        tile.offset.as_mut_ptr(),
+    );
+    let zero = _mm256_setzero_ps();
+    let mut any = zero;
+    // SAFETY: the caller guarantees `tile.cols / 64` blocks behind every
+    // row pointer and a tile sized for them.
+    unsafe {
+        for block in 0..tile.cols / 64 {
+            for half in 0..2 {
+                let mut values = [_mm256_setzero_si256(); 8];
+                for r in 0..8 {
+                    let p = rows[r].add(block * BYTES + 2);
+                    let bytes = _mm256_castsi128_si256(_mm_loadu_si128(p as *const __m128i));
+                    values[r] = q2_0_values(bytes, half);
+                }
+                store_columns(q.add((block * 2 + half) * 256), values);
+            }
+            // One scale per row for all four sub-blocks. The offsets take
+            // the bias off, as `0 - 1 * scale`, the portable fill's sum.
+            let scales = half_scales(&rows, block * BYTES);
+            let offsets = _mm256_sub_ps(zero, _mm256_mul_ps(_mm256_set1_ps(1.0), scales));
+            for sub in block * 4..block * 4 + 4 {
+                _mm256_storeu_ps(scale.add(sub * 8), scales);
+                _mm256_storeu_ps(offset.add(sub * 8), offsets);
+            }
+            any = _mm256_or_ps(any, nonzero(offsets));
+        }
+    }
+    _mm256_movemask_ps(any) != 0
+}
 
 /// The scales and offsets of the Q4_K or Q5_K super-block at `p`, as
 /// floats: eight of each, one per sub-block of 32 weights.
@@ -1642,6 +1724,141 @@ signed_block_row!(row_iq4_nl, load_iq4_nl, 18);
 signed_block_row!(row_mxfp4, load_mxfp4, 17);
 offset_block_row!(row_q4_1, load_q4_1, 20);
 offset_block_row!(row_q5_1, load_q5_1, 24);
+
+// ---------------------------------------------------------------------------
+// Formats with 64-weight blocks
+// ---------------------------------------------------------------------------
+
+/// The weights of the NVFP4 block at `p`, looked up in the doubled FP4
+/// levels: sub-blocks 0 and 2 in the first register, 1 and 3 in the
+/// second, each sub-block in order in its half.
+///
+/// A sub-block's 8 bytes hold its first 8 weights in their low nibbles
+/// and its last 8 in their high nibbles. Interleaving the 64-bit halves of
+/// the low and the high nibbles puts each sub-block in one 128-bit lane,
+/// without moving anything across lanes.
+#[target_feature(enable = "avx2,fma,f16c")]
+#[inline]
+unsafe fn nvfp4_weights(p: *const u8) -> (__m256i, __m256i) {
+    // SAFETY: the caller guarantees a 36-byte block at `p`.
+    let bytes = unsafe { _mm256_loadu_si256(p.add(4) as *const __m256i) };
+    let mask = _mm256_set1_epi8(0x0f);
+    let low = _mm256_and_si256(bytes, mask);
+    let high = _mm256_and_si256(_mm256_srli_epi16::<4>(bytes), mask);
+    let table = levels(&quant::MXFP4_LEVELS);
+    (
+        _mm256_shuffle_epi8(table, _mm256_unpacklo_epi64(low, high)),
+        _mm256_shuffle_epi8(table, _mm256_unpackhi_epi64(low, high)),
+    )
+}
+
+/// The four scales of the NVFP4 block at `p`, from the table of every
+/// UE4M3 byte.
+#[target_feature(enable = "avx2,fma,f16c")]
+#[inline]
+unsafe fn nvfp4_scales(p: *const u8) -> __m128 {
+    let scale = |s: usize| {
+        // SAFETY: the caller guarantees a 36-byte block at `p`, which
+        // starts with its four scales.
+        quant::ue4m3_half(unsafe { *p.add(s) })
+    };
+    _mm_setr_ps(scale(0), scale(1), scale(2), scale(3))
+}
+
+/// Row kernel for NVFP4: 36-byte blocks of four sub-blocks of 16 weights,
+/// each with an 8-bit float scale.
+/// `weight = ue4m3(scale) / 2 * level[nibble]`.
+///
+/// Each register holds two sub-blocks, one in each 128-bit half. A half is
+/// scaled by its sub-block's own scale times the scale of its group of
+/// activations. The four products of a block are made once and spread to
+/// the halves that need them. The two registers of a block have
+/// accumulators of their own.
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn row_nvfp4(row: *const u8, n: usize, act: ActRef) -> f32 {
+    let first = _mm256_setr_epi32(0, 0, 0, 0, 2, 2, 2, 2);
+    let second = _mm256_setr_epi32(1, 1, 1, 1, 3, 3, 3, 3);
+    let mut acc = [_mm256_setzero_ps(), _mm256_setzero_ps()];
+    // SAFETY: the caller guarantees `row` holds `n / 64` blocks of 36 bytes
+    // and `act` describes `n` activations in groups of 32.
+    unsafe {
+        for b in 0..n / 64 {
+            let p = row.add(b * 36);
+            let a = act.q.add(b * 64);
+            let (even, odd) = nvfp4_weights(p);
+            // Sub-blocks 0 and 2, then 1 and 3, as the weights hold them.
+            let acts_even = _mm256_loadu2_m128i(a.add(32) as *const __m128i, a as *const __m128i);
+            let acts_odd =
+                _mm256_loadu2_m128i(a.add(48) as *const __m128i, a.add(16) as *const __m128i);
+            // The activation scales of the block's two groups, each twice:
+            // the first group holds sub-blocks 0 and 1.
+            let pair = _mm_castsi128_ps(_mm_loadl_epi64(act.scale.add(2 * b) as *const __m128i));
+            let scales = _mm_mul_ps(nvfp4_scales(p), _mm_unpacklo_ps(pair, pair));
+            let scales = _mm256_castps128_ps256(scales);
+            let scale_even = _mm256_permutevar8x32_ps(scales, first);
+            let scale_odd = _mm256_permutevar8x32_ps(scales, second);
+            acc[0] = _mm256_fmadd_ps(dot_signed(even, acts_even), scale_even, acc[0]);
+            acc[1] = _mm256_fmadd_ps(dot_signed(odd, acts_odd), scale_odd, acc[1]);
+        }
+        hsum(_mm256_add_ps(acc[0], acc[1]))
+    }
+}
+
+/// The 32 values of half `half` of a Q2_0 block, 0 to 3 each, in order.
+/// `bytes` holds the block's 16 bytes of values in its low 128 bits.
+///
+/// A byte holds four neighboring values, lowest bits first. A 128-bit half
+/// of the result holds 16 values, which come from 4 bytes. Each of its four
+/// 32-bit words takes those 4 bytes and shifts them right by twice its
+/// place, so word `j` holds value `4k + j` in its byte `k`. One byte
+/// shuffle puts them in order.
+#[target_feature(enable = "avx2,fma,f16c")]
+#[inline]
+unsafe fn q2_0_values(bytes: __m256i, half: usize) -> __m256i {
+    let words = _mm256_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1);
+    let words = _mm256_add_epi32(words, _mm256_set1_epi32(2 * half as i32));
+    let shifts = _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6);
+    let spread = _mm256_srlv_epi32(_mm256_permutevar8x32_epi32(bytes, words), shifts);
+    let values = _mm256_and_si256(spread, _mm256_set1_epi8(3));
+    // Byte `4j + k` of each half holds value `4k + j`.
+    let order = _mm256_setr_epi8(
+        0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15, 0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10,
+        14, 3, 7, 11, 15,
+    );
+    _mm256_shuffle_epi8(values, order)
+}
+
+/// Row kernel for Q2_0: 18-byte blocks of 64 weights, each a 2-bit value
+/// of 0 to 3 that stands for one less, and a half scale per block.
+/// `weight = d * (value - 1)`.
+///
+/// The values are multiplied as they are, unsigned, which needs no sign
+/// handling. The sum of the activations, which their quantizer already
+/// computed as `act.wsum`, then takes the 1 back off every weight. The two
+/// groups of activations in a block have accumulators of their own.
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn row_q2_0(row: *const u8, n: usize, act: ActRef) -> f32 {
+    let mut acc = [_mm256_setzero_ps(), _mm256_setzero_ps()];
+    let mut correction = 0.0f32;
+    // SAFETY: the caller guarantees `row` holds `n / 64` blocks of 18 bytes
+    // and `act` describes `n` activations in groups of 32.
+    unsafe {
+        for b in 0..n / 64 {
+            let p = row.add(b * 18);
+            let d = half(p);
+            let bytes = _mm256_castsi128_si256(_mm_loadu_si128(p.add(2) as *const __m128i));
+            for (g, acc) in acc.iter_mut().enumerate() {
+                let values = q2_0_values(bytes, g);
+                let acts = _mm256_loadu_si256(act.q.add(b * 64 + g * 32) as *const __m256i);
+                let scale = _mm256_mul_ps(d, broadcast(act.scale.add(2 * b + g)));
+                *acc = _mm256_fmadd_ps(dot_unsigned(values, acts), scale, *acc);
+            }
+            let sums = *act.wsum.add(2 * b) + *act.wsum.add(2 * b + 1);
+            correction += _mm256_cvtss_f32(d) * sums;
+        }
+        hsum(_mm256_add_ps(acc[0], acc[1])) - correction
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Formats with 256-weight super-blocks
