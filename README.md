@@ -2,14 +2,14 @@
 
 SmaLLM is a CPU inference engine for language models in GGUF format, the
 format llama.cpp and Ollama use. It targets single-board computers, mini PCs
-and old laptops. One binary of about 1 MB, no dependencies, no required
+and old laptops. One binary of 0.9 to 1.4 MB, no dependencies, no required
 configuration. Anonymous memory beyond the mapped model file is a few MB.
 
 **Binary size, release builds:**\
-1.22 MB Linux (x86_64), 1.01 MB Linux (arm64)\
-0.94 MB Linux (armv7), 0.82 MB Linux (riscv64)\
-1.03 MB macOS (Intel), 0.88 MB macOS (Apple silicon)\
-1.26 MB Windows (x86_64), 1.04 MB Windows (arm64)
+1.35 MB Linux (x86_64), 1.15 MB Linux (arm64)\
+1.03 MB Linux (armv7), 0.89 MB Linux (riscv64)\
+1.14 MB macOS (Intel), 1.03 MB macOS (Apple silicon)\
+1.40 MB Windows (x86_64), 1.18 MB Windows (arm64)
 
 **Anonymous memory, Llama 3.2 1B, 4,096-token context:**\
 7.7 MB. llama.cpp b11846: 627 MB. [Memory](#memory) has the method and the
@@ -221,14 +221,14 @@ llama.cpp b11846 on an Intel Core i7-14700K with a 4,096-token context.
 
 ## Size
 
-The program (chat, server, downloader) is 0.82 to 1.26 MB depending on the
-platform. The engine as a shared library is 0.58 to 0.86 MB. llama.cpp
+The program (chat, server, downloader) is 0.89 to 1.40 MB depending on the
+platform. The engine as a shared library is 0.70 to 0.96 MB. llama.cpp
 b11846's CPU-only libraries total 7.7 MB on the same machine. llama.cpp has
 features SmaLLM lacks, listed in [docs/TODO.md](docs/TODO.md).
 
 Release builds compile the standard library for size (`-Z build-std` with
 `optimize_for_size`), which saves about 20 percent. A source build with
-stable Rust is about 1.5 MB.
+stable Rust is about 1.7 MB.
 
 ## Context
 

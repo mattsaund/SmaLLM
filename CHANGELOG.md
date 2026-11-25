@@ -5,6 +5,10 @@ Each version is a `v` tag, with ready-made binaries and libraries on its
 
 ## 0.4.0 - 2026-11-25
 
+- **Sizes.** The program is 0.89 to 1.40 MB depending on the platform
+  (0.82 to 1.26 in 0.3.0), and the shared library 0.70 to 0.96 MB, for
+  Inkling 2, three weight formats, six samplers and the NEON kernels below.
+
 - **Faster on ARM chips with the dot product extension** (Cortex-A55, A76
   and later, such as the Raspberry Pi 5 and the RK3588, Apple's M chips and
   AWS Graviton). Prompts: the tile kernel multiplies four vectors at once

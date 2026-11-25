@@ -19,7 +19,7 @@ x86 CPU, Intel Core i7-14700K, 8 threads, llama.cpp b11846 with its
 
 | | SmaLLM | llama.cpp | Ollama |
 |---|---|---|---|
-| Binary size | 0.82 to 1.26 MB, no dependencies | 7.7 MB of CPU libraries | Much larger, bundles GPU runtimes |
+| Binary size | 0.89 to 1.40 MB, no dependencies | 7.7 MB of CPU libraries | Much larger, bundles GPU runtimes |
 | Anonymous memory, Llama 3.2 1B, 4K context | 24 MB | 636 MB | Not measured (built on llama.cpp) |
 | Anonymous memory, gpt-oss-20b | 59 MB | 9,966 MB | Not measured |
 | Generation speed | Faster on 10 of 10 models, by 8 to 33% | 5% faster on one thread (Llama 3.2 1B) | Not measured |
