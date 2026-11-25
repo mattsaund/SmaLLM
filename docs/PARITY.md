@@ -24,7 +24,7 @@ x86 CPU, Intel Core i7-14700K, 8 threads, llama.cpp b11846 with its
 | Anonymous memory, gpt-oss-20b | 33 MB | 9,966 MB | Not measured |
 | Generation speed | Faster on 9 of 9 models, by 5 to 33% | 5% faster on one thread (Llama 3.2 1B) | Not measured |
 | Prompt speed | Faster on 7 of 9, tie on RWKV-7, DeepSeek 0.83x | | Not measured |
-| ARM speed | Unmeasured | Mature NEON, i8mm and SVE kernels | llama.cpp's |
+| ARM speed (A733, see below) | Generation level; Q4_0 prompts 3.6x slower | Mature NEON, i8mm and SVE kernels | llama.cpp's |
 
 Speed by model, tokens per second, 256-token prompt, 64 generated:
 
@@ -57,6 +57,21 @@ Anonymous memory (RssAnon) with a 4,096-token context and 256 tokens read:
 These figures leave out the mapped model file, which both engines need in
 memory at full speed. The README's Memory section has the trade-offs.
 
+## Measured on ARM
+
+Allwinner A733 (2 Cortex-A76, 6 Cortex-A55, dot product, no i8mm, 12 GB),
+prompt and generation on the two A76 cores, 2 threads, tokens per second.
+[DEVELOPMENT.md](DEVELOPMENT.md) has the details.
+
+| Model (format) | Prompt: SmaLLM | Prompt: llama.cpp | Generation: SmaLLM | Generation: llama.cpp |
+|---|---|---|---|---|
+| LFM3-1.7B (Q4_0) | 12.5 | 44.5 | 7.4 | 8.0 |
+| Nemotron 3.5 Bolt E4B (Q4_K_M) | 8.4 | 8.3 | 2.7 | 2.5 |
+
+With prompts on all 8 cores, SmaLLM reads them at 18.3 (LFM3) and 12.6
+(Nemotron) tokens per second. Anonymous memory: SmaLLM 12 to 21 MB,
+llama.cpp 1.3 GB and 6.8 GB.
+
 ## Hardware
 
 | | SmaLLM | llama.cpp | Ollama |
@@ -67,6 +82,8 @@ memory at full speed. The README's Memory section has the trade-offs.
 | GPU | None | CUDA, HIP, Metal, Vulkan, SYCL, OpenCL, MUSA, WebGPU | CUDA, ROCm, Metal, Vulkan |
 | NPU | None | Hexagon, OpenVINO, CANN | None |
 | Split across machines | No | Yes (RPC) | No |
+| CPU affinity option | No (`taskset` works) | Yes | No |
+| Locking weights in memory | No | Yes (`--mlock`) | Yes |
 
 ## Models and formats
 
@@ -95,6 +112,8 @@ memory at full speed. The README's Memory section has the trade-offs.
 | Save and restore a session | No | Yes | No |
 | Full context | Keeps the start or slides, keys rotated | Context shift | Truncation or shift |
 | Token probabilities | No | Yes | Unknown |
+| Sampling defaults from the model file | No | Yes | Own model parameters |
+| Thinking switch | No | Yes | Yes |
 
 ## Server and tools
 
@@ -134,8 +153,10 @@ reranking, reasoning output, and full-context handling.
 6. Samplers, token probabilities, speculative decoding, LoRA, session
    files, and converting or quantizing models.
 
-**Unknown:** speed on ARM boards, the actual target. See
-[DEVELOPMENT.md](DEVELOPMENT.md) for what to measure first.
+**On ARM** (one board so far, the A733): memory is as far ahead as on x86,
+generation is level with llama.cpp, and Q4_0 prompt reading is 3.6 times
+slower. That kernel is the largest gap on the target hardware. See
+[DEVELOPMENT.md](DEVELOPMENT.md).
 
 ## Keeping this page current
 

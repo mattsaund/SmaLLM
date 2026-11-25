@@ -8,10 +8,10 @@ rules for changes and the map of the files are in
 
 ## Where things stand
 
-Everything has been built and measured on one x86-64 desktop, an Intel
-Core i7-14700K. The ARM code has never been timed. It is correct: CI runs
-every NEON kernel against the portable one on ARM runners, and the engine
-matches llama.cpp on real models there. Nobody knows yet how fast it is.
+SmaLLM is developed on an x86-64 desktop, an Intel Core i7-14700K. The
+first ARM board was measured on 2026-11-24: an Allwinner A733 (results
+below). CI runs every NEON kernel against the portable one on ARM runners,
+and the engine matches llama.cpp on real models there.
 
 - **Kernels.** AVX2, AVX2 with VNNI, NEON, and NEON with the dot product
   extension. The RK3588's cores have that extension, so expect the engine
@@ -22,7 +22,9 @@ matches llama.cpp on real models there. Nobody knows yet how fast it is.
   per tile on NEON.
 - **Threads.** Generation runs on the performance cores, prompts on every
   physical core. `default_threads` and `default_batch_threads` in
-  `src/threads.rs` count them, by `cpu_capacity` on Linux.
+  `src/threads.rs` count them, by `cpu_capacity` on Linux, among the CPUs
+  in the process's affinity mask. Physical cores are told apart by their
+  sibling lists, since some boards number each cluster's cores from zero.
 - **Memory.** The key/value cache keeps 16-bit floats and grows in chunks
   of 256 positions as the context fills. Recurrent models (Mamba, RWKV)
   keep a fixed state plus one saved copy of it.
@@ -62,6 +64,64 @@ SMALLM_TEST_MODELS=~/.local/share/smallm cargo test --release --workspace
 
 Keep large models on disk, not in `/tmp`, which is often memory.
 
+## First board: Allwinner A733
+
+Orange Pi with an Allwinner A733: 2 Cortex-A76 cores at 2.0 GHz (cpu6 and
+cpu7) and 6 Cortex-A55 cores at 1.8 GHz (cpu0 to cpu5), the dot product
+extension but no i8mm, 12 GB of LPDDR5, an SD card reading about 65 MB/s,
+and Armbian's 6.6 vendor kernel. SmaLLM 0.3.0 picked the `neon+dotprod`
+kernels. llama.cpp was built on the board for comparison.
+
+Prompt and generation on the two A76 cores, 2 threads, tokens per second:
+
+| Model (format) | Prompt: SmaLLM | Prompt: llama.cpp | Generation: SmaLLM | Generation: llama.cpp | SmaLLM, prompts on 8 cores |
+|---|---|---|---|---|---|
+| LFM3-1.7B (Q4_0), 128 prompt, 64 generated | 12.5 | 44.5 | 7.4 | 8.0 | 18.3 |
+| Nemotron 3.5 Bolt E4B (Q4_K_M), 64 prompt, 32 generated | 8.4 | 8.3 | 2.7 | 2.5 | 12.6 |
+
+Anonymous memory: SmaLLM 12 to 21 MB, llama.cpp 1.3 GB (LFM3) and 6.8 GB
+(Nemotron).
+
+Findings:
+
+- **Q4_0 prompt reading is 3.6 times slower than llama.cpp.** About 96
+  percent of the prompt time is in the matrix multiplies (feed-forward up
+  48, down 26, query, key and value 17). The batch size is not the cause:
+  32, 64, 128 and 256 give 17.7, 18.8, 18.0 and 16.3 tokens per second on 8
+  cores, so packing tiles per batch is not the main cost. llama.cpp's Q4_0
+  GEMM for this CPU keeps a block of 4 rows by 4 tokens of 32-bit
+  accumulators and uses `sdot` by lane, so each loaded weight register
+  serves four tokens. The NEON tile kernel's register blocking is the first
+  place to look.
+- **Generation is memory-bound and close to llama.cpp.** Q4_0 is 7 percent
+  behind (7.4 against 8.0), Q4_K_M 8 percent ahead (2.7 against 2.5). Both
+  engines read weights at about 8 GB/s. In LFM3's generation profile the
+  feed-forward up projection takes 40 percent, down 21, the logits 18 (a
+  tied 128,000 by 2,048 Q6_K embedding, about 215 MB per token) and query,
+  key and value 13.
+- **Prompts on every core pay off.** On mixed cores the work-claiming pool
+  read Nemotron's prompt 46 percent faster on 8 threads than on 2. llama.cpp
+  got slower when the A55s joined.
+- **Thread counts were wrong** in 0.3.0: the A76s report core ids 0 and 1,
+  like the first two A55s, and were counted as their hardware threads, so
+  prompts ran on 6 threads instead of 8 (15.6 against 18.3 tokens per
+  second). Thread counts also ignored `taskset`. Both are fixed after 0.3.0.
+- **A prompt batch of 64** read 6 percent faster than 32 here.
+- **Storage.** Weights are mapped, so under memory pressure their pages are
+  dropped and read again from the card: 6.2 GB takes about 95 seconds at 65
+  MB/s. A cold start is fine. LFM3's first token (1.05 GB of weights) took
+  18.7 seconds through page faults, against 16.1 to read the file in order,
+  so asking the kernel to read ahead at load would save at most 15 percent.
+- **The GPU would not help generation.** The PowerVR BXM-4-64 (vendor DDK
+  24.2) measures 5.3 GB/s and 37 GFLOPS, below the CPU's 8 GB/s. Its Vulkan
+  compiler fails on 16-bit storage, it has 16 KB of shared memory, a
+  subgroup size of 1 and no integer dot product. A Vulkan backend meant for
+  board GPUs needs 32-bit storage fallbacks and small shared-memory tiles.
+- **The NPU does not fit language models.** The VeriSilicon VIP9000 runs
+  graphs compiled ahead of time on an x86 PC, with static shapes and no
+  key/value cache. Language models stop at SmolLM2 in 16-bit integers with a
+  32-token window.
+
 ## Questions the board can answer
 
 1. **Is the tile route a win on these cores, and from which batch size?**
@@ -70,8 +130,9 @@ Keep large models on disk, not in `/tmp`, which is often memory.
    the break-even is higher. `kernel_speed` gives both costs. To switch
    tiles off for a test, set `tile_rows` to 0 in `src/kernels/arm.rs`.
 2. **Are the thread counts right?** An RK3588 should generate on its 4 fast
-   cores and read prompts on all 8. Check what `smallm bench` reports, then
-   time other counts with `--threads` and `--threads-batch`.
+   cores and read prompts on all 8, and the A733 on its 2 A76s and all 8.
+   Check what `smallm bench` reports, then time other counts with
+   `--threads` and `--threads-batch`.
 3. **Is generation limited by memory or by the kernels?** Compare
    `kernel_speed` with the time per weight that `bench --profile` implies.
    On the desktop, generation waits for memory, and a faster kernel would
@@ -96,6 +157,9 @@ Keep large models on disk, not in `/tmp`, which is often memory.
    they run when it does.
 
 ## Known unfinished work
+
+- **Q4_0 prompt reading on NEON** is 3.6 times slower than llama.cpp on the
+  A733 (above). It is the largest gap on boards.
 
 - **NEON speed is unmeasured.** The tile fills, and the MXFP4, IQ4_NL and
   IQ4_XS kernels, were written without an ARM machine. CI shows they are

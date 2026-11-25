@@ -445,7 +445,11 @@ are nearly tied.
 ## What the engine does not do
 
 - It computes on the CPU. GPUs and NPUs are planned as further backends.
-- It runs text models of fourteen architectures. No images, audio or
-  embeddings.
-- It knows ten chat formats and does not interpret templates.
+- It runs text models of twenty-five architectures, and BERT and nomic-bert
+  models for embeddings and reranking. No image or audio input.
+- It knows fifteen chat formats and does not interpret Jinja templates.
+- It reads one GGUF file per model. Models split across several files are
+  not loaded.
 - It is little-endian only, like the GGUF files themselves.
+
+[TODO.md](TODO.md) has the full list of what is left.

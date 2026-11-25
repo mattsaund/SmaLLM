@@ -3,6 +3,16 @@
 Each version is a `v` tag, with ready-made binaries and libraries on its
 [release page](https://github.com/mattsaund/SmaLLM/releases).
 
+## Unreleased
+
+- **Thread counts on ARM boards.** Physical cores are now told apart by the
+  CPUs that share them. Boards whose clusters number their cores from zero
+  (the Allwinner A733) were counted 6 cores short of 8, and read prompts
+  about 15 percent slower. Thread counts also follow the CPU affinity mask
+  now, so `taskset` limits them.
+- **`smallm rm` asks first**, as `uninstall` does. `--yes` skips the
+  question. `smallm list --help` and `smallm rm --help` work.
+
 ## 0.3.0 - 2026-11-24
 
 - **Prompt threads.** Prompts are read on every physical core, efficiency

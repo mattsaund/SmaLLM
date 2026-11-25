@@ -37,14 +37,19 @@ default binary stays small.
 
 ## Measurement
 
-- [ ] Speed and memory measured on ARM boards, starting with the RK3588. [DEVELOPMENT.md](DEVELOPMENT.md) says what
-      to measure first.
+- [x] Speed and memory measured on a first ARM board, the Allwinner A733. Results in
+      [DEVELOPMENT.md](DEVELOPMENT.md).
+- [x] Thread counts right on boards whose clusters number their cores from zero, and within the CPU affinity mask.
+- [ ] Llama 3.2 1B measured on a board, for the README's tables.
+- [ ] More boards: the RK3588 and the Raspberry Pi 5.
 - [ ] The model-by-model comparison in PARITY.md repeated on ARM, against llama.cpp built on the board.
 
 ## Hardware
 
 - [ ] GPUs, through Vulkan compute. It is the one API that reaches AMD, Intel and NVIDIA cards and the ARM GPUs in
-      phones and boards, so one backend covers them. The engine runs on the CPU only today.
+      phones and boards, so one backend covers them. The engine runs on the CPU only today. Board GPUs need 32-bit
+      storage fallbacks and small shared-memory tiles, and some (the A733's PowerVR) have less bandwidth than the
+      CPU, so they would not speed up generation.
 - [ ] Apple GPUs through Metal, and NVIDIA through CUDA, where they outperform Vulkan.
 - [ ] OpenCL, for the mobile GPUs llama.cpp reaches that way (Qualcomm Adreno).
 - [ ] NPUs. Every vendor has its own toolkit (Rockchip RKNN, Qualcomm QNN and Hexagon, Intel OpenVINO, Huawei CANN,
@@ -56,6 +61,9 @@ default binary stays small.
 - [ ] NEON kernels for 32-bit ARM, and vector kernels for RISC-V.
 - [ ] NEON kernels for the formats that have none: IQ1, IQ2, IQ3, TQ1_0, TQ2_0, Q2_K and Q3_K.
 - [ ] A model split across machines over the network, as llama.cpp's RPC backend does.
+- [ ] `--cpus`, to run on a chosen set of CPUs (one cluster) without `taskset`, as llama.cpp's `--cpu-range` does.
+- [ ] `--mlock`, opt-in, to keep the weights resident on boards with slow storage. On an SD card, pages dropped
+      under memory pressure are slow to read again.
 
 ## Models
 
@@ -96,12 +104,30 @@ default binary stays small.
 - [ ] Token probabilities in the output.
 - [ ] Speculative decoding: a small draft model, EAGLE3, and prompt lookup.
 - [ ] Saving a session's context to a file and loading it again.
-- [ ] An 8-bit and a 4-bit key/value cache, for long contexts.
-- [ ] Freeing the cache of sliding-window layers past their window (Gemma 2, Gemma 3, gpt-oss), as llama.cpp does.
+- [ ] An 8-bit and a 4-bit key/value cache, for long contexts. High value on boards.
+- [ ] Freeing the cache of sliding-window layers past their window (Gemma 2, Gemma 3, Gemma 4, gpt-oss), as
+      llama.cpp does. High value on boards: Gemma 4 style models keep 512-position windows in most layers.
+- [ ] Sampling defaults from the model file (`general.sampling.*`: temperature, top-k, top-p, min-p, repetition
+      penalty), below `smallm.conf` and the command line, as llama.cpp reads them.
+- [ ] A switch for thinking: `run --think on|off`, and `chat_template_kwargs.enable_thinking` and
+      `reasoning_effort` in the server, for the formats that support it (Qwen3, LFM3, SmolLM3, and gpt-oss's
+      reasoning level, fixed at medium today). On a board, a thinking model can spend tens of seconds before its
+      answer.
+- [ ] `--max-tokens` counting reasoning and answer tokens apart, so that a small limit does not end before the
+      answer begins.
 
 ## Speed
 
-Gaps the measurements in PARITY.md show.
+Gaps the measurements in PARITY.md and DEVELOPMENT.md show.
+
+- [ ] Q4_0 prompt reading on NEON with the dot product extension: 3.6 times slower than llama.cpp on the A733's
+      A76 cores (12.5 against 44.5 tokens per second). The matrix multiplies take 96 percent of the time, and the
+      batch size is not the cause. Rework the NEON tile kernel's register blocking (4 rows by 4 tokens of
+      accumulators, `sdot` by lane, as llama.cpp's Q4_0 GEMM does), or add an opt-in repack at load for boards
+      with memory to spare.
+- [ ] Q4_0 generation on NEON, 7 percent behind llama.cpp on the A733 although memory-bound.
+- [ ] The default prompt batch on ARM: 64 read 6 percent faster than 32 on the A733. Measure the scratch memory
+      first.
 
 - [ ] Prompt reading for mixtures of experts. DeepSeek reads prompts at 0.83x llama.cpp with the default batch of
       32 tokens, which leaves each of 64 experts about 3 tokens. A batch of 256 reads them 1.6 times as fast as
@@ -123,6 +149,7 @@ Gaps the measurements in PARITY.md show.
 - [ ] The Anthropic Messages API and the OpenAI Responses API.
 - [ ] Speech endpoints (transcription and text to speech), with the models above.
 - [ ] The Ollama API next to the OpenAI one, and several models loaded and unloaded on demand.
+- [ ] Sampling options on `serve`, as defaults for requests.
 - [ ] A built-in web page, and metrics.
 
 ## Tools
