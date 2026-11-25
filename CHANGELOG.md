@@ -5,10 +5,6 @@ Each version is a `v` tag, with ready-made binaries and libraries on its
 
 ## 0.4.0 - 2026-11-25
 
-- **Sizes.** The program is 0.89 to 1.40 MB depending on the platform
-  (0.82 to 1.26 in 0.3.0), and the shared library 0.70 to 0.96 MB, for
-  Inkling 2, three weight formats, six samplers and the NEON kernels below.
-
 - **Faster on ARM chips with the dot product extension** (Cortex-A55, A76
   and later, such as the Raspberry Pi 5 and the RK3588, Apple's M chips and
   AWS Graviton). Prompts: the tile kernel multiplies four vectors at once
@@ -74,8 +70,7 @@ Each version is a `v` tag, with ready-made binaries and libraries on its
   Intel Core i7-14700K, dense models read prompts up to 11 percent faster
   for 2 to 6 MB more scratch memory. The expert models read them about 44
   percent faster: DeepSeek-Coder-V2-Lite at 189 tokens per second against
-  llama.cpp's 162 (0.83 times llama.cpp before), for 44 MB. ARM keeps 32,
-  which was as fast as 64 on the Allwinner A733 and took 5 to 6 MB less.
+  llama.cpp's 162 (0.83 times llama.cpp before), for 44 MB.
 - **`--cpus`** runs on chosen CPUs, such as one cluster of a board, and the
   thread counts follow them. Linux and Android. The `cpus` setting does the
   same.
@@ -107,6 +102,9 @@ Each version is a `v` tag, with ready-made binaries and libraries on its
   the context again from its start.
 - **Word splitting** for the four families llama.cpp added since 0.3.0's
   reference: `inkling2`, `tekken-num3`, `soprano` and `zonos3` (71 in all).
+- **Sizes.** The program is 0.89 to 1.40 MB depending on the platform
+  (0.82 to 1.26 in 0.3.0), and the shared library 0.70 to 0.96 MB, with
+  Inkling 2, three weight formats, six samplers and the NEON kernels above.
 
 ## 0.3.0 - 2026-11-24
 
