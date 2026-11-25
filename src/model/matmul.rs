@@ -25,7 +25,7 @@ use std::slice;
 use std::time::{Duration, Instant};
 
 use crate::gguf::Mapping;
-use crate::kernels::{ActRef, Kernels, RowDot};
+use crate::kernels::{self, ActRef, Kernels, RowDot};
 use crate::tensor::quant::Tile;
 use crate::tensor::{Family, TensorType};
 use crate::threads::ThreadPool;
@@ -294,6 +294,7 @@ impl Job<'_> {
         let height = self.kernels.tile_rows();
         let acts = self.acts(plan.family);
         let dot = self.kernels.tile_dot();
+        let dot4 = self.kernels.tile_dot4();
         TILE.with_borrow_mut(|tile| {
             let mut row = rows.start;
             while row < rows.end {
@@ -309,9 +310,46 @@ impl Job<'_> {
                 };
                 self.kernels.fill_tile(tile, plan.ty, bytes, plan.row_bytes);
                 debug_assert_eq!(tile.cols, self.cols);
+                // The next tile's rows, asked for now so that they arrive
+                // while this tile meets every vector.
+                let next = (row + count)..rows.end.min(row + count + height);
+                if !next.is_empty() {
+                    // SAFETY: as for `bytes`, rows below `rows.end`.
+                    kernels::prefetch(unsafe {
+                        slice::from_raw_parts(
+                            plan.data.add(next.start * plan.row_bytes),
+                            next.len() * plan.row_bytes,
+                        )
+                    });
+                }
+                // Four vectors at a time when the backend has a kernel for
+                // that. It gives what four single calls would.
+                let mut first = 0;
+                if let Some(dot4) = dot4 {
+                    let mut results = [0.0f32; 4 * MAX_TILE_ROWS];
+                    while first + 4 <= plan.vectors {
+                        let index = |k: usize| plan.first_vector + first + k;
+                        let four = [0, 1, 2, 3].map(|k| acts.act(index(k), self.cols, group));
+                        let sums =
+                            [0, 1, 2, 3].map(|k| acts.scaled_sums(index(k), self.cols).as_ptr());
+                        // SAFETY: as for the single kernel below, for each of
+                        // the four vectors, and `results` has room for four
+                        // whole tiles.
+                        unsafe {
+                            dot4(tile, &four, &sums, group, results.as_mut_ptr());
+                            for k in 0..4 {
+                                let outputs = &results[k * height..k * height + count];
+                                for (r, value) in outputs.iter().enumerate() {
+                                    *plan.out.add((first + k) * plan.rows + row + r) = *value;
+                                }
+                            }
+                        }
+                        first += 4;
+                    }
+                }
                 let mut results = [0.0f32; MAX_TILE_ROWS];
-                let inputs = plan.first_vector..plan.first_vector + plan.vectors;
-                for (slot, index) in inputs.enumerate() {
+                let inputs = plan.first_vector + first..plan.first_vector + plan.vectors;
+                for (slot, index) in (first..).zip(inputs) {
                     let act = acts.act(index, self.cols, group);
                     let sums = acts.scaled_sums(index, self.cols).as_ptr();
                     // SAFETY: the tile and the activations both hold `cols`

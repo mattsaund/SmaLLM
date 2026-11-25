@@ -176,9 +176,9 @@ The difference grows with the weights llama.cpp repacks. On gpt-oss-20b
   16-bit floats. llama.cpp allocates the whole context window when the
   session starts. Memory scales with the tokens in the context, not with
   the configured window.
-- **Small working set.** Scratch buffers are sized for a 64-token batch on
-  x86 and 32 elsewhere, or 128 for models with experts. The vocabulary is
-  read from the mapped file.
+- **Small working set.** Scratch buffers are sized for a 64-token batch,
+  or 128 for models with experts. The vocabulary is read from the mapped
+  file.
   Logits are computed for the last token only.
 - **Per-architecture state.** DeepSeek's latent attention caches one
   compressed row per position and layer. Mamba and RWKV keep a fixed-size

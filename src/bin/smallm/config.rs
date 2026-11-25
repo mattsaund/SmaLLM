@@ -32,7 +32,7 @@ pub const SETTINGS: [(&str, &str, &str); 34] = [
         "batch",
         "auto",
         "Prompt tokens read together. More reads prompts faster and takes more memory.\n\
-         # auto: 64 on x86 and 32 elsewhere, or 128 for models with experts.",
+         # auto: 64, or 128 for models with experts.",
     ),
     (
         "cache-type",

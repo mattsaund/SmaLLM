@@ -21,15 +21,20 @@ use std::arch::aarch64::*;
 use std::arch::asm;
 
 use super::scalar;
-use super::{ActRef, DotQuant, Kernels, TileDot};
+use super::{ActRef, DotQuant, Kernels, TileDot, TileDot4};
 use crate::tensor::TensorType;
 use crate::tensor::quant::{self, Tile};
 
 /// Kernels for every AArch64 CPU.
-pub static KERNELS: Kernels = kernels("neon", row_quant_widening, tile_dot);
+pub static KERNELS: Kernels = kernels("neon", row_quant_widening, tile_dot, None);
 
 /// Kernels for CPUs with the dot product extension.
-pub static KERNELS_DOTPROD: Kernels = kernels("neon+dotprod", row_quant_sdot, tile_dot_sdot);
+pub static KERNELS_DOTPROD: Kernels = kernels(
+    "neon+dotprod",
+    row_quant_sdot,
+    tile_dot_sdot,
+    Some(tile_dot4_sdot),
+);
 
 /// Builds a kernel table. Only the kernels that multiply bytes differ
 /// between the two tables.
@@ -37,6 +42,7 @@ const fn kernels(
     name: &'static str,
     row_quant: fn(TensorType) -> DotQuant,
     tile_dot: TileDot,
+    tile_dot4: Option<TileDot4>,
 ) -> Kernels {
     Kernels {
         name,
@@ -58,7 +64,11 @@ const fn kernels(
         row_bf16,
         row_quant,
         tile_rows: 4,
+        // `sdot` multiplies signed bytes, so zero points come off the
+        // weights at fill time instead of costing an offset pass.
+        signed_tiles: true,
         tile_dot,
+        tile_dot4,
         tile_fill,
     }
 }
@@ -340,6 +350,36 @@ unsafe fn sdot(mut sum: int32x4_t, weights: int8x16_t, acts: int8x16_t) -> int32
     sum
 }
 
+/// The `sdot` instruction by element: multiplies the 16 bytes of `weights`
+/// with the four bytes in lane `LANE` of `acts`, repeated, and adds each
+/// group of four products to one 32-bit lane of `sum`. With a tile step of
+/// 4 columns of 4 rows in `weights` and a vector's 16 activations in
+/// `acts`, it is that step for the columns the lane holds.
+///
+/// Written in assembly because the intrinsic for it is newer than the
+/// oldest compiler this crate supports.
+#[inline]
+#[target_feature(enable = "dotprod")]
+unsafe fn sdot_lane<const LANE: i32>(
+    mut sum: int32x4_t,
+    weights: int8x16_t,
+    acts: int8x16_t,
+) -> int32x4_t {
+    // SAFETY: the instruction only touches the three registers it is given,
+    // and this function enables the extension it belongs to.
+    unsafe {
+        asm!(
+            "sdot {sum:v}.4s, {weights:v}.16b, {acts:v}.4b[{lane}]",
+            sum = inout(vreg) sum,
+            weights = in(vreg) weights,
+            acts = in(vreg) acts,
+            lane = const LANE,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+    sum
+}
+
 /// See [`TileDot`], for tiles of 4 rows.
 ///
 /// A step loads 4 columns of all 4 rows, 16 bytes, and multiplies them with
@@ -362,6 +402,30 @@ unsafe fn tile_rows<D: ByteDot>(
     // groups of `group`, their scaled sums when the tile has offsets, and
     // room for 4 outputs. Every index below stays inside those sizes.
     unsafe {
+        if tile.pairs {
+            // Sub-blocks share their scales in pairs: 32 columns are summed
+            // as integers and scaled once, with the weight and activation
+            // scales multiplied first. `tile_dot4_sdot` does the same.
+            let mut total = vdupq_n_f32(0.0);
+            for pair in 0..tile.cols / 32 {
+                let mut sums = vdupq_n_s32(0);
+                for step in pair * 8..pair * 8 + 8 {
+                    let weights = vld1q_s8(q.add(step * 16));
+                    let four = (act.q.add(step * 4) as *const u32).read_unaligned();
+                    sums = D::add_lanes(sums, weights, vreinterpretq_s8_u32(vdupq_n_u32(four)));
+                }
+                let scales = vmulq_n_f32(
+                    vld1q_f32(scale.add(pair * 8)),
+                    *act.scale.add(pair * 32 / group),
+                );
+                total = vfmaq_f32(total, vcvtq_f32_s32(sums), scales);
+            }
+            if tile.has_offset {
+                total = vaddq_f32(total, offset_terms(subs, offset, scaled_sums));
+            }
+            vst1q_f32(out, total);
+            return;
+        }
         let mut total = vdupq_n_f32(0.0);
         let mut sub = 0;
         for g in 0..tile.cols / group {
@@ -378,22 +442,196 @@ unsafe fn tile_rows<D: ByteDot>(
             total = vfmaq_n_f32(total, vaddq_f32(even, odd), *act.scale.add(g));
         }
         if tile.has_offset {
-            // Four accumulators, for the same reason. `subs` is a multiple
-            // of two, and the loop takes the sub-blocks in pairs.
-            let mut terms = [vdupq_n_f32(0.0); 4];
-            let mut sub = 0;
-            while sub < subs {
-                for lane in 0..2 {
-                    let offsets = vld1q_f32(offset.add((sub + lane) * 4));
-                    let at = (sub & 2) + lane;
-                    terms[at] = vfmaq_n_f32(terms[at], offsets, *scaled_sums.add(sub + lane));
-                }
-                sub += 2;
-            }
-            let terms = vaddq_f32(vaddq_f32(terms[0], terms[1]), vaddq_f32(terms[2], terms[3]));
-            total = vaddq_f32(total, terms);
+            total = vaddq_f32(total, offset_terms(subs, offset, scaled_sums));
         }
         vst1q_f32(out, total);
+    }
+}
+
+/// The offset part of a tile's 4 outputs for one vector: each sub-block's
+/// offsets times the vector's scaled sum for it. Four accumulators, so that
+/// no addition waits for the one before. `subs` is a multiple of two, and
+/// the loop takes the sub-blocks in pairs.
+#[inline(always)]
+unsafe fn offset_terms(subs: usize, offset: *const f32, scaled_sums: *const f32) -> float32x4_t {
+    // SAFETY: the caller guarantees `subs * 4` offsets and `subs` scaled
+    // sums.
+    unsafe {
+        let mut terms = [vdupq_n_f32(0.0); 4];
+        let mut sub = 0;
+        while sub < subs {
+            for lane in 0..2 {
+                let offsets = vld1q_f32(offset.add((sub + lane) * 4));
+                let at = (sub & 2) + lane;
+                terms[at] = vfmaq_n_f32(terms[at], offsets, *scaled_sums.add(sub + lane));
+            }
+            sub += 2;
+        }
+        vaddq_f32(vaddq_f32(terms[0], terms[1]), vaddq_f32(terms[2], terms[3]))
+    }
+}
+
+/// See [`TileDot4`], for tiles of 4 rows and CPUs with the dot product
+/// extension.
+///
+/// The one-vector kernel repeats 4 activation bytes in every lane of a
+/// register for each step, so a weight load serves one vector, and every
+/// `sdot` waits on a load and a broadcast. Here a load of 16 activations
+/// serves the 4 steps of a sub-block through `sdot` by element, and each
+/// step's weights serve all four vectors. The sums are scaled and added in
+/// the same order as in [`tile_rows`], so each vector's results are exactly
+/// that kernel's.
+#[target_feature(enable = "dotprod")]
+unsafe fn tile_dot4_sdot(
+    tile: &Tile,
+    acts: &[ActRef; 4],
+    scaled_sums: &[*const f32; 4],
+    group: usize,
+    out: *mut f32,
+) {
+    debug_assert_eq!(tile.height, 4);
+    let subs = tile.cols / 16;
+    let (q, scale, offset) = (tile.q.as_ptr(), tile.scale.as_ptr(), tile.offset.as_ptr());
+    // SAFETY: as in `tile_rows`, for each of the four vectors, and `out`
+    // has room for 4 outputs per vector.
+    unsafe {
+        if tile.pairs {
+            // As in `tile_rows`: 32 columns summed as integers, then scaled
+            // once. That is three operations per vector besides the eight
+            // `sdot`s, where scaling every 16 columns took six.
+            let mut total = [vdupq_n_f32(0.0); 4];
+            for pair in 0..tile.cols / 32 {
+                let sums = pair_sums4(q, acts, pair);
+                let weight_scales = vld1q_f32(scale.add(pair * 8));
+                for (vector, total) in total.iter_mut().enumerate() {
+                    let act_scale = *acts[vector].scale.add(pair * 32 / group);
+                    let scales = vmulq_n_f32(weight_scales, act_scale);
+                    *total = vfmaq_f32(*total, vcvtq_f32_s32(sums[vector]), scales);
+                }
+            }
+            for (vector, total) in total.into_iter().enumerate() {
+                let total = if tile.has_offset {
+                    vaddq_f32(total, offset_terms(subs, offset, scaled_sums[vector]))
+                } else {
+                    total
+                };
+                vst1q_f32(out.add(4 * vector), total);
+            }
+            return;
+        }
+        let mut total = [vdupq_n_f32(0.0); 4];
+        let mut sub = 0;
+        for g in 0..tile.cols / group {
+            let mut even = [vdupq_n_f32(0.0); 4];
+            let mut odd = [vdupq_n_f32(0.0); 4];
+            for _ in 0..group / 32 {
+                sub_block_pair4(&mut even, &mut odd, q, scale, acts, sub);
+                sub += 2;
+            }
+            for (vector, total) in total.iter_mut().enumerate() {
+                let both = vaddq_f32(even[vector], odd[vector]);
+                *total = vfmaq_n_f32(*total, both, *acts[vector].scale.add(g));
+            }
+        }
+        for (vector, total) in total.into_iter().enumerate() {
+            let total = if tile.has_offset {
+                vaddq_f32(total, offset_terms(subs, offset, scaled_sums[vector]))
+            } else {
+                total
+            };
+            vst1q_f32(out.add(4 * vector), total);
+        }
+    }
+}
+
+/// The integer sums of 32 columns, sub-blocks `2 * pair` and the next, for
+/// each row and each of four vectors.
+///
+/// Each vector's sum is one chain of eight `sdot`s. On a Cortex-A76 the
+/// accumulator is forwarded, so a dependent `sdot` starts the cycle after
+/// the one before, and four chains keep both pipes busy. Two chains per
+/// vector, added at the end, measured slower.
+#[inline(always)]
+unsafe fn pair_sums4(q: *const i8, acts: &[ActRef; 4], pair: usize) -> [int32x4_t; 4] {
+    // SAFETY: the caller guarantees the tile and every vector's activations
+    // cover the pair, and that the CPU has the dot product extension.
+    unsafe {
+        let sub = pair * 2;
+        let values = |half: usize| {
+            [0, 1, 2, 3].map(|vector| vld1q_s8(acts[vector].q.add((sub + half) * 16)))
+        };
+        let (first, second) = (values(0), values(1));
+        let mut sums = [vdupq_n_s32(0); 4];
+        let weights = |half: usize, k: usize| vld1q_s8(q.add(((sub + half) * 4 + k) * 16));
+        // One step of one sub-block for every vector. The lane is a constant
+        // of the instruction, so the steps are written out.
+        macro_rules! step {
+            ($half:literal, $values:ident, $k:literal) => {
+                let weights = weights($half, $k);
+                for vector in 0..4 {
+                    sums[vector] = sdot_lane::<$k>(sums[vector], weights, $values[vector]);
+                }
+            };
+        }
+        step!(0, first, 0);
+        step!(0, first, 1);
+        step!(0, first, 2);
+        step!(0, first, 3);
+        step!(1, second, 0);
+        step!(1, second, 1);
+        step!(1, second, 2);
+        step!(1, second, 3);
+        sums
+    }
+}
+
+/// Two sub-blocks for four vectors: the sums of 32 columns for each row and
+/// vector, scaled and added, the even sub-block's to `even` and the odd
+/// one's to `odd`, as [`sub_block`] adds them. Each sub-block has its own
+/// scales, so each vector keeps one sum per sub-block.
+#[inline(always)]
+unsafe fn sub_block_pair4(
+    even: &mut [float32x4_t; 4],
+    odd: &mut [float32x4_t; 4],
+    q: *const i8,
+    scale: *const f32,
+    acts: &[ActRef; 4],
+    sub: usize,
+) {
+    // SAFETY: the caller guarantees the tile and every vector's activations
+    // cover sub-blocks `sub` and `sub + 1`, and that the CPU has the dot
+    // product extension.
+    unsafe {
+        let values = |half: usize| {
+            [0, 1, 2, 3].map(|vector| vld1q_s8(acts[vector].q.add((sub + half) * 16)))
+        };
+        let (first, second) = (values(0), values(1));
+        let mut sums = [[vdupq_n_s32(0); 2]; 4];
+        let weights = |half: usize, k: usize| vld1q_s8(q.add(((sub + half) * 4 + k) * 16));
+        // One step of both sub-blocks for every vector: eight independent
+        // chains. The lane is a constant of the instruction, so the four
+        // steps are written out.
+        macro_rules! step {
+            ($k:literal) => {
+                let (low, high) = (weights(0, $k), weights(1, $k));
+                for vector in 0..4 {
+                    sums[vector][0] = sdot_lane::<$k>(sums[vector][0], low, first[vector]);
+                    sums[vector][1] = sdot_lane::<$k>(sums[vector][1], high, second[vector]);
+                }
+            };
+        }
+        step!(0);
+        step!(1);
+        step!(2);
+        step!(3);
+        let (low, high) = (
+            vld1q_f32(scale.add(sub * 4)),
+            vld1q_f32(scale.add((sub + 1) * 4)),
+        );
+        for vector in 0..4 {
+            even[vector] = vfmaq_f32(even[vector], vcvtq_f32_s32(sums[vector][0]), low);
+            odd[vector] = vfmaq_f32(odd[vector], vcvtq_f32_s32(sums[vector][1]), high);
+        }
     }
 }
 
@@ -465,10 +703,33 @@ struct Block {
 trait Block32 {
     /// Bytes in one block.
     const BYTES: usize;
-    /// True when blocks carry an offset. The others skip that term.
+    /// True when blocks carry an offset. The others skip that term. Every
+    /// such format stores it as a half-precision float after the scale.
     const HAS_OFFSET: bool;
-    /// Unpacks the block at `p`.
-    unsafe fn load(p: *const u8) -> Block;
+    /// The bias every weight is stored with, which [`Block32::load_raw`]
+    /// leaves in. Zero for the formats stored without one.
+    const BIAS: i8 = 0;
+    /// True when the block starts with its scale as a half-precision float.
+    const HALF_SCALE: bool = true;
+    /// Unpacks the block at `p`, with the bias left in the weights.
+    unsafe fn load_raw(p: *const u8) -> Block;
+    /// Unpacks the block at `p`, with the bias removed.
+    #[inline(always)]
+    unsafe fn load(p: *const u8) -> Block {
+        // SAFETY: forwarded contract. NEON is always present on AArch64.
+        unsafe {
+            let block = Self::load_raw(p);
+            if Self::BIAS == 0 {
+                return block;
+            }
+            let bias = vdupq_n_s8(Self::BIAS);
+            Block {
+                low: vsubq_s8(block.low, bias),
+                high: vsubq_s8(block.high, bias),
+                ..block
+            }
+        }
+    }
 }
 
 /// Splits 16 bytes at `p` into their low and high nibbles.
@@ -516,7 +777,7 @@ impl Block32 for Iq4Nl {
     const BYTES: usize = 18;
     const HAS_OFFSET: bool = false;
     #[inline(always)]
-    unsafe fn load(p: *const u8) -> Block {
+    unsafe fn load_raw(p: *const u8) -> Block {
         // SAFETY: the caller guarantees an 18-byte block at `p`.
         unsafe {
             let (low, high) = nibbles(p.add(2));
@@ -533,8 +794,9 @@ impl Block32 for Iq4Nl {
 impl Block32 for Mxfp4 {
     const BYTES: usize = 17;
     const HAS_OFFSET: bool = false;
+    const HALF_SCALE: bool = false;
     #[inline(always)]
-    unsafe fn load(p: *const u8) -> Block {
+    unsafe fn load_raw(p: *const u8) -> Block {
         // SAFETY: the caller guarantees a 17-byte block at `p`.
         unsafe {
             let (low, high) = nibbles(p.add(1));
@@ -551,16 +813,15 @@ impl Block32 for Mxfp4 {
 impl Block32 for Q4_0 {
     const BYTES: usize = 18;
     const HAS_OFFSET: bool = false;
+    const BIAS: i8 = 8;
     #[inline(always)]
-    unsafe fn load(p: *const u8) -> Block {
+    unsafe fn load_raw(p: *const u8) -> Block {
         // SAFETY: the caller guarantees an 18-byte block at `p`.
         unsafe {
-            // Stored with a bias of 8, removed here so no offset is needed.
             let (low, high) = nibbles(p.add(2));
-            let bias = vdupq_n_s8(8);
             Block {
-                low: vsubq_s8(vreinterpretq_s8_u8(low), bias),
-                high: vsubq_s8(vreinterpretq_s8_u8(high), bias),
+                low: vreinterpretq_s8_u8(low),
+                high: vreinterpretq_s8_u8(high),
                 scale: half(p),
                 offset: 0.0,
             }
@@ -572,7 +833,7 @@ impl Block32 for Q4_1 {
     const BYTES: usize = 20;
     const HAS_OFFSET: bool = true;
     #[inline(always)]
-    unsafe fn load(p: *const u8) -> Block {
+    unsafe fn load_raw(p: *const u8) -> Block {
         // SAFETY: the caller guarantees a 20-byte block at `p`.
         unsafe {
             let (low, high) = nibbles(p.add(4));
@@ -589,18 +850,17 @@ impl Block32 for Q4_1 {
 impl Block32 for Q5_0 {
     const BYTES: usize = 22;
     const HAS_OFFSET: bool = false;
+    const BIAS: i8 = 16;
     #[inline(always)]
-    unsafe fn load(p: *const u8) -> Block {
+    unsafe fn load_raw(p: *const u8) -> Block {
         // SAFETY: the caller guarantees a 22-byte block at `p`.
         unsafe {
-            // Stored with a bias of 16, removed here so no offset is needed.
             let (low, high) = nibbles(p.add(6));
             let low = vorrq_u8(low, fifth_bits(p.add(2)));
             let high = vorrq_u8(high, fifth_bits(p.add(4)));
-            let bias = vdupq_n_s8(16);
             Block {
-                low: vsubq_s8(vreinterpretq_s8_u8(low), bias),
-                high: vsubq_s8(vreinterpretq_s8_u8(high), bias),
+                low: vreinterpretq_s8_u8(low),
+                high: vreinterpretq_s8_u8(high),
                 scale: half(p),
                 offset: 0.0,
             }
@@ -612,7 +872,7 @@ impl Block32 for Q5_1 {
     const BYTES: usize = 24;
     const HAS_OFFSET: bool = true;
     #[inline(always)]
-    unsafe fn load(p: *const u8) -> Block {
+    unsafe fn load_raw(p: *const u8) -> Block {
         // SAFETY: the caller guarantees a 24-byte block at `p`.
         unsafe {
             let (low, high) = nibbles(p.add(8));
@@ -632,7 +892,7 @@ impl Block32 for Q8_0 {
     const BYTES: usize = 34;
     const HAS_OFFSET: bool = false;
     #[inline(always)]
-    unsafe fn load(p: *const u8) -> Block {
+    unsafe fn load_raw(p: *const u8) -> Block {
         // SAFETY: the caller guarantees a 34-byte block at `p`.
         unsafe {
             Block {
@@ -649,38 +909,142 @@ impl Block32 for Q8_0 {
 ///
 /// The dot product of one block is
 /// `scale * act_scale * sum(w * a) + offset * act_scale * sum(a)`.
-/// The last factor is precomputed per block as `act.wsum`. Blocks alternate
-/// between two accumulators so consecutive blocks do not wait on each other.
+/// The last factor is precomputed per block as `act.wsum`.
+///
+/// Generating multiplies every row by one vector, so what a block costs
+/// besides its products, its scale and its sum, decides the speed. Four
+/// blocks are taken at a time. Their integer sums are added pairwise into
+/// one register, one block per lane, their four scales are gathered and
+/// converted together, and a single convert and multiply-add scales all
+/// four. A format's bias stays in the weights and comes out exactly, in
+/// integers, through the activations' sums.
+///
+/// The row is read from start to end. That keeps the memory access a single
+/// stream, which the hardware prefetcher follows far better than several
+/// rows at once: on a Cortex-A76, four rows read together ran 20 to 50
+/// percent slower from memory than one, although faster from the cache.
 #[inline(always)]
 unsafe fn block_row<F: Block32, D: ByteDot>(row: *const u8, n: usize, act: ActRef) -> f32 {
     let blocks = n / 32;
     // SAFETY: the caller guarantees `row` holds `blocks` blocks and `act`
-    // describes `n` quantized activations.
+    // describes `n` quantized activations, with a sum for every 16.
     unsafe {
-        let mut acc = [vdupq_n_f32(0.0), vdupq_n_f32(0.0)];
-        let mut correction = [0.0f32, 0.0];
-        let mut b = 0;
-        while b < blocks {
-            for lane in 0..2 {
-                if b + lane >= blocks {
-                    break;
-                }
-                let index = b + lane;
-                let block = F::load(row.add(index * F::BYTES));
-                let acts_low = vld1q_s8(act.q.add(index * 32));
-                let acts_high = vld1q_s8(act.q.add(index * 32 + 16));
-                let products = D::add_products(vdupq_n_s32(0), block.low, acts_low);
-                let products = D::add_products(products, block.high, acts_high);
-                let scale = block.scale * *act.scale.add(index);
-                acc[lane] = vfmaq_n_f32(acc[lane], vcvtq_f32_s32(products), scale);
-                if F::HAS_OFFSET {
-                    correction[lane] += block.offset * *act.wsum.add(index);
-                }
-            }
-            b += 2;
+        // Two groups of four blocks per step, each with its own sums, give
+        // the core independent work to overlap: the path from a block's load
+        // to its multiply-add is long.
+        let mut acc = [vdupq_n_f32(0.0); 2];
+        let mut correction = [vdupq_n_f32(0.0); 2];
+        let mut index = 0;
+        while index + 8 <= blocks {
+            four_blocks::<F, D>(row, act, index, &mut acc[0], &mut correction[0]);
+            four_blocks::<F, D>(row, act, index + 4, &mut acc[1], &mut correction[1]);
+            index += 8;
         }
-        vaddvq_f32(vaddq_f32(acc[0], acc[1])) + (correction[0] + correction[1])
+        if index + 4 <= blocks {
+            four_blocks::<F, D>(row, act, index, &mut acc[0], &mut correction[0]);
+            index += 4;
+        }
+        let acc = vaddq_f32(acc[0], acc[1]);
+        let correction = vaddq_f32(correction[0], correction[1]);
+        // The last blocks one at a time, the bias taken out of the weights.
+        let mut tail = vdupq_n_f32(0.0);
+        let mut tail_correction = 0.0f32;
+        while index < blocks {
+            let block = F::load(row.add(index * F::BYTES));
+            let values = act.q.add(index * 32);
+            let products = D::add_products(vdupq_n_s32(0), block.low, vld1q_s8(values));
+            let products = D::add_products(products, block.high, vld1q_s8(values.add(16)));
+            let scale = block.scale * *act.scale.add(index);
+            tail = vfmaq_n_f32(tail, vcvtq_f32_s32(products), scale);
+            if F::HAS_OFFSET {
+                tail_correction += block.offset * *act.wsum.add(index);
+            }
+            index += 1;
+        }
+        vaddvq_f32(vaddq_f32(vaddq_f32(acc, correction), tail)) + tail_correction
     }
+}
+
+/// Blocks `index` to `index + 3` of a row, for [`block_row`]: adds their
+/// scaled products to `acc`, one block per lane, and the offset terms of
+/// formats with offsets to `correction`.
+#[inline(always)]
+unsafe fn four_blocks<F: Block32, D: ByteDot>(
+    row: *const u8,
+    act: ActRef,
+    index: usize,
+    acc: &mut float32x4_t,
+    correction: &mut float32x4_t,
+) {
+    // SAFETY: the caller guarantees the four blocks, their activations and
+    // the activations' sums.
+    unsafe {
+        let at = [0, 1, 2, 3].map(|k| row.add((index + k) * F::BYTES));
+        let mut sums = [vdupq_n_s32(0); 4];
+        let mut scales = [0.0f32; 4];
+        for k in 0..4 {
+            let block = F::load_raw(at[k]);
+            let values = act.q.add((index + k) * 32);
+            let low = D::add_products(vdupq_n_s32(0), block.low, vld1q_s8(values));
+            sums[k] = D::add_products(low, block.high, vld1q_s8(values.add(16)));
+            scales[k] = block.scale;
+        }
+        // Lane `k` is block `k`'s sum.
+        let mut total = vpaddq_s32(vpaddq_s32(sums[0], sums[1]), vpaddq_s32(sums[2], sums[3]));
+        if F::BIAS != 0 {
+            // Each block's activation sum, from the sums of its halves.
+            let act_sums = vpaddlq_s16(vld1q_s16(act.sums.add(index * 2)));
+            total = vmlsq_n_s32(total, act_sums, i32::from(F::BIAS));
+        }
+        let weight_scales = if F::HALF_SCALE {
+            halves4(at)
+        } else {
+            vld1q_f32(scales.as_ptr())
+        };
+        let scales = vmulq_f32(weight_scales, vld1q_f32(act.scale.add(index)));
+        *acc = vfmaq_f32(*acc, vcvtq_f32_s32(total), scales);
+        if F::HAS_OFFSET {
+            let offsets = halves4(at.map(|p| p.add(2)));
+            *correction = vfmaq_f32(*correction, offsets, vld1q_f32(act.wsum.add(index)));
+        }
+    }
+}
+
+/// The half-precision floats at four addresses, converted together.
+///
+/// The four are loaded into general registers and combined there, then
+/// moved across once. Loading them into the lanes of one vector register
+/// instead makes each load wait for the one before, and costs the vector
+/// pipes three more operations.
+#[inline(always)]
+unsafe fn halves4(p: [*const u8; 4]) -> float32x4_t {
+    let value: float32x4_t;
+    // SAFETY: the caller guarantees two readable bytes at each address. The
+    // assembly writes only the registers it is given.
+    unsafe {
+        asm!(
+            "ldrh {a:w}, [{p0}]",
+            "ldrh {b:w}, [{p1}]",
+            "ldrh {c:w}, [{p2}]",
+            "ldrh {d:w}, [{p3}]",
+            "orr {a}, {a}, {b}, lsl #16",
+            "orr {c}, {c}, {d}, lsl #16",
+            "orr {a}, {a}, {c}, lsl #32",
+            "fmov {v:d}, {a}",
+            "fcvtl {v:v}.4s, {v:v}.4h",
+            p0 = in(reg) p[0],
+            p1 = in(reg) p[1],
+            p2 = in(reg) p[2],
+            p3 = in(reg) p[3],
+            a = out(reg) _,
+            b = out(reg) _,
+            c = out(reg) _,
+            d = out(reg) _,
+            v = out(vreg) value,
+            options(pure, readonly, nostack, preserves_flags),
+        );
+    }
+    value
 }
 
 // ---------------------------------------------------------------------------
@@ -1008,7 +1372,6 @@ unsafe fn q6_k_row<D: ByteDot>(row: *const u8, n: usize, act: ActRef) -> f32 {
     let mut total = 0.0f32;
     // SAFETY: as in `q4_k_row`.
     unsafe {
-        let low_nibble = vdupq_n_u8(0x0f);
         let two_bits = vdupq_n_u8(3);
         for sb in 0..n / 256 {
             let p = row.add(sb * BLOCK_BYTES);
@@ -1027,41 +1390,46 @@ unsafe fn q6_k_row<D: ByteDot>(row: *const u8, n: usize, act: ActRef) -> f32 {
             bias = vmlal_high_s16(bias, scales_high, sums_high);
             let mut sum = vnegq_s32(vshlq_n_s32::<5>(bias));
 
-            for half_index in 0..2 {
-                for side in 0..2 {
+            // The sub-block scales as 32-bit lanes, in the order the loop
+            // below sums its sub-blocks: one register for each half and
+            // side, holding the even or the odd sub-blocks of that half.
+            let even = vmovl_s8(vget_low_s8(vuzp1q_s8(scale_bytes, scale_bytes)));
+            let odd = vmovl_s8(vget_low_s8(vuzp2q_s8(scale_bytes, scale_bytes)));
+            let scales = [
+                [vmovl_s16(vget_low_s16(even)), vmovl_s16(vget_low_s16(odd))],
+                [vmovl_high_s16(even), vmovl_high_s16(odd)],
+            ];
+            let high_bits = vdupq_n_u8(0x30);
+
+            for (half_index, scales) in scales.into_iter().enumerate() {
+                for (side, scales) in scales.into_iter().enumerate() {
                     // Each register is one sub-block of 16 weights. A value
                     // takes a nibble from `first` or `second` and two more
-                    // bits from `high`.
+                    // bits from `high`, merged by shifts that insert: `sli`
+                    // keeps the low nibble of its first operand, `sri` the
+                    // high one.
                     let first = vld1q_u8(p.add(half_index * 64 + side * 16));
                     let second = vld1q_u8(p.add(half_index * 64 + 32 + side * 16));
                     let high = vld1q_u8(p.add(128 + half_index * 32 + side * 16));
                     let values = [
-                        vorrq_u8(
-                            vandq_u8(first, low_nibble),
-                            vshlq_n_u8::<4>(vandq_u8(high, two_bits)),
-                        ),
-                        vorrq_u8(
-                            vandq_u8(second, low_nibble),
-                            vshlq_n_u8::<4>(vandq_u8(vshrq_n_u8::<2>(high), two_bits)),
-                        ),
-                        vorrq_u8(
-                            vshrq_n_u8::<4>(first),
-                            vshlq_n_u8::<4>(vandq_u8(vshrq_n_u8::<4>(high), two_bits)),
-                        ),
-                        vorrq_u8(
-                            vshrq_n_u8::<4>(second),
-                            vshlq_n_u8::<4>(vshrq_n_u8::<6>(high)),
-                        ),
+                        vsliq_n_u8::<4>(first, vandq_u8(high, two_bits)),
+                        vsliq_n_u8::<4>(second, vandq_u8(vshrq_n_u8::<2>(high), two_bits)),
+                        vsriq_n_u8::<4>(vandq_u8(high, high_bits), first),
+                        vsriq_n_u8::<4>(vandq_u8(vshrq_n_u8::<2>(high), high_bits), second),
                     ];
-                    for (run, value) in values.into_iter().enumerate() {
+                    // Run `run` holds sub-block `half_index * 8 + run * 2 +
+                    // side`. The four sums are added across their lanes
+                    // into one register, one sub-block per lane, and scaled
+                    // with one multiply-add, which keeps the chain through
+                    // `sum` four long instead of sixteen.
+                    let sums = [0, 1, 2, 3].map(|run| {
                         let sub = half_index * 8 + run * 2 + side;
-                        let products = D::add_products(
-                            vdupq_n_s32(0),
-                            vreinterpretq_s8_u8(value),
-                            vld1q_s8(acts.add(sub * 16)),
-                        );
-                        sum = vmlaq_n_s32(sum, products, *p.add(192 + sub) as i8 as i32);
-                    }
+                        let value = vreinterpretq_s8_u8(values[run]);
+                        D::add_products(vdupq_n_s32(0), value, vld1q_s8(acts.add(sub * 16)))
+                    });
+                    let totals =
+                        vpaddq_s32(vpaddq_s32(sums[0], sums[1]), vpaddq_s32(sums[2], sums[3]));
+                    sum = vmlaq_s32(sum, totals, scales);
                 }
             }
             total += d * vaddvq_s32(sum) as f32;
@@ -1139,12 +1507,12 @@ unsafe fn tile_fill(tile: &mut Tile, ty: TensorType, height: usize, data: &[u8],
         TensorType::Q5K => fill_k4::<true>,
         TensorType::Q6K => fill_q6_k,
         TensorType::Iq4Xs => fill_iq4_xs,
-        _ => return tile.fill(ty, height, data, row_bytes),
+        _ => return tile.fill_signed(ty, height, data, row_bytes),
     };
     if height != 4 {
-        return tile.fill(ty, height, data, row_bytes);
+        return tile.fill_signed(ty, height, data, row_bytes);
     }
-    tile.prepare(ty, 4, row_bytes);
+    tile.prepare(ty, 4, row_bytes, true);
     // Rows the tile lacks are read from a row of zeros, which decodes to
     // weights of zero in each of these formats, and then cleared: in some
     // formats zeros stand for other integers times a scale of zero.
@@ -1181,14 +1549,17 @@ unsafe fn transpose(rows: [uint32x4_t; 4]) -> [uint32x4_t; 4] {
 }
 
 /// Writes 16 columns of a tile: `weights[r]` holds those columns of row `r`.
+///
+/// Step `k` of the tile holds columns `4k` to `4k + 3` of each row, which is
+/// lane `k` of each row's register as four 32-bit lanes. `st4` stores four
+/// registers interleaved lane by lane, which is that layout, so one
+/// instruction does what a transpose and four stores did.
 #[inline(always)]
 unsafe fn store_columns(q: *mut i8, weights: [uint8x16_t; 4]) {
     // SAFETY: the caller guarantees room for 4 steps of 16 bytes at `q`.
     unsafe {
-        let lanes = transpose(weights.map(|row| vreinterpretq_u32_u8(row)));
-        for (step, lanes) in lanes.into_iter().enumerate() {
-            vst1q_u8(q.add(step * 16) as *mut u8, vreinterpretq_u8_u32(lanes));
-        }
+        let [first, second, third, fourth] = weights.map(|row| vreinterpretq_u32_u8(row));
+        vst4q_u32(q as *mut u32, uint32x4x4_t(first, second, third, fourth));
     }
 }
 
@@ -1219,26 +1590,28 @@ unsafe fn nonzero(values: float32x4_t) -> uint32x4_t {
     unsafe { vmvnq_u32(vceqq_f32(values, vdupq_n_f32(0.0))) }
 }
 
-/// A format with 32-weight blocks, the way a tile stores it: weights that
-/// are zero or more wherever the format allows, and the bias that took.
+/// A format with 32-weight blocks, decoded for a tile: the stored weights,
+/// and the zero point to take off them.
 trait TileBlock {
     /// Bytes in one block.
     const BYTES: usize;
-    /// What was added to the weights to make them non-negative.
-    const BIAS: f32;
+    /// What the format adds to its weights to store them. Taken off, the
+    /// weights are signed, as the tile keeps them.
+    const BIAS: u8;
     /// The first and the last 16 weights of the block at `p`.
     unsafe fn weights(p: *const u8) -> (uint8x16_t, uint8x16_t);
-    /// The scale of the block at `p`. Most formats start with a half float.
+    /// The scales of the blocks at four addresses, one per lane. Most
+    /// formats start with a half float.
     #[inline(always)]
-    unsafe fn scale(p: *const u8) -> f32 {
-        // SAFETY: the caller guarantees a whole block at `p`.
-        unsafe { half(p) }
+    unsafe fn scales(at: [*const u8; 4]) -> float32x4_t {
+        // SAFETY: the caller guarantees a whole block at each address.
+        unsafe { halves4(at) }
     }
 }
 
 impl TileBlock for Iq4Nl {
     const BYTES: usize = 18;
-    const BIAS: f32 = 0.0;
+    const BIAS: u8 = 0;
     #[inline(always)]
     unsafe fn weights(p: *const u8) -> (uint8x16_t, uint8x16_t) {
         // SAFETY: the caller guarantees an 18-byte block at `p`.
@@ -1254,7 +1627,7 @@ impl TileBlock for Iq4Nl {
 
 impl TileBlock for Mxfp4 {
     const BYTES: usize = 17;
-    const BIAS: f32 = 0.0;
+    const BIAS: u8 = 0;
     #[inline(always)]
     unsafe fn weights(p: *const u8) -> (uint8x16_t, uint8x16_t) {
         // SAFETY: the caller guarantees a 17-byte block at `p`.
@@ -1267,16 +1640,16 @@ impl TileBlock for Mxfp4 {
         }
     }
     #[inline(always)]
-    unsafe fn scale(p: *const u8) -> f32 {
-        // SAFETY: the caller guarantees a 17-byte block at `p`, which starts
-        // with its exponent.
-        quant::e8m0_half(unsafe { *p })
+    unsafe fn scales(at: [*const u8; 4]) -> float32x4_t {
+        // SAFETY: the caller guarantees a 17-byte block at each address,
+        // which starts with its exponent.
+        unsafe { vld1q_f32(at.map(|p| quant::e8m0_half(*p)).as_ptr()) }
     }
 }
 
 impl TileBlock for Q4_0 {
     const BYTES: usize = 18;
-    const BIAS: f32 = 8.0;
+    const BIAS: u8 = 8;
     #[inline(always)]
     unsafe fn weights(p: *const u8) -> (uint8x16_t, uint8x16_t) {
         // SAFETY: the caller guarantees an 18-byte block at `p`.
@@ -1286,7 +1659,7 @@ impl TileBlock for Q4_0 {
 
 impl TileBlock for Q5_0 {
     const BYTES: usize = 22;
-    const BIAS: f32 = 16.0;
+    const BIAS: u8 = 16;
     #[inline(always)]
     unsafe fn weights(p: *const u8) -> (uint8x16_t, uint8x16_t) {
         // SAFETY: the caller guarantees a 22-byte block at `p`.
@@ -1302,7 +1675,7 @@ impl TileBlock for Q5_0 {
 
 impl TileBlock for Q8_0 {
     const BYTES: usize = 34;
-    const BIAS: f32 = 0.0;
+    const BIAS: u8 = 0;
     #[inline(always)]
     unsafe fn weights(p: *const u8) -> (uint8x16_t, uint8x16_t) {
         // SAFETY: the caller guarantees a 34-byte block at `p`.
@@ -1318,30 +1691,36 @@ unsafe fn fill_block32<F: TileBlock>(tile: &mut Tile, rows: [*const u8; 4]) -> b
         tile.scale.as_mut_ptr(),
         tile.offset.as_mut_ptr(),
     );
-    let mut any = false;
     // SAFETY: the caller guarantees `tile.cols / 32` blocks behind every
     // row pointer and a tile sized for them.
     unsafe {
+        let bias = vdupq_n_u8(F::BIAS);
+        let mut any = vdupq_n_u32(0);
         for block in 0..tile.cols / 32 {
+            let at = rows.map(|row| row.add(block * F::BYTES));
             let mut low = [vdupq_n_u8(0); 4];
             let mut high = [vdupq_n_u8(0); 4];
             for r in 0..4 {
-                let p = rows[r].add(block * F::BYTES);
-                (low[r], high[r]) = F::weights(p);
-                // One scale per row, shared by both sub-blocks.
-                let d = F::scale(p);
-                let shift = 0.0 - F::BIAS * d;
-                for sub in block * 2..block * 2 + 2 {
-                    *scale.add(sub * 4 + r) = d;
-                    *offset.add(sub * 4 + r) = shift;
-                }
-                any |= shift != 0.0;
+                let (first, last) = F::weights(at[r]);
+                // The zero point comes off the weights, so it needs no
+                // offset. Wrapping leaves the signed bytes.
+                (low[r], high[r]) = (vsubq_u8(first, bias), vsubq_u8(last, bias));
             }
             store_columns(q.add(block * 128), low);
             store_columns(q.add(block * 128 + 64), high);
+            // One scale per row, the four rows in the four lanes, shared by
+            // both sub-blocks. The offset is zero, computed as the portable
+            // fill computes it, which keeps a scale that is not a number.
+            let d = F::scales(at);
+            let shift = vsubq_f32(vdupq_n_f32(0.0), vmulq_n_f32(d, 0.0));
+            for sub in block * 2..block * 2 + 2 {
+                vst1q_f32(scale.add(sub * 4), d);
+                vst1q_f32(offset.add(sub * 4), shift);
+            }
+            any = vorrq_u32(any, nonzero(shift));
         }
+        vmaxvq_u32(any) != 0
     }
-    any
 }
 
 /// The fill of NVFP4: blocks of 64 signed FP4 levels, which the tile keeps
@@ -1398,13 +1777,14 @@ unsafe fn fill_q2_0(tile: &mut Tile, rows: [*const u8; 4]) -> bool {
             let mut subs = [[vdupq_n_u8(0); 4]; 4];
             for r in 0..4 {
                 let p = rows[r].add(block * BYTES);
+                // Stored with a bias of one, which comes off the weights.
                 for (s, values) in q2_0_values(p.add(2)).into_iter().enumerate() {
-                    subs[s][r] = values;
+                    subs[s][r] = vsubq_u8(values, vdupq_n_u8(1));
                 }
-                // One scale per row for all four sub-blocks. The offsets
-                // take the bias off, as the portable fill computes them.
+                // One scale per row for all four sub-blocks. The offsets are
+                // zero, computed as the portable fill computes them.
                 let d = half(p);
-                let shift = 0.0 - 1.0 * d;
+                let shift = 0.0 - 0.0 * d;
                 for sub in block * 4..block * 4 + 4 {
                     *scale.add(sub * 4 + r) = d;
                     *offset.add(sub * 4 + r) = shift;
@@ -1560,6 +1940,7 @@ unsafe fn fill_q6_k(tile: &mut Tile, rows: [*const u8; 4]) -> bool {
         let zero = vdupq_n_f32(0.0);
         let low_nibble = vdupq_n_u8(0x0f);
         let two_bits = vdupq_n_u8(3);
+        let bias = vdupq_n_u8(32);
         let mut any = vdupq_n_u32(0);
         for block in 0..tile.cols / 256 {
             // Sixteen signed 8-bit scales per row, times the block's scale.
@@ -1575,7 +1956,9 @@ unsafe fn fill_q6_k(tile: &mut Tile, rows: [*const u8; 4]) -> bool {
                         vget_high_s16(wide)
                     };
                     scales[r] = vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(four)), half(p.add(208)));
-                    offsets[r] = vsubq_f32(zero, vmulq_n_f32(scales[r], 32.0));
+                    // Zero, computed as the portable fill computes it: the
+                    // bias of 32 comes off the weights below.
+                    offsets[r] = vsubq_f32(zero, vmulq_n_f32(scales[r], 0.0));
                     any = vorrq_u32(any, nonzero(offsets[r]));
                 }
                 store_affine(scale.add((block * 16 + part * 4) * 4), scales, 1);
@@ -1602,7 +1985,7 @@ unsafe fn fill_q6_k(tile: &mut Tile, rows: [*const u8; 4]) -> bool {
                     for (run, weights) in runs.into_iter().enumerate() {
                         store_columns(
                             q.add((block * 16 + part * 8 + run * 2 + turn) * 64),
-                            weights,
+                            weights.map(|w| vsubq_u8(w, bias)),
                         );
                     }
                 }

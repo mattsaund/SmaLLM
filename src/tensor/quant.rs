@@ -142,6 +142,28 @@ fn decode_blocks(
     }
 }
 
+/// True for the formats whose scale, and offset, covers 32 weights or more,
+/// so that a tile's sub-blocks of 16 come in pairs that share them. The
+/// others scale every 16 weights, or have grids whose scales this list does
+/// not vouch for.
+pub fn scales_pair_up(ty: TensorType) -> bool {
+    matches!(
+        ty,
+        TensorType::Q4_0
+            | TensorType::Q4_1
+            | TensorType::Q5_0
+            | TensorType::Q5_1
+            | TensorType::Q8_0
+            | TensorType::Iq4Nl
+            | TensorType::Mxfp4
+            | TensorType::Q4K
+            | TensorType::Q5K
+            | TensorType::Iq4Xs
+            | TensorType::Q1_0
+            | TensorType::Q2_0
+    )
+}
+
 /// How the integer weights of a format become non-negative: what to add to
 /// each of them, and the largest value that gives. `None` for the formats
 /// that use the whole signed byte.
@@ -266,6 +288,9 @@ pub struct Tile {
     pub signed: bool,
     /// The largest weight an unsigned tile can hold.
     pub max: u8,
+    /// True when the scales come in equal pairs: the format scales at least
+    /// 32 weights at a time, so a kernel may scale 32 columns at once.
+    pub pairs: bool,
     /// The row being decoded.
     pub(crate) row: DecodedRow,
     /// A row of zero bytes, which stands in for the rows a tile lacks.
@@ -275,14 +300,18 @@ pub struct Tile {
 impl Tile {
     /// Sizes the tile for `height` rows of type `ty`, `row_bytes` long, and
     /// sets what follows from the type. The caller writes the contents.
-    pub fn prepare(&mut self, ty: TensorType, height: usize, row_bytes: usize) {
+    /// `signed` keeps every format's weights as they decode, for a backend
+    /// whose byte multiply takes signed weights (see
+    /// [`fill_signed`](Self::fill_signed)).
+    pub fn prepare(&mut self, ty: TensorType, height: usize, row_bytes: usize, signed: bool) {
         let cols = row_bytes / ty.block_bytes() * ty.block_len();
-        let range = unsigned_range(ty);
+        let range = if signed { None } else { unsigned_range(ty) };
         self.height = height;
         self.cols = cols;
         self.signed = range.is_none();
         self.max = range.map_or(0, |(_, max)| max);
         self.has_offset = false;
+        self.pairs = scales_pair_up(ty);
         self.q.resize(cols * height);
         self.scale.resize(cols / 16 * height);
         self.offset.resize(cols / 16 * height);
@@ -321,12 +350,37 @@ impl Tile {
     /// Fills the tile with the rows stored in `data`, `row_bytes` apart.
     ///
     /// `data` holds at most `height` rows of type `ty`. This is the portable
-    /// way to fill a tile, and the definition for the faster ones.
+    /// way to fill a tile, and the definition for the faster ones. Formats
+    /// that store their weights above a zero point keep them that way, with
+    /// an offset that takes the zero point off, for x86's byte multiply,
+    /// which wants unsigned weights.
     pub fn fill(&mut self, ty: TensorType, height: usize, data: &[u8], row_bytes: usize) {
+        self.fill_as(ty, height, data, row_bytes, false);
+    }
+
+    /// [`fill`](Self::fill) with every weight kept as it decodes, signed.
+    /// The zero points come off the weights, so those formats need no
+    /// offset. For backends whose byte multiply is signed, as NEON's `sdot`
+    /// is: an offset costs them a pass over the scales for every vector.
+    pub fn fill_signed(&mut self, ty: TensorType, height: usize, data: &[u8], row_bytes: usize) {
+        self.fill_as(ty, height, data, row_bytes, true);
+    }
+
+    fn fill_as(
+        &mut self,
+        ty: TensorType,
+        height: usize,
+        data: &[u8],
+        row_bytes: usize,
+        signed: bool,
+    ) {
         let count = data.len() / row_bytes;
         assert!(count <= height, "a tile holds at most {height} rows");
-        self.prepare(ty, height, row_bytes);
-        let bias = unsigned_range(ty).map_or(0, |(bias, _)| bias);
+        self.prepare(ty, height, row_bytes, signed);
+        let bias = match signed {
+            true => 0,
+            false => unsigned_range(ty).map_or(0, |(bias, _)| bias),
+        };
         if count < height {
             self.q.fill(0);
             self.scale.fill(0.0);

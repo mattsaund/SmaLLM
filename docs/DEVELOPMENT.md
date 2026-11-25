@@ -19,7 +19,8 @@ and the engine matches llama.cpp on real models there.
 - **Two routes through a quantized matrix** (see `src/model/matmul.rs`).
   The direct route takes one vector at a time, which is generation. Tiles
   take a batch of 8 or more vectors, which is prompt reading, with 4 rows
-  per tile on NEON.
+  per tile on NEON, met by four vectors at a time with the dot product
+  extension.
 - **Threads.** Generation runs on the performance cores, prompts on every
   physical core. `default_threads` and `default_batch_threads` in
   `src/threads.rs` count them, by `cpu_capacity` on Linux, among the CPUs
@@ -47,9 +48,13 @@ cargo test --release --lib kernel_speed -- --ignored --nocapture
 ```
 
 `kernel_speed` prints, for every weight format, picoseconds per weight of
-the direct kernel, of filling a tile, and of the tile kernel. On the desktop
-the tile kernel takes 6 to 8, the fill 20 to 30, and the direct kernels 21
-to 47. The same three numbers on the board decide most of what follows.
+the direct kernel, of filling a tile, and of the tile kernel, and on NEON
+with the dot product extension of the tile kernel for four vectors at once
+(`tile4`, per weight and vector). Then the Q4_0 tile kernel against a whole
+batch of 64 vectors, and the direct kernels over a matrix too large for
+the caches, as generation reads it. On the desktop the tile kernel takes 6
+to 8, the fill 20 to 30, and the direct kernels 21 to 47. The same numbers
+on the board decide most of what follows.
 
 Then build the llama.cpp harness on the board and compare, the way
 [tools/reference/README.md](../tools/reference/README.md) describes:
@@ -109,7 +114,7 @@ Findings:
   GEMM for this CPU keeps a block of 4 rows by 4 tokens of 32-bit
   accumulators and uses `sdot` by lane, so each loaded weight register
   serves four tokens. The NEON tile kernel's register blocking is the first
-  place to look.
+  place to look. (Done: see "After the NEON work" below.)
 - **Generation is memory-bound, and Q4_0 falls behind.** Against the build
   measured first, Q4_0 was 7 percent behind (7.4 against 8.0) and Q4_K_M 8
   percent ahead (2.7 against 2.5). Against b12711, Q4_0 is 14 percent
@@ -118,7 +123,8 @@ Findings:
   kernel leaves bandwidth unused. In LFM3's generation profile the
   feed-forward up projection takes 40 percent, down 21, the logits 18 (a
   tied 128,000 by 2,048 Q6_K embedding, about 215 MB per token) and query,
-  key and value 13.
+  key and value 13. (Closed below: both engines now sit near the board's
+  memory limit.)
 - **Prompts on every core pay off.** On mixed cores the work-claiming pool
   read Nemotron's prompt 46 percent faster on 8 threads than on 2 (12.6
   against 8.4). llama.cpp got slower when the A55s joined. This is a
@@ -137,8 +143,9 @@ Findings:
   runs followed each other and heated the board. Alternated, each started
   under 62°C, best of three on all 8 cores, a 128-token prompt: LFM3 read
   19.3 tokens per second at both sizes, and Nemotron 11.9 at 32 against
-  11.5 at 64. 64 took 4.7 MB (LFM3) and 6.4 MB (Nemotron) more. ARM keeps
-  32, and x86, where 64 is faster, moved to 64 (after 0.3.0).
+  11.5 at 64. 64 took 4.7 MB (LFM3) and 6.4 MB (Nemotron) more. ARM kept
+  32, and x86, where 64 is faster, moved to 64 (after 0.3.0). The faster
+  NEON kernels below changed that, and ARM moved to 64 as well.
 - **Heat decides back-to-back measurements.** The A76 cluster starts idle
   injection at 70°C (`cpub_idle_zone`) and throttles at 90°C, and the board
   idles at 60°C with its fan at full speed. One run of a 128-token prompt
@@ -176,6 +183,77 @@ Findings:
   PC with VeriSilicon's ACUITY tools, with static shapes and no key/value
   cache. Language models stop at SmolLM2 in 16-bit integers with a 32-token
   window, so it suits vision models, not SmaLLM's.
+
+### After the NEON work
+
+Measured 2026-11-25 as above: a 128-token prompt and 64 generated tokens on
+the two A76 cores, 2 threads, the engines alternating, each run started
+under 62°C, best of three, against llama.cpp b12711. Tokens per second:
+
+| Model (format) | Prompt: SmaLLM | Prompt: llama.cpp | Generation: SmaLLM | Generation: llama.cpp |
+|---|---|---|---|---|
+| LFM3-1.7B (Q4_0) | 39.1 | 44.5 | 8.6 | 8.5 |
+| Nemotron 3.5 Bolt E4B (Q4_K_M) | 14.3 | 8.5 | 2.8 | 2.7 |
+
+On all 8 cores, its default for prompts, SmaLLM reads LFM3's prompt at
+47.4 tokens per second and Nemotron's at 17.8 (19.3 and 11.9 before).
+
+What changed, with `kernel_speed` on one A76 in picoseconds per weight:
+
+- **Four vectors per pass over a tile.** `sdot` by lane repeats four bytes
+  of one vector across the register, so each weight register loaded serves
+  four vectors. With signed tiles (below), Q4_0's tile kernel went from
+  99.7 to 38.1 per weight and vector.
+- **Signed tiles.** `sdot` multiplies signed bytes, so zero points come off
+  the weights at fill time, and most formats lose the offset pass that
+  x86's unsigned byte multiply needs.
+- **32 columns per scale.** Formats with one scale per 32 weights or more
+  sum 32 columns as integers before they scale: 38.8 to 28.5.
+- **One `sdot` chain per vector.** The A76 forwards `sdot`'s accumulator: a
+  dependent `sdot` issues the next cycle, and four chains reach two per
+  cycle (by lane and mixed with other work, about 1.74). Two chains per
+  vector, added at the end, only cost the additions: 28.5 to 27.0.
+- **Row kernels four blocks at a time** for the 32-weight formats. Four
+  block sums go into one register, four scales are gathered through general
+  registers and converted together, and a format's bias comes out in
+  integers through the activations' sums. Q4_0 went from 119 to 76 in the
+  cache and from 121 to 85 from memory.
+- **Q6_K's row kernel** merges its 6-bit values with shifts that insert
+  (`sli`, `sri`) and scales four sub-blocks with one multiply-add: 152 to
+  110 in the cache, 160 to 125 from memory. The tied output layers of
+  Q4_K_M files and LFM3 use it.
+- **Tile fills** store four rows' columns with one `st4` and the scales and
+  offsets as whole registers: Q4_0 162 to 123, Q8_0 144 to 99.
+- **The next tile's rows are prefetched** while the current tile meets the
+  batch, since four rows read at once are four streams.
+- **A batch of 64 on ARM too.** With the faster kernels, LFM3 reads a
+  128-token prompt at 37.0 tokens per second at 64, against 34.7 at 32 and
+  35.9 at 128 (best of two), for 4.7 MB more.
+
+Findings:
+
+- **Generation is at the memory limit.** The board reads 9.9 GB/s with one
+  core or two, and 8.2 with all eight. LFM3 reads 1.07 GB per generated
+  token, so no engine passes about 9.2 tokens per second here. Both are
+  close. A faster kernel shows on one core, and on chips with more
+  bandwidth.
+- **One stream beats several from memory.** Four rows of Q4_0 read at once
+  were 20 percent faster than one row from the cache, but 20 percent slower
+  from memory (Q8_0: 55 percent slower). Prefetching ahead within the rows
+  changed nothing. Prefetching the next group of four rows recovered Q4_0
+  but not Q8_0. So the row kernels read one row at a time.
+- **The batch's activations cost 5 to 15 percent.** The Q4_0 tile kernel
+  runs at 27.0 with four vectors in the nearest cache, 28.3 against 64
+  vectors of 2048 columns, and 32.1 against 64 vectors of 7680 columns
+  (LFM3's feed-forward down). Sharing each group of vectors between 2 or 4
+  tiles gained nothing at 2048 columns. Splitting the columns of wide
+  matrices is what is left there.
+- **The rest of the prompt gap is in the multiplies.** LFM3 spends about
+  32.7 picoseconds per weight and vector on each core in its multiplies.
+  The tile kernel accounts for 28 to 32 of that, the fill for 1.9 at a
+  batch of 64, and the rest is threads and memory. The fill loop runs at
+  about half the instruction rate the core should reach, which is not
+  understood yet.
 
 ## Questions the board can answer
 

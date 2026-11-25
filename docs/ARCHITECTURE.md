@@ -277,9 +277,8 @@ the C API already carries a `device` field for choosing one.
 ## Reading a prompt: tiles
 
 Generating a token multiplies each weight row by one vector. Reading a
-prompt multiplies it by a batch of them, 64 by default on x86 and 32
-elsewhere, or 128 for a model with experts, and that changes what is worth
-doing.
+prompt multiplies it by a batch of them, 64 by default, or 128 for a model
+with experts, and that changes what is worth doing.
 
 The kernels above unpack a row's blocks while they multiply. For a batch
 that would unpack every row once per vector. So a batch of 8 or more
@@ -297,9 +296,18 @@ vectors takes another route:
    result. Nothing is added across lanes at the end, which is what a
    row-at-a-time kernel spends a third of its time on.
 
-Signed weights are shifted to be zero or more when a tile is filled, and
-the shift moves into the tile's offsets. That lets the byte multiply read
-them without any sign handling.
+x86's byte multiply takes unsigned weights, so on x86 signed weights are
+shifted to be zero or more when a tile is filled, and the shift moves into
+the tile's offsets. NEON's `sdot` multiplies signed bytes, so NEON tiles go
+the other way: a format's zero point (8 for Q4_0, 32 for Q6_K) comes off the
+weights at fill time, and the tiles of most formats need no offset term.
+
+With the dot product extension, NEON also multiplies a tile by four vectors
+at once. `sdot` by lane repeats four bytes of one vector across the
+register, so each weight register loaded serves four vectors, and the
+tile's four rows times four vectors keep four sums going. Formats with one
+scale per 32 weights or more (Q4_0, Q8_0, Q4_K and others) sum 32 columns
+as integers before scaling, where the tile's scale layout steps every 16.
 
 A tile lives in a few kilobytes of scratch memory per thread, so this route
 costs no memory to speak of. The weights stay in the model file. llama.cpp
@@ -313,7 +321,13 @@ the portable fill bit for bit.
 
 Generation does not use tiles. One vector per row leaves nothing to share
 the unpacking with, and at that point speed is set by how fast memory
-delivers the weights, not by the multiply.
+delivers the weights, not by the multiply. The row kernels read each row
+from start to end, one stream that the hardware prefetcher follows well.
+On NEON they take four blocks of 32 at a time and scale them together:
+four sums in the lanes of one register, four scales gathered and converted
+at once, and the format's zero point taken off through the activations'
+sums. Reading four rows at once shares more work, but four streams 1 KB
+apart came from memory 20 to 50 percent slower on a Cortex-A76.
 
 ## Attention and the key/value cache
 

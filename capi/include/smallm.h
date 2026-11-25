@@ -60,9 +60,8 @@ typedef enum smallm_status {
 typedef struct smallm_session_params {
     uint32_t n_ctx;     /* Context window in tokens. Any size is accepted. */
     uint32_t n_threads; /* Threads to generate with. */
-    uint32_t n_batch;   /* Prompt tokens evaluated together. 0 picks 64 on
-                           x86 and 32 elsewhere, or 128 for models with
-                           experts. */
+    uint32_t n_batch;   /* Prompt tokens evaluated together. 0 picks 64, or
+                           128 for models with experts. */
     uint32_t device;    /* Where to compute. 0 is the CPU, the only device. */
     uint32_t n_threads_batch; /* Threads to read prompts with. 0 picks every
                                  physical core, or n_threads when that is set. */

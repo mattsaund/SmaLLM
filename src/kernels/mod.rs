@@ -69,7 +69,22 @@ pub type DotFloat = unsafe fn(row: *const u8, x: *const f32, n: usize) -> f32;
 pub type TileDot =
     unsafe fn(tile: &Tile, act: ActRef, scaled_sums: *const f32, group: usize, out: *mut f32);
 
-/// Fills a tile with the rows in `data`, exactly as [`Tile::fill`] does.
+/// [`TileDot`] for four activation vectors at once. `out` receives the
+/// outputs of each vector in turn, one float per row of the tile.
+///
+/// It must give exactly what four calls to the backend's [`TileDot`] give,
+/// so that a token's results never depend on how its batch is grouped. A
+/// backend has one when reading a weight once for several tokens pays.
+pub type TileDot4 = unsafe fn(
+    tile: &Tile,
+    acts: &[ActRef; 4],
+    scaled_sums: &[*const f32; 4],
+    group: usize,
+    out: *mut f32,
+);
+
+/// Fills a tile with the rows in `data`, exactly as [`Tile::fill`] does, or
+/// as [`Tile::fill_signed`] does for a backend with signed tiles.
 ///
 /// A backend may decode the formats it cares about with its own
 /// instructions. The result must not differ from the portable fill.
@@ -108,7 +123,12 @@ pub struct Kernels {
     /// Rows this backend multiplies at once in the batched route. Zero when
     /// it has no kernel worth using for that.
     tile_rows: usize,
+    /// True when the tile kernels want signed tiles, from
+    /// [`Tile::fill_signed`].
+    signed_tiles: bool,
     tile_dot: TileDot,
+    /// The kernel for four vectors at once, when the backend has one.
+    tile_dot4: Option<TileDot4>,
     tile_fill: TileFill,
 }
 
@@ -412,9 +432,21 @@ impl Kernels {
         self.tile_rows
     }
 
+    /// True when this backend's tiles are signed, filled as
+    /// [`Tile::fill_signed`] fills them. Otherwise as [`Tile::fill`] does.
+    pub fn signed_tiles(&self) -> bool {
+        self.signed_tiles
+    }
+
     /// The kernel for tiles of decoded rows.
     pub fn tile_dot(&self) -> TileDot {
         self.tile_dot
+    }
+
+    /// The kernel for a tile and four vectors at once, when this backend
+    /// has one.
+    pub fn tile_dot4(&self) -> Option<TileDot4> {
+        self.tile_dot4
     }
 
     /// Fills `tile` with the rows stored in `data`, `row_bytes` apart, for
@@ -437,6 +469,38 @@ impl Kernels {
             TensorType::BF16 => RowDot::Float(self.row_bf16),
             _ => RowDot::Quant((self.row_quant)(ty)),
         }
+    }
+}
+
+/// Asks the memory system to start loading `bytes` into the second-level
+/// cache, one request per cache line, so that a later read finds them
+/// there. A hint: it changes no result, and does nothing on a machine
+/// without kernels here.
+///
+/// The batched multiply reads the rows of each tile once, four rows at a
+/// time. Asking for the next tile while the current one is in use hides the
+/// wait for memory, which the hardware prefetcher, following one stream
+/// best, does not.
+pub fn prefetch(bytes: &[u8]) {
+    for line in bytes.chunks(64) {
+        let address = line.as_ptr();
+        // SAFETY: a prefetch reads nothing the program can see and cannot
+        // fault. The address is inside `bytes` anyway.
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            std::arch::asm!(
+                "prfm pldl2keep, [{address}]",
+                address = in(reg) address,
+                options(nostack, preserves_flags, readonly)
+            );
+        }
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_MM_HINT_T1, _mm_prefetch};
+            _mm_prefetch::<_MM_HINT_T1>(address as *const i8);
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        let _ = address;
     }
 }
 

@@ -5,6 +5,27 @@ Each version is a `v` tag, with ready-made binaries and libraries on its
 
 ## Unreleased
 
+- **Faster on ARM chips with the dot product extension** (Cortex-A55, A76
+  and later, such as the Raspberry Pi 5 and the RK3588, Apple's M chips and
+  AWS Graviton). Prompts: the tile kernel multiplies four vectors at once
+  with `sdot` by lane, tiles keep their weights signed so zero points cost
+  nothing, formats with a scale per 32 weights sum 32 columns before they
+  scale, and tile fills store with `st4`. Generation: the row kernels of the 32-weight formats (Q4_0, Q8_0,
+  Q5_0, IQ4_NL, MXFP4 and others) take four blocks at a time, and Q6_K's
+  merges its bits with shifts that insert. On an Allwinner A733's two
+  Cortex-A76 cores, LFM3 1.7B (Q4_0) reads a 128-token prompt at 39.1
+  tokens per second (12.8 before, llama.cpp 44.5) and generates at 8.6 (7.5
+  before, llama.cpp 8.5, both at the board's memory limit). On all 8 cores
+  it reads that prompt at 47.4. Nemotron 3.5 Bolt E4B (Q4_K_M) reads
+  prompts at 14.3 (8.9 before, llama.cpp 8.5).
+- **A prompt batch of 64 on ARM**, as on x86. It was 32. With the faster
+  kernels, 64 reads prompts 7 percent faster on the A733, for about 5 MB
+  more scratch memory.
+- **Prompts read ahead of the multiply.** While a tile of rows meets the
+  batch, the next tile's rows are already being fetched from memory. On x86
+  Llama 3.2 1B (Q4_K_M) reads a 256-token prompt about 6 percent faster (876
+  against 828 tokens per second on 8 cores), and Gemma 4 E2B (Q4_0) is
+  unchanged.
 - **Thread counts on ARM boards.** Physical cores are now told apart by the
   CPUs that share them. Boards whose clusters number their cores from zero
   (the Allwinner A733) were counted 6 cores short of 8, and read prompts

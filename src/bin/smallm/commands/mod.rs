@@ -42,8 +42,7 @@ pub const SESSION_SPECS: [Spec; 7] = [
     value(
         "batch",
         Some('b'),
-        "Prompt tokens evaluated together (default: 64 on x86 and 32 elsewhere, or 128 for models \
-         with experts)",
+        "Prompt tokens evaluated together (default: 64, or 128 for models with experts)",
     ),
     value(
         "cache-type",

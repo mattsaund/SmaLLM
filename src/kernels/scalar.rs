@@ -34,7 +34,9 @@ pub static KERNELS: Kernels = Kernels {
     row_quant,
     // The portable tile kernel is the definition, not a fast path.
     tile_rows: 0,
+    signed_tiles: false,
     tile_dot,
+    tile_dot4: None,
     tile_fill,
 };
 
@@ -62,7 +64,9 @@ pub static EXACT: Kernels = Kernels {
     row_bf16,
     row_quant: exact::row_quant,
     tile_rows: 0,
+    signed_tiles: false,
     tile_dot,
+    tile_dot4: None,
     tile_fill,
 };
 

@@ -535,6 +535,60 @@ fn tiles_match_the_definition() {
     }
 }
 
+/// A kernel for four vectors must give exactly what four single calls give,
+/// so that results never depend on how a batch is grouped.
+#[test]
+fn four_vector_tiles_match_one_vector_tiles_exactly() {
+    let mut rng = Rng(29);
+    for kernels in available() {
+        let Some(dot4) = kernels.tile_dot4() else {
+            continue;
+        };
+        let height = kernels.tile_rows();
+        let mut tile = Tile::default();
+        for ty in QUANT_TYPES {
+            let group = group_of(ty);
+            // Two groups or blocks, whichever is longer, so that sums cross
+            // from one group to the next.
+            let n = 2 * ty.block_len().max(group);
+            let row_bytes = ty.row_bytes(n).unwrap();
+            let matrix = random_weights(&mut rng, ty, height * n, 3.2);
+            kernels.fill_tile(&mut tile, ty, &matrix, row_bytes);
+            let acts: Vec<Acts> = (0..4)
+                .map(|_| Acts::new(kernels, &rng.floats(n, -2.0, 2.0), group))
+                .collect();
+            let sums: Vec<Vec<f32>> = acts.iter().map(scaled_sums).collect();
+            let mut expected = vec![f32::NAN; 4 * height];
+            for (k, (act, sum)) in acts.iter().zip(&sums).enumerate() {
+                // SAFETY: the tile and the activations both hold `n` columns,
+                // and each output has room for a whole tile.
+                unsafe {
+                    (kernels.tile_dot())(
+                        &tile,
+                        act.as_ref(),
+                        sum.as_ptr(),
+                        group,
+                        expected[k * height..].as_mut_ptr(),
+                    )
+                };
+            }
+            let mut got = vec![f32::NAN; 4 * height];
+            let refs = [0, 1, 2, 3].map(|k| acts[k].as_ref());
+            let pointers = [0, 1, 2, 3].map(|k| sums[k].as_ptr());
+            // SAFETY: as above, for four vectors at once.
+            unsafe { dot4(&tile, &refs, &pointers, group, got.as_mut_ptr()) };
+            let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+            assert_eq!(
+                bits(&got),
+                bits(&expected),
+                "{} {}",
+                kernels.name,
+                ty.name()
+            );
+        }
+    }
+}
+
 #[test]
 fn every_backend_fills_tiles_like_the_portable_fill() {
     let mut rng = Rng(23);
@@ -556,7 +610,10 @@ fn every_backend_fills_tiles_like_the_portable_fill() {
                         matrices.push(vec![fill; rows * row_bytes]);
                     }
                     for matrix in matrices {
-                        expected.fill(ty, height, &matrix, row_bytes);
+                        match kernels.signed_tiles() {
+                            true => expected.fill_signed(ty, height, &matrix, row_bytes),
+                            false => expected.fill(ty, height, &matrix, row_bytes),
+                        }
                         kernels.fill_tile(&mut got, ty, &matrix, row_bytes);
                         let what = format!("{} {} {rows} rows of {n}", kernels.name, ty.name());
                         assert_eq!(
@@ -766,6 +823,98 @@ fn kernel_speed() {
             }
             let picos = start.elapsed().as_secs_f64() * 1e12 / (rounds * height * cols) as f64;
             line.push_str(&format!("  tile-{} {picos:>5.1}", kernels.name));
+            // Four vectors at once, counted per weight and vector.
+            if let Some(dot4) = kernels.tile_dot4() {
+                let refs = [0, 1, 2, 3].map(|_| acts.as_ref());
+                let pointers = [0, 1, 2, 3].map(|_| sums.as_ptr());
+                let mut out = [0.0f32; 32];
+                let rounds = 10000;
+                let start = std::time::Instant::now();
+                for _ in 0..rounds {
+                    // SAFETY: as above, and `out` has room for four tiles.
+                    unsafe { dot4(&tile, &refs, &pointers, acts.group, out.as_mut_ptr()) };
+                    std::hint::black_box(&mut out);
+                }
+                let picos =
+                    start.elapsed().as_secs_f64() * 1e12 / (rounds * 4 * height * cols) as f64;
+                line.push_str(&format!("  tile4 {picos:>5.1}"));
+            }
+        }
+        println!("{line}");
+    }
+
+    // Reading a prompt passes a whole batch of activations by each tile. For
+    // wide matrices they no longer fit the nearest caches. Picoseconds per
+    // weight and vector.
+    for kernels in available() {
+        let Some(dot4) = kernels.tile_dot4() else {
+            continue;
+        };
+        let ty = TensorType::Q4_0;
+        let vectors = 64;
+        for cols in [1024, 2048, 7680] {
+            let height = kernels.tile_rows();
+            let row_bytes = ty.row_bytes(cols).unwrap();
+            let rows = random_weights(&mut rng, ty, height * cols, 3.2);
+            let mut tile = Tile::default();
+            kernels.fill_tile(&mut tile, ty, &rows, row_bytes);
+            let batch: Vec<Acts> = (0..vectors)
+                .map(|_| Acts::new(scalar(), &rng.floats(cols, -3.0, 3.0), 32))
+                .collect();
+            let sums: Vec<Vec<f32>> = batch.iter().map(scaled_sums).collect();
+            let mut out = [0.0f32; 32];
+            let mut best = f64::MAX;
+            for _ in 0..20 {
+                let start = std::time::Instant::now();
+                for group in 0..vectors / 4 {
+                    let refs = [0, 1, 2, 3].map(|k| batch[group * 4 + k].as_ref());
+                    let pointers = [0, 1, 2, 3].map(|k| sums[group * 4 + k].as_ptr());
+                    // SAFETY: the tile and every vector hold `cols` columns,
+                    // and `out` has room for four tiles.
+                    unsafe { dot4(&tile, &refs, &pointers, 32, out.as_mut_ptr()) };
+                    std::hint::black_box(&mut out);
+                }
+                best = best.min(start.elapsed().as_secs_f64());
+            }
+            let picos = best * 1e12 / (vectors * height * cols) as f64;
+            println!(
+                "  {} Q4_0 tile4, a batch of {vectors} vectors of {cols}: {picos:.1}",
+                kernels.name
+            );
+        }
+    }
+
+    // Generating reads every weight from memory once per token. A matrix
+    // far larger than the caches shows what that costs.
+    let (rows, cols) = (16384, 2048);
+    let x = rng.floats(cols, -3.0, 3.0);
+    println!("picoseconds per weight, {rows} rows of {cols}, read from memory:");
+    for ty in [
+        TensorType::Q4_0,
+        TensorType::Q8_0,
+        TensorType::Q4K,
+        TensorType::Q6K,
+    ] {
+        let matrix = random_weights(&mut rng, ty, rows * cols, 3.2);
+        let row_bytes = ty.row_bytes(cols).unwrap();
+        let acts = Acts::new(scalar(), &x, group_of(ty));
+        let mut line = format!("  {:<7}", ty.name());
+        for kernels in available() {
+            let mut best = f64::MAX;
+            for _ in 0..5 {
+                let mut sink = 0.0f32;
+                let start = std::time::Instant::now();
+                for row in matrix.chunks_exact(row_bytes) {
+                    sink += row_dot(kernels, ty, row, cols, &acts);
+                }
+                best = best.min(start.elapsed().as_secs_f64());
+                std::hint::black_box(sink);
+            }
+            line.push_str(&format!(
+                "  {} {:>6.1}",
+                kernels.name,
+                best * 1e12 / (rows * cols) as f64
+            ));
         }
         println!("{line}");
     }

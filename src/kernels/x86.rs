@@ -52,7 +52,9 @@ const fn kernels(name: &'static str, tile_dot: TileDot) -> Kernels {
         row_bf16,
         row_quant,
         tile_rows: 8,
+        signed_tiles: false,
         tile_dot,
+        tile_dot4: None,
         tile_fill,
     }
 }
@@ -373,7 +375,7 @@ unsafe fn tile_fill(tile: &mut Tile, ty: TensorType, height: usize, data: &[u8],
     if height != 8 {
         return tile.fill(ty, height, data, row_bytes);
     }
-    tile.prepare(ty, 8, row_bytes);
+    tile.prepare(ty, 8, row_bytes, false);
     // Rows the tile lacks are read from a row of zeros, which decodes to
     // weights of zero in each of these formats, and then cleared: in some
     // formats zeros stand for other integers times a scale of zero.

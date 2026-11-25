@@ -159,17 +159,22 @@ Bugs the first board found (the Allwinner A733, 2026-11-24).
 
 Gaps the measurements in PARITY.md and DEVELOPMENT.md show.
 
-- [ ] Q4_0 prompt reading on NEON with the dot product extension: 3.5 times slower than llama.cpp b12711 on the
-      A733's A76 cores (12.8 against 44.6 tokens per second). The matrix multiplies take 96 percent of the time, and
-      the batch size is not the cause. Rework the NEON tile kernel's register blocking (4 rows by 4 tokens of
-      accumulators, `sdot` by lane, as llama.cpp's Q4_0 GEMM does), or add an opt-in repack at load for boards
-      with memory to spare.
-- [ ] Q4_0 generation on NEON, 14 percent behind llama.cpp b12711 on the A733 (7.5 against 8.7 tokens per second,
-      and 7 percent behind the older build the board first ran). Both are memory-bound, so the matrix-vector kernel
-      leaves bandwidth unused. Q4_K_M is 4 percent ahead (2.8 against 2.7).
-- [x] The default prompt batch on ARM. With runs alternated and started at the same temperature, 64 gained nothing
-      over 32 on the A733 (LFM3 level, Nemotron 3 percent slower) and took 5 to 6 MB more, so ARM keeps 32. x86
-      moved to 64: prompts up to 11 percent faster for 2 to 6 MB.
+- [x] Q4_0 prompt reading on NEON with the dot product extension, 3.5 times slower than llama.cpp b12711 on the
+      A733's A76 cores. A four-vector tile kernel (`sdot` by lane), signed tiles, 32 columns per scale and faster
+      fills took it from 12.8 to 39.1 tokens per second. Nemotron's Q4_K_M prompts went from 8.9 to 14.3.
+- [ ] Q4_0 prompt reading on NEON, still 12 percent behind llama.cpp b12711 on the A733's two A76 cores (39.1
+      against 44.5 tokens per second), though ahead on all 8 cores (47.4). What is left, in DEVELOPMENT.md: splitting the columns of wide matrices (a batch against 7680
+      columns runs the tile kernel 13 percent slower than against 2048), and the tile fill, which runs at half
+      the instruction rate the core should reach. An opt-in repack at load stays possible for boards with memory
+      to spare.
+- [x] Q4_0 generation on NEON, 14 percent behind llama.cpp b12711 on the A733. Row kernels that take four blocks at
+      a time, and Q6_K's for the tied output layer, made it 8.6 against 8.5 tokens per second. Both engines are now
+      at the board's memory limit (9.9 GB/s, about 9.2 tokens per second for LFM3).
+- [x] Q6_K's NEON row kernel, which the tied output layers of LFM3 and of Q4_K_M files use: 152 to 110 picoseconds
+      per weight on an A76.
+- [x] The default prompt batch on ARM. With the faster NEON kernels, 64 reads LFM3's prompt 7 percent faster than
+      32 on the A733 for 4.7 MB more, and 128 is slower again, so every machine now defaults to 64. x86 moved to 64
+      first: prompts up to 11 percent faster for 2 to 6 MB.
 - [x] Prompt reading for mixtures of experts. A default batch of 128 tokens for models with experts: on x86
       DeepSeek reads prompts at 189 tokens per second against llama.cpp's 162 (0.83x before, at 32), and gpt-oss at
       187 against 103, for 44 and 26 MB of scratch memory.
