@@ -15,6 +15,9 @@
 //! - The state of every block is saved each [`CHECKPOINT_EVERY`] positions.
 //!   Going back further restores the last checkpoint before the cut, and
 //!   the session reads the tokens after it again (see `Session::truncate`).
+//!   The saved states together stay under [`CHECKPOINT_BYTES`]: the oldest
+//!   go first, and a cut before every one of them reads the context again
+//!   from its start.
 //!
 //! Keeping every position instead would cost a vector per block and
 //! position, more than the attention cache of these models.
@@ -24,6 +27,16 @@ pub const CHECKPOINT_EVERY: usize = 256;
 
 /// Positions the context can be cut back without reading tokens again.
 pub const RECENT: usize = 8;
+
+/// Memory the saved states may take together. A small state keeps many,
+/// so LFM2 can go back thousands of positions. A wide one keeps fewer:
+/// Inkling 2 Mini saves 3.8 MB a time, which would grow to 61 MB at 4,096
+/// tokens without a cap.
+pub const CHECKPOINT_BYTES: usize = 16 << 20;
+
+/// Saved states kept whatever their size, so that a cut a few hundred
+/// positions back never reads the whole context again.
+const MIN_CHECKPOINTS: usize = 2;
 
 /// The inputs that the convolution blocks still need.
 pub struct ConvState {
@@ -45,6 +58,8 @@ pub struct ConvState {
     /// Saved states: a position `p`, then each block's inputs at the `rows`
     /// positions before `p`, block after block.
     checkpoints: Vec<(usize, Vec<f32>)>,
+    /// The most saved states kept, from [`CHECKPOINT_BYTES`].
+    max_checkpoints: usize,
 }
 
 impl ConvState {
@@ -61,6 +76,7 @@ impl ConvState {
         }
         let rows = taps.saturating_sub(1);
         let capacity = rows + RECENT;
+        let checkpoint_bytes = (count * rows * n_embd * std::mem::size_of::<f32>()).max(1);
         ConvState {
             slots,
             rows,
@@ -70,6 +86,7 @@ impl ConvState {
             len: 0,
             valid_from: 0,
             checkpoints: Vec::new(),
+            max_checkpoints: (CHECKPOINT_BYTES / checkpoint_bytes).max(MIN_CHECKPOINTS),
         }
     }
 
@@ -143,8 +160,14 @@ impl ConvState {
         {
             Some(index) => index,
             None => {
-                self.checkpoints
-                    .push((position, vec![0.0; self.rings.len() * len]));
+                // The oldest saved state makes room for the new one. Its
+                // buffer is reused.
+                let buffer = if self.checkpoints.len() >= self.max_checkpoints {
+                    self.checkpoints.remove(0).1
+                } else {
+                    vec![0.0; self.rings.len() * len]
+                };
+                self.checkpoints.push((position, buffer));
                 self.checkpoints.len() - 1
             }
         };
@@ -314,6 +337,33 @@ mod tests {
         assert_eq!(state.rewind(10), 0);
         assert_eq!(state_at(&state, 0, 0), [0.0, 0.0]);
         assert_eq!(state.bytes(), rings);
+    }
+
+    #[test]
+    fn saved_states_stay_under_their_cap() {
+        // Two blocks of one float and three taps: 16 bytes a state, so the
+        // cap keeps many. A tiny cap is simulated by lowering the count.
+        let mut state = ConvState::new(&[true, true], 3, 1);
+        state.max_checkpoints = 3;
+        feed(&mut state, &[0, 1], 0, 6 * CHECKPOINT_EVERY + 10, 100);
+        let saved: Vec<usize> = state.checkpoints.iter().map(|(at, _)| *at).collect();
+        assert_eq!(
+            saved,
+            [
+                4 * CHECKPOINT_EVERY,
+                5 * CHECKPOINT_EVERY,
+                6 * CHECKPOINT_EVERY
+            ]
+        );
+        // Before the oldest one kept, the context is read again from its
+        // start.
+        assert_eq!(state.rewind(3 * CHECKPOINT_EVERY + 5), 0);
+        // Wide states keep the minimum.
+        let wide = ConvState::new(&[true; 48], 4, 6656);
+        assert_eq!(
+            wide.max_checkpoints,
+            (CHECKPOINT_BYTES / (48 * 3 * 6656 * 4)).max(2)
+        );
     }
 
     #[test]

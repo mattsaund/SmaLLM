@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 use crate::gguf::Gguf;
 
 /// Architectures this engine runs, as named in `general.architecture`.
-pub const ARCHITECTURES: [&str; 25] = [
+pub const ARCHITECTURES: [&str; 27] = [
     "llama",
     "qwen2",
     "qwen3",
@@ -37,6 +37,8 @@ pub const ARCHITECTURES: [&str; 25] = [
     "granitehybrid",
     "rwkv6",
     "rwkv7",
+    "inkling2",
+    "inkling2_loop",
 ];
 
 /// Which two elements of an attention head a rotary embedding rotates
@@ -50,7 +52,7 @@ pub enum Rope {
 }
 
 /// The activation inside the feed-forward gate.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Activation {
     Silu,
     Gelu,
@@ -58,6 +60,13 @@ pub enum Activation {
     /// `x * sigmoid(1.702 * x)`, and the up projection is clamped to
     /// `[-7, 7]` and has one added.
     SwigluOai,
+    /// Inkling's SiTU: `beta * tanh(gate / beta) * sigmoid(gate)`, times
+    /// the up projection soft-capped the same way at `linear`. A `linear`
+    /// of zero leaves the up projection as it is.
+    Situ {
+        beta: f32,
+        linear: f32,
+    },
 }
 
 /// How a mixture of experts turns the router's scores into weights.
@@ -202,6 +211,83 @@ impl Ssm {
     }
 }
 
+/// The settings of Inkling 2 (Thinking Machines), which no other
+/// architecture shares. `inkling.rs` has the forward pass.
+///
+/// Inkling has no rotary embeddings. Each query head also makes a short
+/// vector, which a learned table turns into a bias for every distance
+/// between positions. Queries and keys are capped in length. Short
+/// convolutions run over the keys, the values and both block outputs. And
+/// the input of each block attends over the outputs of the earlier groups
+/// of blocks, instead of reading one residual stream.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Inkling {
+    /// Elements of each head's relative-position query.
+    pub rel_len: usize,
+    /// Distances the bias table of a full-attention layer covers. Longer
+    /// ones get no bias. A windowed layer's table covers its window.
+    pub rel_extent: usize,
+    /// The longest a query or key head may be. Longer ones are scaled down.
+    pub qk_clip: f32,
+    /// The same cap for the relative-position queries.
+    pub rel_clip: f32,
+    /// Full-attention queries grow with the log of the position past this,
+    /// `1 + alpha * ln(max(1, (position + 1) / floor))`.
+    pub log_floor: f32,
+    pub log_alpha: f32,
+    /// Layers in one group. The first layer of a group starts a new
+    /// residual stream, and the earlier one joins those the inputs attend
+    /// over.
+    pub block: usize,
+    /// Positions each short convolution sums, the current one included.
+    pub conv_taps: usize,
+    /// Rows of the embedding and output matrices, which are padded past the
+    /// vocabulary.
+    pub n_vocab_padded: usize,
+    /// The repeated layers of Inkling 2 Mini. `None` for Inkling 2.
+    pub looped: Option<Loop>,
+}
+
+/// Layers that run several times over (Inkling 2 Mini). The layers from
+/// `start` to `end` run `passes` times. Each pass after the first starts
+/// from the same input as the first, and gated messages from the previous
+/// pass join its layers' inputs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Loop {
+    pub start: usize,
+    pub end: usize,
+    pub passes: usize,
+    /// Width of the gates' low-rank bottleneck.
+    pub rank: usize,
+}
+
+impl Inkling {
+    /// Cache slots: one per layer, and one more per repeated layer for each
+    /// pass after the first. Each slot keeps its own keys, values and
+    /// convolution inputs.
+    pub fn slots(&self, n_layer: usize) -> usize {
+        match self.looped {
+            Some(lp) => n_layer + (lp.passes - 1) * (lp.end - lp.start),
+            None => n_layer,
+        }
+    }
+
+    /// The layer whose weights cache slot `slot` runs, as llama.cpp numbers
+    /// the slots: the layers first, then each later pass's repeats.
+    pub fn layer_of_slot(&self, n_layer: usize, slot: usize) -> usize {
+        match self.looped {
+            Some(lp) if slot >= n_layer => lp.start + (slot - n_layer) % (lp.end - lp.start),
+            _ => slot,
+        }
+    }
+
+    /// Floats of convolution input a slot keeps per position: the key and
+    /// value projections, then the attention and feed-forward outputs.
+    pub fn conv_channels(&self, n_embd: usize, kv_dim: usize) -> usize {
+        2 * kv_dim + 2 * n_embd
+    }
+}
+
 /// The settings of RWKV blocks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rwkv {
@@ -334,6 +420,8 @@ pub struct Config {
     /// The latent attention shape, for models whose attention layers use
     /// it (DeepSeek V2 and V3).
     pub mla: Option<Mla>,
+    /// Inkling 2's settings, for Inkling models.
+    pub inkling: Option<Inkling>,
 }
 
 impl Config {
@@ -471,6 +559,7 @@ impl Config {
             routing,
             mla: None,
             rwkv: None,
+            inkling: None,
             arch: arch.clone(),
         };
 
@@ -764,6 +853,41 @@ impl Config {
                     }
                 }
             }
+            // Inkling 2 and Inkling 2 Mini. Positions come from a learned
+            // bias on distances, not rotation. The experts are weighed by
+            // sigmoids and normalized, which llama.cpp hard-codes for these
+            // models rather than reading it from the file.
+            "inkling2" | "inkling2_loop" => {
+                let inkling = meta.inkling(n_vocab, n_layer, arch == "inkling2_loop")?;
+                let beta = meta.f32("activation.situ_beta").unwrap_or(0.0);
+                let linear = meta.f32("activation.situ_linear_beta").unwrap_or(0.0);
+                if !(beta.is_finite() && beta > 0.0 && linear.is_finite() && linear >= 0.0) {
+                    return Err(Error::format("Inkling: invalid SiTU activation settings"));
+                }
+                config.activation = Activation::Situ { beta, linear };
+                config.logit_softcap = meta.f32("final_logit_softcapping").unwrap_or(0.0);
+                if window == 0 {
+                    return Err(Error::format("Inkling: missing attention window"));
+                }
+                for (layer, local) in config
+                    .layers
+                    .iter_mut()
+                    .zip(meta.window_pattern(n_layer, 0))
+                {
+                    layer.rope_dims = 0;
+                    layer.rope_factors = false;
+                    if local {
+                        layer.window = window;
+                    }
+                }
+                let routing = config
+                    .routing
+                    .as_mut()
+                    .ok_or_else(|| Error::format("Inkling without experts"))?;
+                routing.gating = Gating::Sigmoid;
+                routing.normalize = true;
+                config.inkling = Some(inkling);
+            }
             _ => unreachable!("architecture was checked above"),
         }
         config.check()?;
@@ -897,6 +1021,76 @@ impl Meta<'_> {
 
     fn f32(&self, suffix: &str) -> Option<f32> {
         self.file.get_f32(&self.key(suffix))
+    }
+
+    /// Inkling's settings, checked as llama.cpp checks them. `looped` reads
+    /// the loop of Inkling 2 Mini.
+    fn inkling(&self, n_vocab: usize, n_layer: usize, looped: bool) -> Result<Inkling> {
+        let bad = |what: &str| Error::format(format!("Inkling: invalid {what}"));
+        let positive = |suffix: &str| {
+            self.f32(suffix)
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .ok_or_else(|| bad(suffix))
+        };
+        let inkling = Inkling {
+            rel_len: self.required("attention.relative_length")?,
+            rel_extent: self.required("attention.relative_extent")?,
+            qk_clip: positive("attention.qk_clip")?,
+            rel_clip: positive("attention.relative_clip")?,
+            log_floor: self.required("attention.log_scale_floor")? as f32,
+            log_alpha: self
+                .f32("attention.log_scale_alpha")
+                .filter(|alpha| alpha.is_finite() && *alpha >= 0.0)
+                .ok_or_else(|| bad("logarithmic scale"))?,
+            block: self.required("attn_res.block_size")?,
+            conv_taps: self.required("shortconv.l_cache")?,
+            n_vocab_padded: self.required("vocab_size")?,
+            looped: None,
+        };
+        // The bias table and the convolutions are read into memory, so
+        // their sizes are bounded.
+        if inkling.rel_len > 1024 || inkling.rel_extent > 1 << 20 {
+            return Err(bad("relative-position bias size"));
+        }
+        if !(2..=64).contains(&inkling.conv_taps) {
+            return Err(bad("convolution width"));
+        }
+        let unpadded = self.usize("vocab_size_unpadded").unwrap_or(0);
+        if unpadded != n_vocab || n_vocab > inkling.n_vocab_padded {
+            return Err(bad(
+                "vocabulary size: the tokenizer must have the unpadded size",
+            ));
+        }
+        if !looped {
+            return Ok(inkling);
+        }
+        if self
+            .file
+            .get_bool(&self.key("loop.varying"))
+            .unwrap_or(false)
+        {
+            return Err(Error::unsupported("Inkling loops of varying length"));
+        }
+        let lp = Loop {
+            start: self.required("loop.start")?,
+            end: self.required("loop.end")?,
+            passes: self.required("loop.count")?,
+            rank: self.required("loop.gate_rank")?,
+        };
+        let block = inkling.block;
+        if lp.passes < 2
+            || lp.passes > 64
+            || lp.start >= lp.end
+            || lp.end > n_layer
+            || lp.start % block != 0
+            || lp.end % block != 0
+        {
+            return Err(bad("loop"));
+        }
+        Ok(Inkling {
+            looped: Some(lp),
+            ..inkling
+        })
     }
 
     fn required(&self, suffix: &str) -> Result<usize> {

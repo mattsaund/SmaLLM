@@ -254,6 +254,15 @@ mod oracle {
                 let (gate, up) = (gate.min(7.0), up.clamp(-7.0, 7.0));
                 gate / (1.0 + (-1.702 * gate).exp()) * (up + 1.0)
             }
+            Activation::Situ { beta, linear } => {
+                let (beta, linear) = (beta as f64, linear as f64);
+                let up = if linear > 0.0 {
+                    linear * (up / linear).tanh()
+                } else {
+                    up
+                };
+                beta * (gate / beta).tanh() / (1.0 + (-gate).exp()) * up
+            }
         }
     }
 

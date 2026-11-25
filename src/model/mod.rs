@@ -18,6 +18,7 @@ mod config;
 mod conv;
 mod encoder;
 mod forward;
+mod inkling;
 mod kv;
 mod matmul;
 mod recurrent;
@@ -34,8 +35,8 @@ use crate::gguf::Gguf;
 use crate::tokenizer::Tokenizer;
 
 pub use config::{
-    ARCHITECTURES, Activation, Config, Gating, LayerSpec, Mixer, Mla, Rope, Routing, Rwkv, Ssm,
-    Yarn,
+    ARCHITECTURES, Activation, Config, Gating, Inkling, LayerSpec, Loop, Mixer, Mla, Rope, Routing,
+    Rwkv, Ssm, Yarn,
 };
 pub use encoder::{ENCODERS, Embedder, Pooling, normalize};
 pub use forward::{Phase, Profile, Session, SessionConfig};

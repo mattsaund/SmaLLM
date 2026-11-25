@@ -257,6 +257,13 @@ fn phi_2_q4_k_m() {
     check("phi-2.Q4_K_M");
 }
 
+/// Inkling 2 Mini is newer than the llama.cpp the other golden files come
+/// from. Its golden file comes from llama.cpp b12711.
+#[test]
+fn inkling_2_mini_ud_q2_k_xl() {
+    check("Inkling-2-Mini-UD-Q2_K_XL");
+}
+
 #[test]
 fn gpt_oss_20b_mxfp4() {
     check("gpt-oss-20b-MXFP4");
@@ -336,6 +343,7 @@ fn every_golden_file_has_a_test() {
         "granite-4.0-h-tiny-Q4_K_M",
         "rwkv7-g1d-0.1b-Q8_0",
         "rwkv-6-world-1.6b-Q4_K",
+        "Inkling-2-Mini-UD-Q2_K_XL",
     ];
     for entry in std::fs::read_dir(golden_dir()).unwrap() {
         let path = entry.unwrap().path();

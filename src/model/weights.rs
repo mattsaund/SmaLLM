@@ -14,6 +14,7 @@ use crate::tensor::TensorType;
 use crate::tensor::quant::dequantize_row;
 
 use super::config::{Config, LayerSpec, Mixer, Mla, Ssm};
+use super::inkling::InklingWeights;
 
 /// A weight matrix stored in the model file, one row after another.
 #[derive(Clone, Copy, Debug)]
@@ -317,6 +318,11 @@ pub struct Experts {
     /// Each expert's biases on its gate, up and down projections (gpt-oss):
     /// one row per expert. They stay in the file until a row is used.
     pub biases: Option<[Matrix; 3]>,
+    /// One multiplier per expert on the outputs of its gate, up and down
+    /// projections. Conversions from NVFP4 keep each expert's global scale
+    /// apart from its weights this way (Inkling). A fused gate and up share
+    /// one.
+    pub scales: [Option<Vec<f32>>; 3],
     /// A network that every token goes through as well (Qwen2 MoE), with
     /// an optional gate: one score per token, through a sigmoid.
     pub shared: Option<(Dense, Option<Linear>)>,
@@ -401,6 +407,9 @@ pub struct Weights {
     pub per_layer_inputs: Option<PerLayerInputs>,
     /// Weight and bias of a layer norm of the token embeddings (RWKV).
     pub embd_norm: Option<(Vec<f32>, Vec<f32>)>,
+    /// Everything else of an Inkling model, whose blocks are bound by
+    /// `inkling.rs`. `layers` is empty then.
+    pub inkling: Option<InklingWeights>,
 }
 
 impl Weights {
@@ -409,9 +418,14 @@ impl Weights {
     pub fn bind(file: &Gguf, config: &mut Config) -> Result<Weights> {
         let d = config.n_embd;
 
-        let token_embd = matrix(file, "token_embd.weight", config.n_vocab, d)?;
+        // Inkling pads its embedding and output matrices past the
+        // vocabulary. Only the rows of real tokens are read.
+        let vocab_rows = config
+            .inkling
+            .map_or(config.n_vocab, |inkling| inkling.n_vocab_padded);
+        let token_embd = matrix(file, "token_embd.weight", vocab_rows, d)?;
         let output_matrix = match file.tensor("output.weight") {
-            Some(_) => matrix(file, "output.weight", config.n_vocab, d)?,
+            Some(_) => matrix(file, "output.weight", vocab_rows, d)?,
             None => token_embd,
         };
         let output = Linear {
@@ -430,6 +444,21 @@ impl Weights {
         } else {
             None
         };
+        if config.inkling.is_some() {
+            let inkling = super::inkling::bind(file, config)?;
+            return Ok(Weights {
+                token_embd,
+                output,
+                output_norm,
+                output_norm_bias,
+                rope_factors: None,
+                rope_factors_long: None,
+                layers: Vec::new(),
+                per_layer_inputs: None,
+                embd_norm: None,
+                inkling: Some(inkling),
+            });
+        }
         // One table of rotary divisors serves every layer that uses one, so
         // those layers must rotate the same number of elements.
         let mut rotating = config.layers.iter().filter(|layer| {
@@ -681,6 +710,7 @@ impl Weights {
             layers,
             per_layer_inputs,
             embd_norm,
+            inkling: None,
         })
     }
 }
@@ -704,6 +734,7 @@ impl Weights {
             layers: Vec::new(),
             per_layer_inputs: None,
             embd_norm: None,
+            inkling: None,
         }
     }
 }
@@ -876,7 +907,7 @@ fn dense(file: &Gguf, prefix: &str, suffix: &str, d: usize, n_ff: usize) -> Resu
 }
 
 /// Binds the experts of layer `index`, and its shared expert if it has one.
-fn experts(file: &Gguf, index: usize, d: usize, count: usize) -> Result<Experts> {
+pub(super) fn experts(file: &Gguf, index: usize, d: usize, count: usize) -> Result<Experts> {
     let name = |part: &str| format!("blk.{index}.{part}");
     let down = file.tensor(&name("ffn_down_exps.weight")).ok_or_else(|| {
         Error::format(format!("missing tensor: {}", name("ffn_down_exps.weight")))
@@ -884,7 +915,19 @@ fn experts(file: &Gguf, index: usize, d: usize, count: usize) -> Result<Experts>
     let n_ff = down.cols();
     // Gate and up are separate tensors, or one with each expert's gate
     // rows followed by its up rows.
-    let (gate, up) = if file.tensor(&name("ffn_gate_up_exps.weight")).is_some() {
+    let fused = file.tensor(&name("ffn_gate_up_exps.weight")).is_some();
+    let scale = |part: &str| optional_vector(file, &name(part), count);
+    let scales = if fused {
+        let shared = scale("ffn_gate_up_exps.scale")?;
+        [shared.clone(), shared, scale("ffn_down_exps.scale")?]
+    } else {
+        [
+            scale("ffn_gate_exps.scale")?,
+            scale("ffn_up_exps.scale")?,
+            scale("ffn_down_exps.scale")?,
+        ]
+    };
+    let (gate, up) = if fused {
         let fused = stacked(file, &name("ffn_gate_up_exps.weight"), count, 2 * n_ff, d)?;
         let half = |offset: usize| ExpertMatrix {
             matrix: fused,
@@ -931,6 +974,7 @@ fn experts(file: &Gguf, index: usize, d: usize, count: usize) -> Result<Experts>
         gate,
         up,
         biases,
+        scales,
         down: ExpertMatrix {
             matrix: stacked(file, &name("ffn_down_exps.weight"), count, d, n_ff)?,
             rows: d,

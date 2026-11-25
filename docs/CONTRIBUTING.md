@@ -108,11 +108,13 @@ SmaLLM/
 │   │   ├── conv.rs          short convolution state, with rollback
 │   │   ├── recurrent.rs     recurrent block states, with saved copies
 │   │   ├── rwkv.rs          RWKV blocks: time and channel mixing with a state
+│   │   ├── inkling.rs       Inkling 2's weights
 │   │   ├── encoder.rs       embedding and reranking models (BERT)
 │   │   ├── matmul.rs        the parallel matrix multiply
 │   │   ├── forward.rs       the forward pass and the Session type
 │   │   ├── forward/mamba.rs Mamba blocks: the convolution and the scan
 │   │   ├── forward/mla.rs   latent attention (DeepSeek V2 and V3)
+│   │   ├── forward/inkling.rs  Inkling 2: depth attention, its loop, relative bias
 │   │   └── tests.rs         the forward pass against a slow oracle
 │   ├── sampler.rs           picks the next token
 │   ├── chat.rs              chat formats

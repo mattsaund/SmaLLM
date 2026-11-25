@@ -40,6 +40,7 @@
 //! most Mamba models have no feed-forward network. `forward/mamba.rs` has
 //! its math.
 
+mod inkling;
 mod mamba;
 mod mla;
 
@@ -65,6 +66,7 @@ use super::weights::{
     AttentionWeights, ConvWeights, Dense, Experts, FeedForward, Linear, Matrix, MixerWeights,
     PerLayerInputs, PerLayerWeights, Plain,
 };
+use inkling::{Buffers, InklingScratch};
 use mamba::MambaScratch;
 use mla::MlaScratch;
 
@@ -561,6 +563,7 @@ struct Scratch {
     per_layer: PerLayerScratch,
     rwkv: RwkvScratch,
     mla: MlaScratch,
+    inkling: InklingScratch,
     acts: ActScratch,
     rope: RopeTables,
 }
@@ -642,7 +645,15 @@ impl Session {
             .iter()
             .map(|layer| layer.mixer == Mixer::ShortConv)
             .collect();
-        let conv = ConvState::new(&is_conv, c.conv_kernel, d);
+        // Inkling keeps the inputs of four convolutions in every cache slot.
+        let conv = match &c.inkling {
+            Some(inkling) => ConvState::new(
+                &vec![true; inkling.slots(c.n_layer)],
+                inkling.conv_taps,
+                inkling.conv_channels(d, c.max_kv_dim()),
+            ),
+            None => ConvState::new(&is_conv, c.conv_kernel, d),
+        };
         let conv_scratch = if is_conv.contains(&true) {
             ConvScratch {
                 b: vec![0.0; batch * d],
@@ -734,23 +745,33 @@ impl Session {
             per_layer,
             rwkv: RwkvScratch::new(c, model.weights(), batch),
             mla: MlaScratch::new(&model, batch),
+            inkling: InklingScratch::new(c, batch),
             acts: ActScratch::default(),
             rope: RopeTables::new(c, rope_factors(&model, n_ctx)),
         };
         // Layers that read another layer's cache have none of their own.
         // Latent attention keeps keys only, and reads values out of them.
-        let shapes: Vec<(usize, usize, usize)> = c
-            .layers
-            .iter()
-            .map(|layer| {
-                if layer.owns_kv() {
-                    let values = if c.mla.is_some() { 0 } else { layer.head_dim };
-                    (layer.n_head_kv, layer.head_dim, values)
-                } else {
-                    (0, 0, 0)
-                }
-            })
-            .collect();
+        let shapes: Vec<(usize, usize, usize)> = match &c.inkling {
+            // Each pass of Inkling's loop has cache slots of its own.
+            Some(inkling) => (0..inkling.slots(c.n_layer))
+                .map(|slot| {
+                    let layer = &c.layers[inkling.layer_of_slot(c.n_layer, slot)];
+                    (layer.n_head_kv, layer.head_dim, layer.head_dim)
+                })
+                .collect(),
+            None => c
+                .layers
+                .iter()
+                .map(|layer| {
+                    if layer.owns_kv() {
+                        let values = if c.mla.is_some() { 0 } else { layer.head_dim };
+                        (layer.n_head_kv, layer.head_dim, values)
+                    } else {
+                        (0, 0, 0)
+                    }
+                })
+                .collect(),
+        };
         let recurrent = RecurrentState::new(&recurrent::state_sizes(c));
         let state_end = (0..c.n_layer)
             .rev()
@@ -884,8 +905,12 @@ impl Session {
         let rope = &self.scratch.rope;
         let back = rope.back(discard);
         self.kv.shift(keep, discard, |layer, key| {
-            let dims = config.layers[layer].rope_dims;
-            rotate(&mut key[..dims], &back[rope.of_layer[layer]], config.rope);
+            // Inkling's loop has more cache slots than layers, and none of
+            // them rotates.
+            let dims = config.layers.get(layer).map_or(0, |spec| spec.rope_dims);
+            if dims > 0 {
+                rotate(&mut key[..dims], &back[rope.of_layer[layer]], config.rope);
+            }
         });
         self.conv.shift(keep, discard);
         self.recurrent.shift(keep, discard);
@@ -988,6 +1013,7 @@ impl Session {
             per_layer,
             rwkv: rwkv_scratch,
             mla: mla_scratch,
+            inkling: inkling_scratch,
             acts,
             rope,
         } = scratch;
@@ -1025,6 +1051,16 @@ impl Session {
             pass.per_layer_inputs(inputs, tokens, &x[..count * d], per_layer);
         }
         pass.lap(Phase::Embed);
+        // Inkling's blocks take a path of their own. Its `layers` is empty,
+        // so the loop below does nothing for it.
+        if let Some(inkling) = &weights.inkling {
+            let mut buffers = Buffers {
+                attention: &mut *attention,
+                experts: &mut *experts,
+                inkling: inkling_scratch,
+            };
+            pass.inkling(inkling, x, &mut buffers, want_logits);
+        }
 
         let state_end = *state_end;
         for (index, (layer, spec)) in weights.layers.iter().zip(&config.layers).enumerate() {
@@ -1321,6 +1357,7 @@ impl Pass<'_> {
             window: spec.window,
             softcap: config.attention_softcap,
             sinks: w.sinks.as_deref(),
+            bias: None,
         };
         let source = spec.kv_source.unwrap_or(run.index);
         attend(&self.engine, self.kv, source, spec, &query, &s.slots, out);
@@ -1524,6 +1561,17 @@ impl Pass<'_> {
         }
         self.multiply(inputs, d, &mut targets);
         drop(targets);
+        // A scale per expert comes first, then the biases, as llama.cpp
+        // applies them.
+        let [gate_scale, up_scale, down_scale] = &w.scales;
+        scale_experts(
+            gate_scale.as_deref(),
+            &s.groups,
+            &s.group_experts,
+            n_ff,
+            gate,
+        );
+        scale_experts(up_scale.as_deref(), &s.groups, &s.group_experts, n_ff, up);
         if let Some([gate_bias, up_bias, _]) = &w.biases {
             let map = self.engine.map;
             for (values, bias) in [(&mut *gate, gate_bias), (&mut *up, up_bias)] {
@@ -1557,6 +1605,7 @@ impl Pass<'_> {
         }
         self.multiply(gate, n_ff, &mut targets);
         drop(targets);
+        scale_experts(down_scale.as_deref(), &s.groups, &s.group_experts, d, out);
         if let Some([_, _, down_bias]) = &w.biases {
             let map = self.engine.map;
             add_expert_biases(
@@ -1811,6 +1860,7 @@ fn apply_gate(
         Activation::Silu => kernels.silu_mul(gate, up),
         Activation::Gelu => kernels.gelu_mul(gate, up),
         Activation::SwigluOai => swiglu_oai(kernels, gate, up),
+        Activation::Situ { beta, linear } => situ(gate, up, beta, linear),
     };
     let n = gate.len().min(up.len());
     if n <= GRAIN || pool.threads() == 1 {
@@ -1826,6 +1876,39 @@ fn apply_gate(
         let up = unsafe { ups.slice(range.start, range.len()) };
         apply(gate, up);
     });
+}
+
+/// Inkling's SiTU, as llama.cpp computes it: the gate soft-capped at `beta`
+/// times its sigmoid, times the up projection soft-capped at `linear`. The
+/// result goes to `gate`.
+fn situ(gate: &mut [f32], up: &[f32], beta: f32, linear: f32) {
+    for (g, &u) in gate.iter_mut().zip(up) {
+        let up = if linear > 0.0 {
+            linear * (u / linear).tanh()
+        } else {
+            u
+        };
+        *g = beta * (*g / beta).tanh() / (1.0 + (-*g).exp()) * up;
+    }
+}
+
+/// Multiplies each expert's output rows by its scale. `values` holds the
+/// rows of `groups` back to back, `width` floats each, and `experts` names
+/// each group's expert.
+fn scale_experts(
+    scales: Option<&[f32]>,
+    groups: &[Range<usize>],
+    experts: &[usize],
+    width: usize,
+    values: &mut [f32],
+) {
+    let Some(scales) = scales else { return };
+    for (group, &expert) in groups.iter().zip(experts) {
+        let scale = scales[expert];
+        values[group.start * width..group.end * width]
+            .iter_mut()
+            .for_each(|value| *value *= scale);
+    }
 }
 
 /// Adds a block's output to the hidden state, normalizing it first when the
@@ -1865,6 +1948,26 @@ struct Query<'a> {
     softcap: f32,
     /// Each query head's sink score, when the model has them.
     sinks: Option<&'a [f32]>,
+    /// A bias on each score from the distance between the positions
+    /// (Inkling).
+    bias: Option<RelBias<'a>>,
+}
+
+/// Inkling's bias on each score from the distance between the positions.
+/// A head's relative query dots with the table's row for the distance, and
+/// distances past the table get none. The head's own sink score is taken
+/// off every score, which makes it a sink next to the zero sink the query
+/// adds. None of it is scaled: llama.cpp adds it to the mask, which joins
+/// the scores after their scale.
+struct RelBias<'a> {
+    /// Relative queries: one row per token, `len` floats per head, the
+    /// heads side by side.
+    queries: &'a [f32],
+    /// Each token's sink score per head.
+    sinks: &'a [f32],
+    /// `len` weights per distance.
+    table: &'a [f32],
+    len: usize,
 }
 
 /// Where a parallel loop writes, shared between its threads.
@@ -1953,6 +2056,23 @@ fn attend(
             );
         });
         for (head, head_scores) in scores.chunks_exact_mut(stride).enumerate() {
+            if let Some(bias) = &query.bias {
+                let len = bias.len;
+                let extent = bias.table.len() / len;
+                let at = token * spec.n_head + kv_head * shared + head;
+                let relative = &bias.queries[at * len..(at + 1) * len];
+                let sink = bias.sinks[at];
+                for (index, score) in head_scores[..visible].iter_mut().enumerate() {
+                    let distance = position - (first + index);
+                    let shift = if distance < extent {
+                        let row = &bias.table[distance * len..(distance + 1) * len];
+                        row.iter().zip(relative).map(|(a, b)| a * b).sum::<f32>()
+                    } else {
+                        0.0
+                    };
+                    *score += shift - sink;
+                }
+            }
             if query.softcap > 0.0 {
                 let cap = query.softcap;
                 head_scores[..visible]

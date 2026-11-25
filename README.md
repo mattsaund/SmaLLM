@@ -73,13 +73,15 @@ chat, `/clear` starts over, `/system` sets a system message and `/exit`
 leaves.
 
 **Reasoning output.** For models that emit reasoning before the answer
-(Qwen3, LFM3, Gemma 4, DeepSeek R1, gpt-oss), the chat prints it dimmed and
-keeps it out of the conversation history. Piped output omits it. The server
-returns it as `reasoning_content`, the field llama.cpp uses. `--think off`
-makes Qwen3, LFM3 and RWKV-7 G1 answer without reasoning, and `--think on`
-turns it on for Gemma 4. gpt-oss always reasons and takes `--think low`,
-`medium` or `high`. In the server, `chat_template_kwargs.enable_thinking`
-and `reasoning_effort` choose per request.
+(Qwen3, LFM3, Gemma 4, Inkling 2, DeepSeek R1, gpt-oss), the chat prints it
+dimmed and keeps it out of the conversation history. Piped output omits it.
+The server returns it as `reasoning_content`, the field llama.cpp uses.
+`--think off` makes Qwen3, LFM3 and RWKV-7 G1 answer without reasoning, and
+`--think on` turns it on for Gemma 4. gpt-oss always reasons and takes
+`--think low`, `medium` or `high`. Inkling 2 sets its effort from the same
+choices: off is 0, which shortens its reasoning but does not end it. In the
+server, `chat_template_kwargs.enable_thinking` and `reasoning_effort` choose
+per request.
 
 **Settings.** Every setting has a line in one file, `smallm.conf`, named like
 its command-line option. `smallm config` shows the settings in effect and
@@ -89,12 +91,14 @@ line wins over the file.
 
 ## What it runs
 
-**Models.** Twenty-five architectures for chat and text:
+**Models.** Twenty-seven architectures for chat and text:
 
 - Transformers: Llama, Qwen2, Qwen3, Gemma 2, Gemma 3, Gemma 4, Phi-2,
   Phi-3, Granite, SmolLM3, and gpt-oss.
 - Mixtures of experts: Qwen2-MoE, Qwen3-MoE, OLMoE, Granite MoE, LFM2-MoE,
-  DeepSeek-MoE, and DeepSeek V2 and V3 with their latent attention.
+  DeepSeek-MoE, DeepSeek V2 and V3 with their latent attention, and Inkling
+  2 and Inkling 2 Mini, whose blocks attend over the outputs of earlier
+  blocks and whose middle layers run three times.
 - Hybrids and models that are not transformers: LFM2 and LFM3 (attention
   and short convolutions), Mamba, Mamba 2, Granite 4.0 H (Mamba 2 and
   attention), RWKV-6 and RWKV-7.
@@ -102,21 +106,24 @@ line wins over the file.
 That covers Llama 2 and 3, Mistral, Mixtral, TinyLlama, SmolLM2 and 3,
 Qwen2.5, Qwen3, the DeepSeek R1 distillations, Gemma 2, 3 and 4, Phi-2 to
 Phi-4-mini, gpt-oss, DeepSeek V2 and V3, Kimi and Moonlight, Granite 3 and
-4, OLMoE, Falcon Mamba, and Liquid AI's LFM2, LFM2.5 and LFM3. BERT and
-nomic-bert models make embeddings and rerank. The engine is tested against
-llama.cpp on 27 models. Tokens match exactly, and greedy output matches up
-to near ties between two candidates. LFM3 is newer than the llama.cpp it is
-tested against, so it is checked against llama.cpp's source instead.
+4, OLMoE, Falcon Mamba, Liquid AI's LFM2, LFM2.5 and LFM3, and Thinking
+Machines' Inkling 2 Mini. BERT and nomic-bert models make embeddings and
+rerank. The engine is tested against llama.cpp on 28 models. Tokens match
+exactly, and greedy output matches up to near ties between two candidates.
+LFM3 is newer than the llama.cpp it is tested against, so it is checked
+against llama.cpp's source instead. Inkling 2 Mini is tested against
+llama.cpp b12711.
 
 **Tokenizers.** SentencePiece, byte-level BPE with the word splitting rules
-of all 67 families llama.cpp knows, Gemma 4's, RWKV's World tokenizer, and
+of all 71 families llama.cpp knows, Gemma 4's, RWKV's World tokenizer, and
 the encoder tokenizers WordPiece (BERT) and Unigram (T5, XLM-RoBERTa).
 llama.cpp's own tokenizer test texts pass on every vocabulary it ships that
 uses one of these, and on RWKV's.
 
 **Weights.** F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K,
 Q5_K, Q6_K, the i-quants IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS,
-IQ3_S, IQ4_NL and IQ4_XS, the ternary TQ1_0 and TQ2_0, and MXFP4.
+IQ3_S, IQ4_NL and IQ4_XS, the ternary TQ1_0 and TQ2_0, MXFP4, NVFP4, and the
+1- and 2-bit Q1_0 and Q2_0.
 Dequantization is bit-exact with ggml for every format, checked by
 `tests/quant.rs`. Weights stay in the file's format and are memory mapped.
 Loading takes milliseconds and allocates no memory for weights.
@@ -127,7 +134,7 @@ including 32-bit ARM and RISC-V, runs portable code.
 
 **Chat formats.** ChatML, Llama 3, Llama 2, Mistral, Gemma, Gemma 4, Granite,
 Phi-3, Phi-4-mini, Zephyr, DeepSeek, DeepSeek V2, Kimi, OpenAI's Harmony
-(gpt-oss) and RWKV World, recognized from the model file.
+(gpt-oss), RWKV World and Inkling, recognized from the model file.
 
 ## Speed
 

@@ -159,6 +159,22 @@ held for a key before it writes the new value. The blocks normalize with
 layer norms, and every input moves part of the way toward the previous
 token's. They run a path of their own, in `model/rwkv.rs`.
 
+Inkling 2 (Thinking Machines) runs a path of its own too, in
+`model/forward/inkling.rs`, with its weights bound by `model/inkling.rs`. Its
+blocks read more than one residual stream. The first block of every group
+of six keeps its input aside and starts a new stream, and the inputs of each
+block's attention and experts attend over depth: the kept streams and the
+current one are normalized, scored against a learned query, and summed with
+the softmax of the scores. Attention has no rotation. Each head also makes a
+short relative query that dots with a learned row per distance, and that
+bias, minus a sink score per head, joins the scores after their scale.
+Queries and keys are capped in length, values are normalized, and short
+convolutions with a residual run over the keys, the values and both block
+outputs. Inkling 2 Mini runs layers 6 to 17 three times. Each later pass
+starts from the same input, takes gated messages mixed from the previous
+pass's outputs, and keeps its own key/value cache and convolution state, so
+the 24 layers have 48 cache slots.
+
 `model/config.rs` turns the architecture name and its metadata into a few
 model-wide switches (how positions are rotated, the activation, embedding
 and logit scaling) and one `LayerSpec` per block. A layer's spec says how it

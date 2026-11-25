@@ -54,6 +54,30 @@ Each version is a `v` tag, with ready-made binaries and libraries on its
   there, for boards whose storage is too slow to read pages back. It needs
   a locked-memory limit (`ulimit -l`) as large as the file.
 - `--max-tokens` says in its help that it counts reasoning tokens.
+- **Inkling 2 and Inkling 2 Mini** (Thinking Machines), the `inkling2` and
+  `inkling2_loop` architectures. Their blocks attend over the outputs of
+  earlier blocks instead of reading one residual stream. Attention has a
+  learned bias on distances instead of rotation, and short convolutions run
+  over the keys, the values and both block outputs. Inkling 2 Mini runs
+  layers 6 to 17 three times, each pass with its own cache. Its tokenizer
+  rule, its chat format (`inkling`, with the thinking effort set by
+  `--think`), and its reasoning markers come with it. Greedy output
+  matches llama.cpp b12711, and logits agree at a cosine similarity of
+  0.9997 (0.99994 on a K-quant copy). With the 9.1 GB UD-Q2_K_XL file,
+  SmaLLM reads prompts 15 percent faster and generates 13 percent faster
+  than llama.cpp, and holds 154 MB of anonymous memory after 256 tokens
+  where llama.cpp holds 1.45 GB.
+- **NVFP4, Q1_0 and Q2_0 weights**, which Inkling 2 Mini's experts use,
+  each expanding to exactly ggml's numbers. NVFP4 and Q2_0 have AVX2 and
+  NEON kernels and run at Q4_0's speed on x86. Q1_0 runs portable code.
+  Expert tensors may also carry one scale per expert (`.scale`), which
+  conversions from NVFP4 keep apart from the weights.
+- **Saved convolution states stay under 16 MB together**, the oldest
+  dropped first. They grew with the context before, by 3.8 MB every 256
+  positions for Inkling 2 Mini. A cut before the oldest saved state reads
+  the context again from its start.
+- **Word splitting** for the four families llama.cpp added since 0.3.0's
+  reference: `inkling2`, `tekken-num3`, `soprano` and `zonos3` (71 in all).
 
 ## 0.3.0 - 2026-11-24
 

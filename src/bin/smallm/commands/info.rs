@@ -151,6 +151,18 @@ pub fn main(raw: impl Iterator<Item = String>) -> Result<(), String> {
             ),
         );
     }
+    // Inkling 2 Mini runs some of its layers more than once.
+    if let Some(lp) = config.inkling.and_then(|inkling| inkling.looped) {
+        row(
+            "loop",
+            format!(
+                "layers {} to {} run {} times",
+                lp.start,
+                lp.end - 1,
+                lp.passes
+            ),
+        );
+    }
     let sharing = attention
         .iter()
         .filter(|layer| layer.kv_source.is_some())

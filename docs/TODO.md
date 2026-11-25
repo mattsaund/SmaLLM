@@ -12,15 +12,17 @@ default binary stays small.
 ## Done
 
 - [x] GGUF loading by memory map, with every read bounds-checked
-- [x] Twenty-five architectures, including mixtures of experts, hybrids, and the state-space and RWKV families
-- [x] Twenty-five weight formats, float, quantized, i-quants, ternary and MXFP4, each expanding exactly as in ggml
+- [x] Twenty-seven architectures, including mixtures of experts, hybrids, the state-space and RWKV families, and
+      Inkling 2 with its loop
+- [x] Twenty-eight weight formats, float, quantized, i-quants, ternary, MXFP4, NVFP4, Q1_0 and Q2_0, each expanding
+      exactly as in ggml
 - [x] Kernels for AVX2, AVX-VNNI, NEON and the ARM dot product extension
 - [x] Prompt reading in packed tiles
 - [x] Anonymous memory in megabytes, with weights read in place from the mapped file
 - [x] A half-precision key/value cache, allocated as the context fills
 - [x] SentencePiece and byte-level BPE tokenizers for every word splitting family llama.cpp knows, RWKV's, and
       the encoder tokenizers WordPiece and Unigram, matching it token for token on its test texts
-- [x] Fifteen chat formats, recognized from the model file
+- [x] Sixteen chat formats, recognized from the model file
 - [x] Embedding and reranking models, from the command line and the server
 - [x] Reasoning output separated from the answer in the chat, in pipes and in the server
 - [x] A context window that slides or keeps its start when it fills, chosen with `--overflow`
@@ -54,6 +56,10 @@ Bugs the first board found (the Allwinner A733, 2026-11-24).
 - [ ] Llama 3.2 1B measured on a board, for the README's tables.
 - [ ] More boards: the RK3588 and the Raspberry Pi 5.
 - [ ] The model-by-model comparison in PARITY.md repeated on ARM, against llama.cpp built on the board.
+- [ ] Round the scales of 32-element activation groups to 16 bits, as ggml does. SmaLLM keeps them in 32 bits, which
+      leaves its logits a little apart from llama.cpp's on the formats that use these groups (Q4_0, Q8_0, MXFP4,
+      NVFP4, Q2_0). Rounding them moved Inkling 2 Mini's UD-Q2_K_XL logits from a cosine similarity of 0.9997 to
+      0.99994 against llama.cpp b12711. It changes every such model's numbers a little, so it waits for a decision.
 
 ## Hardware
 
@@ -70,7 +76,8 @@ Bugs the first board found (the Allwinner A733, 2026-11-24).
 - [ ] AVX-512 kernels, and AMX on Intel Xeon.
 - [ ] ARM i8mm (8-bit matrix multiply) and SVE kernels, which llama.cpp uses on newer ARM cores.
 - [ ] NEON kernels for 32-bit ARM, and vector kernels for RISC-V.
-- [ ] NEON kernels for the formats that have none: IQ1, IQ2, IQ3, TQ1_0, TQ2_0, Q2_K and Q3_K.
+- [ ] NEON kernels for the formats that have none: IQ1, IQ2, IQ3, TQ1_0, TQ2_0, Q1_0, Q2_K and Q3_K. AVX2 kernels for
+      Q1_0.
 - [ ] A model split across machines over the network, as llama.cpp's RPC backend does.
 - [x] `--cpus`, to run on a chosen set of CPUs (one cluster) without `taskset`, as llama.cpp's `--cpu-range` does.
       Linux and Android.
@@ -87,6 +94,13 @@ Bugs the first board found (the Allwinner A733, 2026-11-24).
       transformers (RWKV, Mamba).
 - [x] Encoder tokenizers (WordPiece and Unigram), which only the encoder models use.
 - [x] Encoder models, for embeddings and reranking.
+- [x] Inkling 2 and Inkling 2 Mini (Thinking Machines): attention over the outputs of earlier blocks, a learned bias
+      on distances instead of rotation, short convolutions on keys, values and block outputs, and Mini's loop of
+      layers 6 to 17, run three times with 48 cache slots. Its tokenizer, chat format and reasoning markers too.
+- [ ] Inkling's image input (its vision tower) and its multi-token prediction head (DSpark, for speculative
+      decoding).
+- [ ] Inkling's tool messages and tool calls, and the effort levels it has past `Thinking` (minimal at 0.1, max at
+      0.99).
 - [x] The remaining weight formats: IQ1, IQ2, IQ3, IQ4_XS, the ternary ones, and MXFP4.
 - [ ] Current architectures in wide use: Llama 4, Qwen3.5 and Qwen3.5-MoE, Qwen3-Next, GLM-4 and its MoE
       (GLM-4.5, 4.6), Gemma 3n, Mistral 3, OLMo 2, Command-R and Cohere 2, ERNIE 4.5, MiniMax M2, EXAONE 4,
@@ -102,7 +116,8 @@ Bugs the first board found (the Allwinner A733, 2026-11-24).
 - [ ] Images and audio as input.
 - [ ] Text to speech models (OuteTTS, Qwen3-TTS).
 - [ ] LoRA adapters and control vectors.
-- [ ] The weight formats NVFP4, Q1_0 and Q2_0.
+- [x] The weight formats NVFP4, Q1_0 and Q2_0, with AVX2 and NEON kernels for NVFP4 and Q2_0.
+- [ ] The weight format F8_E4M3, which llama.cpp added after b11846.
 - [ ] PLaMo 2's tokenizer.
 - [ ] Models split across several GGUF files (`-00001-of-00004.gguf`), the way large models ship. The downloader
       skips them today, and the loader reads one file.
@@ -112,7 +127,7 @@ Bugs the first board found (the Allwinner A733, 2026-11-24).
 - [x] Sliding the context window when it fills, or keeping its start and dropping the middle.
 - [x] A half-precision key/value cache, to halve the memory of long contexts.
 - [ ] Grammar-constrained output (GBNF), and JSON that follows a schema.
-- [ ] Jinja chat templates, for models whose format is not one of the fifteen built in.
+- [ ] Jinja chat templates, for models whose format is not one of the sixteen built in.
 - [x] More samplers: Mirostat 1 and 2, typical, XTC, top-n-sigma, dynamic temperature, presence and frequency
       penalties, and a bias on chosen tokens, in llama.cpp's order and with its option names.
 - [ ] DRY, llama.cpp's sampler against repeated sequences.
@@ -120,9 +135,12 @@ Bugs the first board found (the Allwinner A733, 2026-11-24).
 - [ ] Speculative decoding: a small draft model, EAGLE3, and prompt lookup.
 - [ ] Saving a session's context to a file and loading it again.
 - [ ] An 8-bit and a 4-bit key/value cache, for long contexts. High value on boards.
-- [ ] Freeing the cache of sliding-window layers past their window (Gemma 2, Gemma 3, Gemma 4, gpt-oss), as
-      llama.cpp does. High value on boards: Gemma 4 and Nemotron 3.5 Bolt keep 512-position windows in 35 of
-      their 42 layers.
+- [ ] Freeing the cache of sliding-window layers past their window (Gemma 2, Gemma 3, Gemma 4, gpt-oss, Inkling),
+      as llama.cpp does. High value on boards: Gemma 4 and Nemotron 3.5 Bolt keep 512-position windows in 35 of
+      their 42 layers, and 40 of Inkling 2 Mini's 48 cache slots look back 1,024 positions. Inkling keeps 4 KB per
+      position and slot today, 805 MB at 4,096 tokens.
+- [x] Saved convolution states capped at 16 MB together, the oldest dropped first. Inkling 2 Mini's are 3.8 MB each
+      and grew to 61 MB at 4,096 tokens. It keeps four now, LFM2 dozens.
 - [x] Sampling defaults from the model file (`general.sampling.*`: temperature, top-k, top-p, min-p, repetition
       penalty and its window, XTC and Mirostat), below `smallm.conf` and the command line. Nemotron 3.5 Bolt E4B's
       file asks for temperature 1.0 and top-k 64, where SmaLLM used 0.8 and 40.
